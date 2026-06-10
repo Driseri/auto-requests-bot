@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import pytest
+import aiosqlite
+
+from app.models import ApplicationStatus, FieldName, Step
+from app.repository import DraftRepository
+
+
+@pytest.mark.asyncio
+async def test_drafts_for_different_users_do_not_mix(tmp_path):
+    repository = DraftRepository(str(tmp_path / "drafts.db"))
+    await repository.init()
+
+    await repository.get_or_create(1)
+    await repository.get_or_create(2)
+    await repository.save_answer(1, FieldName.INTENT.value, "intent.one")
+    await repository.save_answer(2, FieldName.INTENT.value, "intent.two")
+
+    first = await repository.get_by_user_id(1)
+    second = await repository.get_by_user_id(2)
+
+    assert first is not None
+    assert second is not None
+    assert first.intent == "intent.one"
+    assert second.intent == "intent.two"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_state_persists_between_repository_instances(tmp_path):
+    db_path = str(tmp_path / "persistent.db")
+    first_repository = DraftRepository(db_path)
+    await first_repository.init()
+    await first_repository.get_or_create(3)
+    await first_repository.save_answer(3, FieldName.INTENT.value, "intent.persisted")
+    await first_repository.set_step(3, Step.SCRIPTWRITER)
+
+    second_repository = DraftRepository(db_path)
+    await second_repository.init()
+    draft = await second_repository.get_by_user_id(3)
+
+    assert draft is not None
+    assert draft.intent == "intent.persisted"
+    assert draft.current_step == Step.SCRIPTWRITER
+
+
+@pytest.mark.asyncio
+async def test_repository_migrates_old_database_without_formatting_column(tmp_path):
+    db_path = str(tmp_path / "old.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE drafts (
+                telegram_user_id INTEGER PRIMARY KEY,
+                current_step TEXT NOT NULL,
+                intent TEXT,
+                scriptwriter TEXT,
+                reason TEXT,
+                raw_change_description TEXT,
+                formatted_change_description TEXT,
+                source_text TEXT,
+                priority TEXT,
+                llm_check_status TEXT NOT NULL DEFAULT 'not_checked',
+                llm_score REAL,
+                clarification_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO drafts (
+                telegram_user_id, current_step, source_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (5, Step.SOURCE_TEXT.value, "old source", "2026-05-18T13:00:00+00:00", "2026-05-18T13:00:00+00:00"),
+        )
+        await db.commit()
+
+    repository = DraftRepository(db_path)
+    await repository.init()
+    draft = await repository.get_by_user_id(5)
+
+    assert draft is not None
+    assert draft.source_text == "old source"
+    assert draft.source_text_formatting_json is None
+
+
+@pytest.mark.asyncio
+async def test_repository_migrates_old_database_without_application_id(tmp_path):
+    db_path = str(tmp_path / "old_no_application_id.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE drafts (
+                telegram_user_id INTEGER PRIMARY KEY,
+                current_step TEXT NOT NULL,
+                intent TEXT,
+                scriptwriter TEXT,
+                reason TEXT,
+                raw_change_description TEXT,
+                formatted_change_description TEXT,
+                source_text TEXT,
+                source_text_formatting_json TEXT,
+                priority TEXT,
+                llm_check_status TEXT NOT NULL DEFAULT 'not_checked',
+                llm_score REAL,
+                clarification_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO drafts (
+                telegram_user_id, current_step, created_at, updated_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                6,
+                Step.INTENT.value,
+                "2026-05-18T13:00:00+00:00",
+                "2026-05-18T13:00:00+00:00",
+            ),
+        )
+        await db.commit()
+
+    repository = DraftRepository(db_path)
+    await repository.init()
+    draft = await repository.get_by_user_id(6)
+    updated = await repository.ensure_application_id(6)
+
+    assert draft is not None
+    assert draft.application_id is None
+    assert updated.application_id is not None
+    assert len(updated.application_id) == 8
+    assert updated.application_id == updated.application_id.upper()
+
+
+@pytest.mark.asyncio
+async def test_new_draft_gets_application_id(tmp_path):
+    repository = DraftRepository(str(tmp_path / "drafts.db"))
+    await repository.init()
+
+    draft = await repository.get_or_create(7)
+
+    assert draft.application_id is not None
+    assert len(draft.application_id) == 8
+    assert draft.application_id == draft.application_id.upper()
+
+
+@pytest.mark.asyncio
+async def test_user_settings_do_not_mix_between_users(tmp_path):
+    repository = DraftRepository(str(tmp_path / "settings.db"))
+    await repository.init()
+
+    await repository.save_user_setting(1, "default_intent", "intent.one")
+    await repository.save_user_setting(2, "default_intent", "intent.two")
+    await repository.save_user_setting(1, "default_scriptwriter", "Writer One")
+    await repository.clear_user_setting(2, "default_intent")
+
+    first = await repository.get_user_settings(1)
+    second = await repository.get_user_settings(2)
+
+    assert first.default_intent == "intent.one"
+    assert first.default_scriptwriter == "Writer One"
+    assert second.default_intent is None
+    assert second.default_scriptwriter is None
+
+
+@pytest.mark.asyncio
+async def test_submitted_applications_are_saved_listed_and_updated(tmp_path):
+    repository = DraftRepository(str(tmp_path / "submitted.db"))
+    await repository.init()
+
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        sheet_name="Высокий",
+        last_known_status=ApplicationStatus.NEW.value,
+    )
+    await repository.save_submitted_application(
+        application_id="B1C2D3E4",
+        telegram_user_id=200,
+        sheet_name="Низкий",
+        last_known_status=ApplicationStatus.NEW.value,
+    )
+
+    await repository.update_submitted_application_status(
+        "A1B2C3D4",
+        sheet_name="Высокий",
+        last_known_status=ApplicationStatus.ACCEPTED.value,
+        last_seen_row_number=5,
+        last_seen_editor="редактор 1",
+        last_seen_editor_comment="Можно использовать",
+    )
+
+    first = await repository.get_submitted_application("A1B2C3D4")
+    tracked = await repository.list_submitted_applications()
+
+    assert first is not None
+    assert first.telegram_user_id == 100
+    assert first.last_known_status == ApplicationStatus.ACCEPTED.value
+    assert first.last_seen_row_number == 5
+    assert first.last_seen_editor == "редактор 1"
+    assert first.last_seen_editor_comment == "Можно использовать"
+    assert {item.application_id for item in tracked} == {"A1B2C3D4", "B1C2D3E4"}
+
+
+@pytest.mark.asyncio
+async def test_repository_migration_adds_submitted_applications_table(tmp_path):
+    db_path = str(tmp_path / "old_without_submitted.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE drafts (
+                telegram_user_id INTEGER PRIMARY KEY,
+                current_step TEXT NOT NULL,
+                application_id TEXT,
+                intent TEXT,
+                scriptwriter TEXT,
+                reason TEXT,
+                raw_change_description TEXT,
+                formatted_change_description TEXT,
+                source_text TEXT,
+                source_text_formatting_json TEXT,
+                priority TEXT,
+                llm_check_status TEXT NOT NULL DEFAULT 'not_checked',
+                llm_score REAL,
+                clarification_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.commit()
+
+    repository = DraftRepository(db_path)
+    await repository.init()
+
+    assert await repository.list_submitted_applications() == []
+
+
+@pytest.mark.asyncio
+async def test_repository_migrates_existing_bulk_batches_to_status_schema_v1(tmp_path):
+    db_path = str(tmp_path / "old_bulk_batches.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE bulk_batches (
+                batch_id TEXT PRIMARY KEY,
+                telegram_user_id INTEGER NOT NULL,
+                spreadsheet_id TEXT,
+                direction TEXT,
+                sheet_name TEXT NOT NULL,
+                sheet_id INTEGER NOT NULL,
+                start_row INTEGER NOT NULL,
+                data_start_row INTEGER NOT NULL,
+                reserved_rows INTEGER NOT NULL,
+                batch_status TEXT,
+                last_known_batch_status TEXT,
+                last_seen_final_answers_digest_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO bulk_batches (
+                batch_id, telegram_user_id, spreadsheet_id, direction, sheet_name,
+                sheet_id, start_row, data_start_row, reserved_rows, batch_status,
+                last_known_batch_status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "BATCH-OLD",
+                100,
+                "spreadsheet",
+                "ФЛ",
+                "Массовый ввод",
+                10,
+                1,
+                3,
+                5,
+                "Нужны пояснения",
+                "Новая пачка",
+                "2026-06-01T10:00:00+00:00",
+                "2026-06-01T10:00:00+00:00",
+            ),
+        )
+        await db.commit()
+
+    repository = DraftRepository(db_path)
+    await repository.init()
+    batch = await repository.get_bulk_batch("BATCH-OLD")
+
+    assert batch is not None
+    assert batch.status_schema_version == 1
+    assert batch.batch_status == "Нужны пояснения"

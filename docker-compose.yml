@@ -1,0 +1,19 @@
+name: alfa-auto-requests
+
+services:
+  bot:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SQLITE_PATH: /data/app.db
+      GOOGLE_CREDENTIALS_PATH: /run/secrets/google_credentials.json
+      TZ: ${BOT_TIMEZONE:-Europe/Moscow}
+    volumes:
+      - bot-data:/data
+      - ./credentials.json:/run/secrets/google_credentials.json:ro
+    restart: unless-stopped
+
+volumes:
+  bot-data:

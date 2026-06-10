@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+/data/
+credentials.json
+*.log
+deploy.tar.gz
+*.xlsx
+context
+test_sheet.py
+GigaChatapi.yml
