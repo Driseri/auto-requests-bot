@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from app.google_api import GoogleApiRetryConfig, execute_with_retry
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -159,6 +160,7 @@ class GoogleSheetsBulkBatchService:
         repository: DraftRepository,
         sheets_api: Any | None = None,
         reserved_rows: int = DEFAULT_BULK_RESERVED_ROWS,
+        google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
     ) -> None:
         self.direction_spreadsheets = direction_spreadsheets or DirectionSpreadsheetConfig(
@@ -171,6 +173,8 @@ class GoogleSheetsBulkBatchService:
         self.credentials_path = credentials_path
         self.repository = repository
         self._sheets_api = sheets_api
+        self._external_sheets_api = sheets_api is not None
+        self.google_api_retry = google_api_retry
         self.reserved_rows = reserved_rows
         self.application_editors = application_editors
         self._sheet_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -191,11 +195,18 @@ class GoogleSheetsBulkBatchService:
         try:
             async with lock:
                 existing_batches = await self.repository.list_bulk_batches()
+                batch_id = generate_batch_id()
                 batch, insert_url = await asyncio.to_thread(
-                    self._create_batch_sync,
-                    telegram_user_id,
-                    direction,
-                    existing_batches,
+                    execute_with_retry,
+                    lambda: self._create_batch_sync(
+                        telegram_user_id,
+                        direction,
+                        existing_batches,
+                        batch_id,
+                    ),
+                    config=self.google_api_retry,
+                    operation_id=f"bulk-create:{telegram_user_id}:{direction}",
+                    reset_client=self._reset_sheets_api,
                 )
                 saved_batch = await self.repository.save_bulk_batch(
                     batch_id=batch.batch_id,
@@ -227,6 +238,7 @@ class GoogleSheetsBulkBatchService:
         telegram_user_id: int,
         direction: str,
         existing_batches: list[BulkBatch],
+        batch_id: str,
     ) -> tuple[BulkBatch, str]:
         api = self._get_sheets_api()
         spreadsheet_id = self.direction_spreadsheets.spreadsheet_id_for(direction)
@@ -235,6 +247,36 @@ class GoogleSheetsBulkBatchService:
         sheet_name = _bulk_sheet_name(direction)
         sheet_id = self._get_or_create_sheet_id(api, spreadsheet_id, sheet_name, BULK_STAGING_COLUMN_COUNT)
         existing_rows = self._read_rows(api, spreadsheet_id, sheet_name, "A:N")
+        existing_start_row = next(
+            (
+                row_number
+                for row_number, row in enumerate(existing_rows, start=1)
+                if _cell(row, 1).strip() == batch_id
+            ),
+            None,
+        )
+        if existing_start_row is not None:
+            data_start_row = existing_start_row + 2
+            batch = BulkBatch(
+                batch_id=batch_id,
+                telegram_user_id=telegram_user_id,
+                spreadsheet_id=spreadsheet_id,
+                direction=direction,
+                sheet_name=sheet_name,
+                sheet_id=sheet_id,
+                start_row=existing_start_row,
+                data_start_row=data_start_row,
+                reserved_rows=self.reserved_rows,
+                data_end_row=data_start_row + self.reserved_rows - 1,
+                status_schema_version=2,
+                created_at=utc_now_iso(),
+                updated_at=utc_now_iso(),
+            )
+            return batch, self._insert_url(
+                spreadsheet_id,
+                sheet_id,
+                data_start_row,
+            )
         start_row = _next_batch_start_row(
             existing_rows=existing_rows,
             existing_batches=existing_batches,
@@ -243,7 +285,6 @@ class GoogleSheetsBulkBatchService:
         )
         data_start_row = start_row + 2
         data_end_row = data_start_row + self.reserved_rows - 1
-        batch_id = generate_batch_id()
         now = utc_now_iso()
 
         rows = [
@@ -379,6 +420,10 @@ class GoogleSheetsBulkBatchService:
             self._sheets_api = build_google_sheets_api(self.credentials_path)
         return self._sheets_api
 
+    def _reset_sheets_api(self) -> None:
+        if not self._external_sheets_api:
+            self._sheets_api = None
+
 
 class BulkApplicationRegistrar:
     def __init__(
@@ -391,11 +436,14 @@ class BulkApplicationRegistrar:
         dashboard_sync: DashboardSyncService | None = None,
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
         registration_stale_seconds: int = DEFAULT_BULK_REGISTRATION_STALE_SECONDS,
+        google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
     ) -> None:
         self.repository = repository
         self.spreadsheet_id = spreadsheet_id
         self.credentials_path = credentials_path
         self._sheets_api = sheets_api
+        self._external_sheets_api = sheets_api is not None
+        self.google_api_retry = google_api_retry
         self.dashboard_sync = dashboard_sync
         self.application_editors = application_editors
         self.registration_stale_seconds = registration_stale_seconds
@@ -456,14 +504,19 @@ class BulkApplicationRegistrar:
         return result
 
     async def _register_claimed_batch(self, batch: BulkBatch) -> BulkRegistrationResult:
-        api = self._get_sheets_api()
-        layout = await asyncio.to_thread(self._read_batch_layout, api, batch)
+        layout = await self._run_google(
+            lambda: self._read_batch_layout(self._get_sheets_api(), batch),
+            f"bulk-layout:{batch.batch_id}",
+        )
         if layout is None:
             return BulkRegistrationResult(
                 success=False,
                 message="Структура колонок массовой заявки не соответствует поддерживаемым схемам.",
             )
-        if await asyncio.to_thread(self._has_overflow_data, api, batch, layout):
+        if await self._run_google(
+            lambda: self._has_overflow_data(self._get_sheets_api(), batch, layout),
+            f"bulk-overflow:{batch.batch_id}",
+        ):
             return BulkRegistrationResult(
                 success=False,
                 message=(
@@ -474,7 +527,10 @@ class BulkApplicationRegistrar:
         registered = 0
         user_rows = 0
         actual_rows = 0
-        rows = await asyncio.to_thread(self._read_batch_rows, api, batch)
+        rows = await self._run_google(
+            lambda: self._read_batch_rows(self._get_sheets_api(), batch),
+            f"bulk-read:{batch.batch_id}",
+        )
         invalid_change_type_rows: list[int] = []
         normalized_change_types: list[tuple[int, str]] = []
         for offset, row in enumerate(rows):
@@ -502,12 +558,14 @@ class BulkApplicationRegistrar:
                 ),
             )
         if normalized_change_types:
-            await asyncio.to_thread(
-                self._write_normalized_change_types,
-                api,
-                batch,
-                normalized_change_types,
-                layout,
+            await self._run_google(
+                lambda: self._write_normalized_change_types(
+                    self._get_sheets_api(),
+                    batch,
+                    normalized_change_types,
+                    layout,
+                ),
+                f"bulk-normalize:{batch.batch_id}",
             )
         for offset, row in enumerate(rows):
             staging_row_number = batch.data_start_row + offset
@@ -526,13 +584,15 @@ class BulkApplicationRegistrar:
                 continue
 
             application_id = generate_application_id()
-            await asyncio.to_thread(
-                self._write_registration_cells,
-                api,
-                batch,
-                staging_row_number,
-                application_id,
-                layout,
+            await self._run_google(
+                lambda: self._write_registration_cells(
+                    self._get_sheets_api(),
+                    batch,
+                    staging_row_number,
+                    application_id,
+                    layout,
+                ),
+                f"bulk-register:{batch.batch_id}:{staging_row_number}",
             )
             await self._save_new_application(
                 batch, row, staging_row_number, application_id, layout
@@ -548,7 +608,14 @@ class BulkApplicationRegistrar:
                 ),
             )
         data_end_row = batch.data_start_row + actual_rows - 1
-        await asyncio.to_thread(self._group_batch_rows, api, batch, actual_rows)
+        await self._run_google(
+            lambda: self._group_batch_rows(
+                self._get_sheets_api(),
+                batch,
+                actual_rows,
+            ),
+            f"bulk-group:{batch.batch_id}",
+        )
         await self._sync_dashboard(
             batch,
             final_answer_present=_has_final_answer(
@@ -567,6 +634,15 @@ class BulkApplicationRegistrar:
             message=f"Массовая заявка зарегистрирована. Строк зарегистрировано: {user_rows}.",
             registered_count=user_rows,
             retry_allowed=False,
+        )
+
+    async def _run_google(self, operation, operation_id: str):
+        return await asyncio.to_thread(
+            execute_with_retry,
+            operation,
+            config=self.google_api_retry,
+            operation_id=operation_id,
+            reset_client=self._reset_sheets_api,
         )
 
     async def _sync_dashboard(self, batch: BulkBatch, *, final_answer_present: bool) -> None:
@@ -891,6 +967,10 @@ class BulkApplicationRegistrar:
         if self._sheets_api is None:
             self._sheets_api = build_google_sheets_api(self.credentials_path)
         return self._sheets_api
+
+    def _reset_sheets_api(self) -> None:
+        if not self._external_sheets_api:
+            self._sheets_api = None
 
 
 def _bulk_header_row(

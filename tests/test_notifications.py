@@ -201,6 +201,26 @@ class FakeDashboardSync:
         )
 
 
+class SelectiveFailNotifier(FakeNotifier):
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup=None,
+        link_preview_options=None,
+    ):
+        if chat_id == 100:
+            raise RuntimeError("telegram unavailable for one user")
+        await super().send_message(
+            chat_id,
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            link_preview_options=link_preview_options,
+        )
+
+
 class FakeResponse:
     def __init__(self, status: int = 429, reason: str = "Too Many Requests") -> None:
         self.status = status
@@ -1050,8 +1070,7 @@ async def test_notification_service_does_not_update_tracking_if_send_fails(tmp_p
         notifier=FakeNotifier(fail=True),
     )
 
-    with pytest.raises(RuntimeError):
-        await service.run_once()
+    await service.run_once()
 
     tracked = await repository.get_submitted_application("A1B2C3D4")
     assert tracked is not None
@@ -1265,8 +1284,7 @@ async def test_bulk_clarification_notification_retries_after_send_failure(tmp_pa
         notifier=FakeNotifier(fail=True),
     )
 
-    with pytest.raises(RuntimeError):
-        await service.run_once()
+    await service.run_once()
 
     saved = await repository.get_submitted_application("A1B2C3D4")
     assert saved is not None
@@ -1356,12 +1374,55 @@ async def test_bulk_done_notification_retries_when_telegram_send_fails(tmp_path)
         notifier=FakeNotifier(fail=True),
     )
 
-    with pytest.raises(RuntimeError):
-        await service.run_once()
+    await service.run_once()
 
     saved = await repository.get_bulk_batch(batch.batch_id)
     assert saved is not None
     assert saved.last_known_batch_status == BulkBatchStatus.NEW.value
+
+
+@pytest.mark.asyncio
+async def test_notification_failure_for_one_user_does_not_block_others(tmp_path):
+    repository = DraftRepository(str(tmp_path / "isolated_users.db"))
+    await repository.init()
+    for application_id, user_id in (("A1B2C3D4", 100), ("B1C2D3E4", 200)):
+        await repository.save_submitted_application(
+            application_id=application_id,
+            telegram_user_id=user_id,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_id=100,
+            sheet_name=WEEK_SHEET,
+            last_known_status=ApplicationStatus.NEW.value,
+        )
+    statuses = {
+        application_id: SheetApplicationStatus(
+            application_id=application_id,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_name=WEEK_SHEET,
+            sheet_id=100,
+            row_number=row_number,
+            status=ApplicationStatus.ACCEPTED.value,
+            editor_comment="",
+            final_answer="",
+        )
+        for application_id, row_number in (("A1B2C3D4", 2), ("B1C2D3E4", 3))
+    }
+    notifier = SelectiveFailNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(statuses),
+        notifier=notifier,
+    )
+
+    await service.run_once()
+
+    failed = await repository.get_submitted_application("A1B2C3D4")
+    successful = await repository.get_submitted_application("B1C2D3E4")
+    assert failed is not None
+    assert successful is not None
+    assert failed.last_known_status == ApplicationStatus.NEW.value
+    assert successful.last_known_status == ApplicationStatus.ACCEPTED.value
+    assert [message["chat_id"] for message in notifier.messages] == [200]
 
 
 @pytest.mark.asyncio

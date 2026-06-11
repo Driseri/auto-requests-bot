@@ -6,6 +6,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from app.google_api import GoogleApiRetryConfig
 from app.scheduling import (
     DEFAULT_THURSDAY_CUTOFF,
     DEFAULT_TIMEZONE,
@@ -51,6 +52,8 @@ class Settings:
     bulk_registration_stale_seconds: int
     rollout_schedule: RolloutSchedule
     application_editors: tuple[str, ...]
+    google_api_retry: GoogleApiRetryConfig
+    status_polling_heartbeat_path: str
 
 
 def load_settings() -> Settings:
@@ -165,6 +168,20 @@ def load_settings() -> Settings:
             ),
         ),
         application_editors=_env_editors("APPLICATION_EDITORS"),
+        google_api_retry=GoogleApiRetryConfig(
+            max_attempts=int(os.getenv("GOOGLE_API_MAX_ATTEMPTS", "4").strip() or "4"),
+            base_seconds=float(
+                os.getenv("GOOGLE_API_RETRY_BASE_SECONDS", "1").strip() or "1"
+            ),
+            max_seconds=float(
+                os.getenv("GOOGLE_API_RETRY_MAX_SECONDS", "8").strip() or "8"
+            ),
+        ),
+        status_polling_heartbeat_path=os.getenv(
+            "STATUS_POLLING_HEARTBEAT_PATH",
+            "/data/status-polling-heartbeat.json",
+        ).strip()
+        or "/data/status-polling-heartbeat.json",
     )
 
 

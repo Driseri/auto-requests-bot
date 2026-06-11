@@ -10,7 +10,9 @@ from typing import Any, Callable, Protocol
 from aiogram.types import LinkPreviewOptions
 from googleapiclient.errors import HttpError
 
+from app.google_api import GoogleApiRetryConfig, execute_with_retry
 from app.keyboards import build_keyboard
+from app.health import write_heartbeat
 from app.bulk import (
     BULK_STAGING_HEADERS,
     CURRENT_BULK_STAGING_HEADERS,
@@ -119,14 +121,17 @@ class GoogleSheetsStatusReader:
         direction_spreadsheets: DirectionSpreadsheetConfig,
         credentials_path: str,
         sheets_api: Any | None = None,
+        google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
     ) -> None:
         self.direction_spreadsheets = direction_spreadsheets
         self.credentials_path = credentials_path
         self._sheets_api = sheets_api
+        self._external_sheets_api = sheets_api is not None
+        self.google_api_retry = google_api_retry
         self._sheet_ids_cache: dict[str, dict[str, int]] = {}
 
     async def read_statuses(self) -> dict[str, SheetApplicationStatus]:
-        return await asyncio.to_thread(self._read_statuses_sync)
+        return await self._run_with_retry(self._read_statuses_sync, "status-full-scan")
 
     async def read_statuses_for(
         self,
@@ -134,29 +139,46 @@ class GoogleSheetsStatusReader:
         *,
         fallback_full_scan: bool = False,
     ) -> dict[str, SheetApplicationStatus]:
-        return await asyncio.to_thread(
-            self._read_statuses_for_sync,
-            applications,
-            fallback_full_scan,
+        return await self._run_with_retry(
+            lambda: self._read_statuses_for_sync(applications, fallback_full_scan),
+            "status-tracked-scan",
         )
 
     async def read_bulk_application_statuses(
         self,
         batches: list[BulkBatch],
     ) -> dict[str, SheetApplicationStatus]:
-        return await asyncio.to_thread(self._read_bulk_application_statuses_sync, batches)
+        return await self._run_with_retry(
+            lambda: self._read_bulk_application_statuses_sync(batches),
+            "status-bulk-rows",
+        )
 
     async def read_batch_statuses(
         self,
         batches: list[BulkBatch],
     ) -> dict[str, SheetBulkBatchStatus]:
-        return await asyncio.to_thread(self._read_batch_statuses_sync, batches)
+        return await self._run_with_retry(
+            lambda: self._read_batch_statuses_sync(batches),
+            "status-bulk-batches",
+        )
 
     async def read_bulk_editor_comments(
         self,
         batches: list[BulkBatch],
     ) -> dict[str, list[BulkEditorComment]]:
-        return await asyncio.to_thread(self._read_bulk_editor_comments_sync, batches)
+        return await self._run_with_retry(
+            lambda: self._read_bulk_editor_comments_sync(batches),
+            "status-bulk-comments",
+        )
+
+    async def _run_with_retry(self, operation: Callable[[], Any], operation_id: str) -> Any:
+        return await asyncio.to_thread(
+            execute_with_retry,
+            operation,
+            config=self.google_api_retry,
+            operation_id=operation_id,
+            reset_client=self._reset_sheets_api,
+        )
 
     def _read_statuses_sync(self) -> dict[str, SheetApplicationStatus]:
         api = self._get_sheets_api()
@@ -456,6 +478,12 @@ class GoogleSheetsStatusReader:
             self._sheets_api = build_google_sheets_api(self.credentials_path)
         return self._sheets_api
 
+    def _reset_sheets_api(self) -> None:
+        if self._external_sheets_api:
+            return
+        self._sheets_api = None
+        self._sheet_ids_cache.clear()
+
 
 class StatusNotificationService:
     def __init__(
@@ -482,7 +510,14 @@ class StatusNotificationService:
     async def run_once(self) -> None:
         self._polling_iteration += 1
         dashboard_sync_due = self._is_dashboard_sync_due()
-        await self._process_bulk_batch_statuses(sync_dashboard=dashboard_sync_due)
+        if hasattr(self.repository, "list_active_bulk_batches"):
+            active_batches = await self.repository.list_active_bulk_batches()
+        else:
+            active_batches = await self.repository.list_bulk_batches()
+        await self._process_bulk_batch_statuses(
+            active_batches,
+            sync_dashboard=dashboard_sync_due,
+        )
         tracked = await self.repository.list_submitted_applications()
         if not tracked:
             if dashboard_sync_due:
@@ -500,7 +535,7 @@ class StatusNotificationService:
         if hasattr(self.status_reader, "read_bulk_application_statuses"):
             statuses.update(
                 await self.status_reader.read_bulk_application_statuses(
-                    await self.repository.list_bulk_batches()
+                    active_batches
                 )
             )
         notifications_by_user: dict[int, list[StatusNotification]] = {}
@@ -563,13 +598,20 @@ class StatusNotificationService:
 
         for telegram_user_id, notifications in notifications_by_user.items():
             text = await self._render_notification_message(notifications)
-            await self.notifier.send_message(
-                telegram_user_id,
-                text,
-                parse_mode="HTML",
-                reply_markup=await self._reply_markup_for_user(telegram_user_id),
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-            )
+            try:
+                await self.notifier.send_message(
+                    telegram_user_id,
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=await self._reply_markup_for_user(telegram_user_id),
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Telegram notification failed: telegram_user_id=%s",
+                    telegram_user_id,
+                )
+                continue
             for notification in notifications:
                 await self._update_tracking(
                     notification.tracked,
@@ -598,10 +640,14 @@ class StatusNotificationService:
             return notification.current.status == BulkApplicationStatus.NEEDS_CLARIFICATION.value
         return notification.current.status in SINGLE_IMPORTANT_STATUSES
 
-    async def _process_bulk_batch_statuses(self, *, sync_dashboard: bool) -> None:
+    async def _process_bulk_batch_statuses(
+        self,
+        batches: list[BulkBatch],
+        *,
+        sync_dashboard: bool,
+    ) -> None:
         if not hasattr(self.status_reader, "read_batch_statuses"):
             return
-        batches = await self.repository.list_bulk_batches()
         if not batches:
             return
         current_by_batch = await self.status_reader.read_batch_statuses(batches)
@@ -629,13 +675,20 @@ class StatusNotificationService:
             )
 
         for telegram_user_id, items in notifications_by_user.items():
-            await self.notifier.send_message(
-                telegram_user_id,
-                self._render_bulk_batch_status_message(items),
-                parse_mode="HTML",
-                reply_markup=await self._reply_markup_for_user(telegram_user_id),
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-            )
+            try:
+                await self.notifier.send_message(
+                    telegram_user_id,
+                    self._render_bulk_batch_status_message(items),
+                    parse_mode="HTML",
+                    reply_markup=await self._reply_markup_for_user(telegram_user_id),
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Bulk Telegram notification failed: telegram_user_id=%s",
+                    telegram_user_id,
+                )
+                continue
             for batch, current in items:
                 await self._update_bulk_batch_tracking(
                     batch,
@@ -896,14 +949,30 @@ async def run_status_polling_loop(
     *,
     service: StatusNotificationService,
     interval_seconds: float,
+    heartbeat_path: str | None = None,
 ) -> None:
+    consecutive_errors = 0
+    successful_iterations = 0
     while True:
         try:
             await service.run_once()
+            successful_iterations += 1
+            if heartbeat_path:
+                write_heartbeat(heartbeat_path, iteration=successful_iterations)
+            if consecutive_errors:
+                LOGGER.info(
+                    "Status polling recovered after %s consecutive errors",
+                    consecutive_errors,
+                )
+            consecutive_errors = 0
         except asyncio.CancelledError:
             raise
         except Exception:
-            LOGGER.exception("Status polling iteration failed")
+            consecutive_errors += 1
+            LOGGER.exception(
+                "Status polling iteration failed: consecutive_errors=%s",
+                consecutive_errors,
+            )
         await asyncio.sleep(interval_seconds)
 
 

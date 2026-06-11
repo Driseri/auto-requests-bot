@@ -4,6 +4,20 @@
 
 Сделать деплой предсказуемым: изменения попадают на VPS только после тестов, сборки Docker-образа и контролируемого перезапуска контейнера. Секреты не хранятся в репозитории и не попадают в Docker image.
 
+## Подготовленная Локальная Основа
+
+- `docker-compose.prod.yml` запускает image с обязательным `APP_VERSION`, а не плавающим `latest`.
+- В Compose настроены healthcheck и ротация логов `10m x 5`.
+- One-shot сервис `backup` создает проверенную SQLite-копию через Backup API.
+- Перед переключением версии нужно выполнить backup и сохранить предыдущий `APP_VERSION`.
+- Rollback выполняется возвратом предыдущего SHA-тега:
+
+```bash
+APP_VERSION=<previous-commit-sha> docker compose -f docker-compose.prod.yml up -d --force-recreate bot
+```
+
+На текущем этапе эти файлы подготовлены и проверяются локально. Автоматический deploy на VPS не выполняется.
+
 ## Рекомендуемая схема
 
 Лучший вариант для проекта: GitHub Actions + Docker image registry + SSH deploy на VPS.
@@ -294,4 +308,3 @@ GigaChat check failed
 3. На VPS один раз положить prod compose.
 4. Добавить CD через SSH.
 5. Перейти с ручного `deploy.tar.gz` на deploy из GitHub Actions.
-

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from html import escape
 
@@ -25,6 +26,7 @@ from app.models import (
     LlmContext,
     Priority,
     Step,
+    SubmissionState,
     direction_display_label,
     direction_value_from_display_label,
 )
@@ -89,6 +91,7 @@ class ApplicationFlow:
         self.bulk_service = bulk_service
         self.bulk_registrar = bulk_registrar
         self.show_llm_response_json = show_llm_response_json
+        self._submission_locks: dict[str, asyncio.Lock] = {}
 
     async def show_start(self) -> BotResponse:
         return BotResponse(
@@ -786,7 +789,18 @@ class ApplicationFlow:
         return self._review_response(draft)
 
     async def submit(self, telegram_user_id: int) -> BotResponse:
-        draft = await self._get_active_or_start(telegram_user_id)
+        draft = await self.repository.get_by_user_id(telegram_user_id)
+        if draft is None:
+            draft = await self.repository.get_or_create(telegram_user_id)
+        if draft.submission_state == SubmissionState.SENT.value:
+            return BotResponse(
+                text=(
+                    "Заявка уже отправлена в таблицу.\n\n"
+                    "Чтобы создать новую заявку, отправьте /new."
+                ),
+                keyboard=KeyboardKind.CREATE_MODE,
+                draft=draft,
+            )
         missing = self._missing_required_fields(draft)
         if missing:
             return BotResponse(
@@ -800,28 +814,52 @@ class ApplicationFlow:
             )
 
         draft = await self.repository.ensure_application_id(telegram_user_id)
-        result = await self.submission_service.submit(draft)
-        if not result.success:
-            return BotResponse(
-                text=result.message,
-                keyboard=KeyboardKind.REVIEW,
-                draft=draft,
-            )
+        application_id = draft.application_id or ""
+        lock = self._submission_locks.setdefault(application_id, asyncio.Lock())
+        async with lock:
+            draft = await self.repository.get_by_user_id(telegram_user_id) or draft
+            if draft.submission_state == SubmissionState.SENT.value:
+                return BotResponse(
+                    text=(
+                        "Заявка уже отправлена в таблицу.\n\n"
+                        "Чтобы создать новую заявку, отправьте /new."
+                    ),
+                    keyboard=KeyboardKind.CREATE_MODE,
+                    draft=draft,
+                )
 
-        await self.repository.save_submitted_application(
-            application_id=draft.application_id or "",
-            telegram_user_id=telegram_user_id,
-            spreadsheet_id=result.spreadsheet_id,
-            sheet_id=result.sheet_id,
-            sheet_name=result.sheet_name or "",
-            last_known_status=ApplicationStatus.NEW.value,
-            direction=draft.direction,
-            answer_type=draft.answer_type,
-            application_type=draft.application_type,
-            is_urgent=draft.is_urgent,
-            last_seen_row_number=result.row_number,
-        )
-        draft = await self.repository.complete(telegram_user_id)
+            resolve_target = getattr(self.submission_service, "resolve_target", None)
+            if callable(resolve_target):
+                spreadsheet_id, sheet_name = resolve_target(draft)
+            else:
+                spreadsheet_id, sheet_name = "", ""
+            draft = await self.repository.begin_submission(
+                telegram_user_id,
+                spreadsheet_id=spreadsheet_id,
+                sheet_name=sheet_name,
+            )
+            result = await self.submission_service.submit(draft)
+            if not result.success:
+                await self.repository.fail_submission(telegram_user_id)
+                return BotResponse(
+                    text=result.message,
+                    keyboard=KeyboardKind.REVIEW,
+                    draft=draft,
+                )
+
+            draft = await self.repository.complete_submission(
+                telegram_user_id,
+                application_id=application_id,
+                spreadsheet_id=result.spreadsheet_id,
+                sheet_id=result.sheet_id,
+                sheet_name=result.sheet_name or sheet_name,
+                row_number=result.row_number,
+                last_known_status=ApplicationStatus.NEW.value,
+                direction=draft.direction,
+                answer_type=draft.answer_type,
+                application_type=draft.application_type,
+                is_urgent=draft.is_urgent,
+            )
         return BotResponse(
             text=f"{result.message}\n\nЧтобы создать новую заявку, отправьте /new.",
             keyboard=KeyboardKind.CREATE_MODE,

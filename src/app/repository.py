@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiosqlite
 
 from app.models import (
     BulkBatch,
+    BulkBatchStatus,
     BulkRegistrationState,
     Draft,
     Step,
+    SubmissionState,
     SubmittedApplication,
     TEXT_FIELDS,
     UserSettings,
@@ -29,7 +32,9 @@ class DraftRepository:
         if db_path.parent and str(db_path.parent) != ".":
             db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA synchronous=NORMAL")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS drafts (
@@ -53,6 +58,12 @@ class DraftRepository:
                     llm_check_status TEXT NOT NULL DEFAULT 'not_checked',
                     llm_score REAL,
                     clarification_count INTEGER NOT NULL DEFAULT 0,
+                    submission_state TEXT NOT NULL DEFAULT 'DRAFT',
+                    submission_started_at TEXT,
+                    submission_spreadsheet_id TEXT,
+                    submission_sheet_name TEXT,
+                    submission_sheet_id INTEGER,
+                    submission_row_number INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -66,6 +77,14 @@ class DraftRepository:
             await self._ensure_column(db, "application_type", "TEXT")
             await self._ensure_column(db, "change_type", "TEXT")
             await self._ensure_column(db, "author_name", "TEXT")
+            await self._ensure_column(
+                db, "submission_state", "TEXT NOT NULL DEFAULT 'DRAFT'"
+            )
+            await self._ensure_column(db, "submission_started_at", "TEXT")
+            await self._ensure_column(db, "submission_spreadsheet_id", "TEXT")
+            await self._ensure_column(db, "submission_sheet_name", "TEXT")
+            await self._ensure_column(db, "submission_sheet_id", "INTEGER")
+            await self._ensure_column(db, "submission_row_number", "INTEGER")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_settings (
@@ -192,6 +211,30 @@ class DraftRepository:
                 )
             await self._ensure_user_settings_column(db, "pending_action", "TEXT")
             await self._ensure_user_settings_column(db, "default_direction", "TEXT")
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_submitted_applications_batch_id
+                ON submitted_applications(batch_id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_submitted_applications_user_id
+                ON submitted_applications(telegram_user_id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_submitted_applications_sheet
+                ON submitted_applications(spreadsheet_id, sheet_name)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bulk_batches_active
+                ON bulk_batches(registration_state, last_known_batch_status)
+                """
+            )
             await self._migrate_llm_completeness_check(db)
             await db.commit()
 
@@ -208,7 +251,7 @@ class DraftRepository:
             created_at=now,
             updated_at=now,
         )
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 INSERT INTO drafts (
@@ -229,7 +272,7 @@ class DraftRepository:
         return draft
 
     async def get_by_user_id(self, telegram_user_id: int) -> Draft | None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM drafts WHERE telegram_user_id = ?",
@@ -300,15 +343,161 @@ class DraftRepository:
         return draft
 
     async def delete(self, telegram_user_id: int) -> None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute("DELETE FROM drafts WHERE telegram_user_id = ?", (telegram_user_id,))
             await db.commit()
 
     async def complete(self, telegram_user_id: int) -> Draft:
         return await self.set_step(telegram_user_id, Step.COMPLETED)
 
+    async def begin_submission(
+        self,
+        telegram_user_id: int,
+        *,
+        spreadsheet_id: str,
+        sheet_name: str,
+        stale_after_seconds: int = 600,
+    ) -> Draft:
+        now = datetime.now(timezone.utc)
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM drafts WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await db.rollback()
+                raise LookupError(f"Draft not found for user {telegram_user_id}")
+            current = self._draft_from_row(row)
+            if current.submission_state == SubmissionState.SENT.value:
+                await db.commit()
+                return current
+            started = _parse_iso_datetime(current.submission_started_at)
+            active_pending = (
+                current.submission_state == SubmissionState.PENDING.value
+                and started is not None
+                and now - started < timedelta(seconds=stale_after_seconds)
+            )
+            if not active_pending:
+                await db.execute(
+                    """
+                    UPDATE drafts
+                    SET submission_state = ?,
+                        submission_started_at = ?,
+                        submission_spreadsheet_id = COALESCE(submission_spreadsheet_id, ?),
+                        submission_sheet_name = COALESCE(submission_sheet_name, ?),
+                        updated_at = ?
+                    WHERE telegram_user_id = ?
+                    """,
+                    (
+                        SubmissionState.PENDING.value,
+                        now.isoformat(),
+                        spreadsheet_id,
+                        sheet_name,
+                        now.isoformat(),
+                        telegram_user_id,
+                    ),
+                )
+            await db.commit()
+        updated = await self.get_by_user_id(telegram_user_id)
+        if updated is None:
+            raise LookupError(f"Draft not found for user {telegram_user_id}")
+        return updated
+
+    async def fail_submission(self, telegram_user_id: int) -> None:
+        await self._update_fields(
+            telegram_user_id,
+            {
+                "submission_state": SubmissionState.FAILED.value,
+                "submission_started_at": None,
+            },
+        )
+
+    async def complete_submission(
+        self,
+        telegram_user_id: int,
+        *,
+        application_id: str,
+        spreadsheet_id: str | None,
+        sheet_id: int | None,
+        sheet_name: str,
+        row_number: int | None,
+        last_known_status: str,
+        direction: str | None,
+        answer_type: str | None,
+        application_type: str | None,
+        is_urgent: bool | None,
+    ) -> Draft:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                INSERT INTO submitted_applications (
+                    application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
+                    last_known_status, direction, answer_type, application_type, is_urgent,
+                    last_seen_row_number, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(application_id) DO UPDATE SET
+                    spreadsheet_id = excluded.spreadsheet_id,
+                    sheet_id = excluded.sheet_id,
+                    sheet_name = excluded.sheet_name,
+                    last_seen_row_number = COALESCE(
+                        excluded.last_seen_row_number,
+                        submitted_applications.last_seen_row_number
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    application_id,
+                    telegram_user_id,
+                    spreadsheet_id,
+                    sheet_id,
+                    sheet_name,
+                    last_known_status,
+                    direction,
+                    answer_type,
+                    application_type,
+                    1 if is_urgent else 0 if is_urgent is not None else None,
+                    row_number,
+                    now,
+                    now,
+                ),
+            )
+            await db.execute(
+                """
+                UPDATE drafts
+                SET submission_state = ?,
+                    submission_started_at = NULL,
+                    submission_spreadsheet_id = ?,
+                    submission_sheet_name = ?,
+                    submission_sheet_id = ?,
+                    submission_row_number = ?,
+                    current_step = ?,
+                    updated_at = ?
+                WHERE telegram_user_id = ?
+                """,
+                (
+                    SubmissionState.SENT.value,
+                    spreadsheet_id,
+                    sheet_name,
+                    sheet_id,
+                    row_number,
+                    Step.COMPLETED.value,
+                    now,
+                    telegram_user_id,
+                ),
+            )
+            await db.commit()
+        draft = await self.get_by_user_id(telegram_user_id)
+        if draft is None:
+            raise LookupError(f"Draft not found for user {telegram_user_id}")
+        return draft
+
     async def get_user_settings(self, telegram_user_id: int) -> UserSettings:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM user_settings WHERE telegram_user_id = ?",
@@ -321,7 +510,7 @@ class DraftRepository:
             return self._settings_from_row(row)
 
         now = utc_now_iso()
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 INSERT INTO user_settings (
@@ -377,7 +566,7 @@ class DraftRepository:
         last_seen_final_answer: str | None = None,
     ) -> SubmittedApplication:
         now = utc_now_iso()
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 INSERT INTO submitted_applications (
@@ -433,7 +622,7 @@ class DraftRepository:
         self,
         application_id: str,
     ) -> SubmittedApplication | None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM submitted_applications WHERE application_id = ?",
@@ -444,7 +633,7 @@ class DraftRepository:
         return self._submitted_from_row(row) if row is not None else None
 
     async def list_submitted_applications(self) -> list[SubmittedApplication]:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM submitted_applications ORDER BY created_at ASC"
@@ -466,7 +655,7 @@ class DraftRepository:
         sheet_id: int | None = None,
         last_seen_final_answer: str | None = None,
     ) -> None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 UPDATE submitted_applications
@@ -514,7 +703,7 @@ class DraftRepository:
     ) -> BulkBatch:
         batch_id = batch_id or generate_batch_id()
         now = utc_now_iso()
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 INSERT INTO bulk_batches (
@@ -560,7 +749,7 @@ class DraftRepository:
         return batch
 
     async def get_bulk_batch(self, batch_id: str) -> BulkBatch | None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM bulk_batches WHERE batch_id = ?",
@@ -571,9 +760,25 @@ class DraftRepository:
         return self._bulk_batch_from_row(row) if row is not None else None
 
     async def list_bulk_batches(self) -> list[BulkBatch]:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM bulk_batches ORDER BY created_at ASC")
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [self._bulk_batch_from_row(row) for row in rows]
+
+    async def list_active_bulk_batches(self) -> list[BulkBatch]:
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM bulk_batches
+                WHERE COALESCE(last_known_batch_status, '') != ?
+                ORDER BY created_at ASC
+                """,
+                (BulkBatchStatus.DONE.value,),
+            )
             rows = await cursor.fetchall()
             await cursor.close()
         return [self._bulk_batch_from_row(row) for row in rows]
@@ -585,7 +790,7 @@ class DraftRepository:
         batch_status: str,
         last_known_batch_status: str,
     ) -> None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 UPDATE bulk_batches
@@ -609,7 +814,7 @@ class DraftRepository:
         *,
         reserved_rows: int,
     ) -> None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 UPDATE bulk_batches
@@ -632,7 +837,7 @@ class DraftRepository:
         stale_after_seconds: int,
     ) -> str:
         now = datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
@@ -686,7 +891,7 @@ class DraftRepository:
         registered_count: int,
         data_end_row: int,
     ) -> None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 UPDATE bulk_batches
@@ -710,7 +915,7 @@ class DraftRepository:
             await db.commit()
 
     async def release_bulk_batch_registration(self, batch_id: str) -> None:
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 """
                 UPDATE bulk_batches
@@ -734,7 +939,7 @@ class DraftRepository:
         assignments = ", ".join(f"{field} = ?" for field in values)
         params = [*values.values(), telegram_user_id]
 
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 f"UPDATE drafts SET {assignments} WHERE telegram_user_id = ?",
                 params,
@@ -764,6 +969,12 @@ class DraftRepository:
             llm_check_status=row["llm_check_status"],
             llm_score=row["llm_score"],
             clarification_count=row["clarification_count"],
+            submission_state=row["submission_state"] or SubmissionState.DRAFT.value,
+            submission_started_at=row["submission_started_at"],
+            submission_spreadsheet_id=row["submission_spreadsheet_id"],
+            submission_sheet_name=row["submission_sheet_name"],
+            submission_sheet_id=row["submission_sheet_id"],
+            submission_row_number=row["submission_row_number"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -837,7 +1048,7 @@ class DraftRepository:
         assignments = ", ".join(f"{field} = ?" for field in values)
         params = [*values.values(), telegram_user_id]
 
-        async with aiosqlite.connect(self.sqlite_path) as db:
+        async with self._connection() as db:
             await db.execute(
                 f"UPDATE user_settings SET {assignments} WHERE telegram_user_id = ?",
                 params,
@@ -852,6 +1063,17 @@ class DraftRepository:
         existing_columns = {row[1] for row in rows}
         if name not in existing_columns:
             await db.execute(f"ALTER TABLE drafts ADD COLUMN {name} {definition}")
+
+    @asynccontextmanager
+    async def _connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        db = await aiosqlite.connect(self.sqlite_path, timeout=10)
+        try:
+            await db.execute("PRAGMA busy_timeout=10000")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("PRAGMA synchronous=NORMAL")
+            yield db
+        finally:
+            await db.close()
 
     @staticmethod
     async def _migrate_llm_completeness_check(db: aiosqlite.Connection) -> None:

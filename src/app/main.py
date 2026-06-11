@@ -100,6 +100,7 @@ async def main() -> None:
         dashboard_sync=dashboard_sync,
         application_editors=settings.application_editors,
         registration_stale_seconds=settings.bulk_registration_stale_seconds,
+        google_api_retry=settings.google_api_retry,
     )
 
     flow = ApplicationFlow(
@@ -126,6 +127,7 @@ async def main() -> None:
             rollout_schedule=settings.rollout_schedule,
             application_editors=settings.application_editors,
             dashboard_sync=dashboard_sync,
+            google_api_retry=settings.google_api_retry,
         ),
         bulk_service=GoogleSheetsBulkBatchService(
             direction_spreadsheets=direction_spreadsheets,
@@ -133,6 +135,7 @@ async def main() -> None:
             repository=repository,
             application_editors=settings.application_editors,
             reserved_rows=settings.bulk_reserved_rows,
+            google_api_retry=settings.google_api_retry,
         ),
         bulk_registrar=bulk_registrar,
     )
@@ -154,6 +157,7 @@ async def main() -> None:
                     status_reader=GoogleSheetsStatusReader(
                         direction_spreadsheets=direction_spreadsheets,
                         credentials_path=settings.google_credentials_path,
+                        google_api_retry=settings.google_api_retry,
                     ),
                     dashboard_sync=dashboard_sync,
                     dashboard_sync_interval_seconds=(
@@ -163,6 +167,7 @@ async def main() -> None:
                     fallback_spreadsheet_id=settings.google_dashboard_spreadsheet_id,
                 ),
                 interval_seconds=settings.status_polling_interval_seconds,
+                heartbeat_path=settings.status_polling_heartbeat_path,
             )
         )
 

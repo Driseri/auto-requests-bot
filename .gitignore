@@ -11,6 +11,7 @@ credentials.json
 *.log
 deploy.tar.gz
 *.xlsx
+backups/
 context
 test_sheet.py
 GigaChatapi.yml

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Alfa auto requests backup at 03:00 Moscow time
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 Europe/Moscow
+Persistent=true
+Unit=alfa-auto-requests-backup.service
+
+[Install]
+WantedBy=timers.target

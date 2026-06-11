@@ -2,13 +2,14 @@ name: alfa-auto-requests
 
 services:
   bot:
-    build: .
+    image: alfa-auto-requests-bot:${APP_VERSION:?APP_VERSION is required}
     env_file:
       - path: .env
-        required: false
+        required: true
     environment:
       SQLITE_PATH: /data/app.db
       GOOGLE_CREDENTIALS_PATH: /run/secrets/google_credentials.json
+      STATUS_POLLING_HEARTBEAT_PATH: /data/status-polling-heartbeat.json
       TZ: ${BOT_TIMEZONE:-Europe/Moscow}
     volumes:
       - bot-data:/data
@@ -27,7 +28,7 @@ services:
         max-file: "5"
 
   backup:
-    build: .
+    image: alfa-auto-requests-bot:${APP_VERSION:?APP_VERSION is required}
     profiles: ["maintenance"]
     environment:
       SQLITE_PATH: /data/app.db
@@ -46,11 +47,6 @@ services:
       - --retention-days
       - "7"
     restart: "no"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
 
 volumes:
   bot-data:

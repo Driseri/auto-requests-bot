@@ -273,6 +273,30 @@ docker compose build
 docker compose run --rm bot pytest
 ```
 
+## Надежность И Резервные Копии
+
+- Одиночная отправка идемпотентна по `application_id`: маршрут фиксируется до первой записи, а повтор сначала ищет существующую строку.
+- Для временных ошибок Google API (`429`, `5xx`, timeout, broken pipe, reset соединения) используется ограниченный exponential backoff с jitter.
+- SQLite работает с `WAL`, `synchronous=NORMAL`, `foreign_keys=ON` и `busy_timeout=10000`.
+- Healthcheck проверяет свежесть heartbeat успешного status polling и доступность SQLite.
+- Docker-логи ограничены пятью файлами по 10 МБ.
+- Завершенные массовые заявки не читаются в каждом частом polling-цикле.
+
+Локальный backup с проверкой `integrity_check`:
+
+```bash
+docker compose --profile maintenance run --rm backup
+```
+
+Проверка и восстановление в отдельный файл:
+
+```bash
+python -m app.maintenance verify backups/app-YYYYMMDD-HHMMSS.db
+python -m app.maintenance restore backups/app-YYYYMMDD-HHMMSS.db restored.db
+```
+
+Примеры systemd unit для ежедневного запуска в 03:00 по Москве находятся в `ops/systemd`. Перед восстановлением production-базы контейнер должен быть остановлен; команда restore не должна указывать на активный `/data/app.db`.
+
 ## Ручная Проверка
 
 1. Создайте Google-таблицы направлений и дашборда.

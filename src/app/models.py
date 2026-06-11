@@ -113,6 +113,13 @@ class BulkRegistrationState(StrEnum):
     REGISTERED = "REGISTERED"
 
 
+class SubmissionState(StrEnum):
+    DRAFT = "DRAFT"
+    PENDING = "PENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+
+
 class ApplicationStatus(StrEnum):
     NEW = "Новая"
     IN_PROGRESS = "В работе"
@@ -221,6 +228,12 @@ class Draft:
     llm_check_status: str = LlmCheckStatus.NOT_CHECKED.value
     llm_score: float | None = None
     clarification_count: int = 0
+    submission_state: str = SubmissionState.DRAFT.value
+    submission_started_at: str | None = None
+    submission_spreadsheet_id: str | None = None
+    submission_sheet_name: str | None = None
+    submission_sheet_id: int | None = None
+    submission_row_number: int | None = None
     created_at: str = ""
     updated_at: str = ""
 

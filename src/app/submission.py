@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Any, Callable, Protocol
 
 from app.formatting import build_text_format_runs, deserialize_formatting_spans
+from app.google_api import GoogleApiRetryConfig, execute_with_retry
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -146,6 +147,9 @@ class DirectionSpreadsheetConfig:
 
 
 class SubmissionServiceProtocol(Protocol):
+    def resolve_target(self, application: Draft) -> tuple[str, str]:
+        ...
+
     async def submit(self, application: Draft) -> SubmissionResult:
         ...
 
@@ -154,7 +158,34 @@ class InMemorySubmissionService:
     def __init__(self) -> None:
         self.submitted: list[Draft] = []
 
+    def resolve_target(self, application: Draft) -> tuple[str, str]:
+        return ("test-spreadsheet", application.submission_sheet_name or "01.06")
+
     async def submit(self, application: Draft) -> SubmissionResult:
+        existing = next(
+            (
+                item
+                for item in self.submitted
+                if item.application_id == application.application_id
+            ),
+            None,
+        )
+        if existing is not None:
+            row_number = self.submitted.index(existing) + 2
+            return SubmissionResult(
+                success=True,
+                message="Заявка уже отправлена в таблицу.",
+                spreadsheet_id="test-spreadsheet",
+                sheet_id=100,
+                sheet_name=application.submission_sheet_name or "01.06",
+                row_number=row_number,
+                row_link=spreadsheet_row_link(
+                    spreadsheet_id="test-spreadsheet",
+                    sheet_id=100,
+                    row_number=row_number,
+                    end_column="X",
+                ),
+            )
         self.submitted.append(application)
         return SubmissionResult(
             success=True,
@@ -183,6 +214,7 @@ class GoogleSheetsSubmissionService:
         clock: Callable[[], datetime] | None = None,
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
         dashboard_sync: DashboardSyncService | None = None,
+        google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
         # Legacy constructor args kept temporarily for tests/old wiring.
         spreadsheet_id: str = "",
         high_priority_sheet_name: str = "",
@@ -197,6 +229,8 @@ class GoogleSheetsSubmissionService:
         self.dashboard_spreadsheet_id = dashboard_spreadsheet_id
         self.credentials_path = credentials_path
         self._sheets_api = sheets_api
+        self._external_sheets_api = sheets_api is not None
+        self.google_api_retry = google_api_retry
         self.rollout_schedule = rollout_schedule
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.application_editors = application_editors
@@ -214,14 +248,21 @@ class GoogleSheetsSubmissionService:
                 f"Google credentials file not found: {self.credentials_path}"
             )
 
-    async def submit(self, application: Draft) -> SubmissionResult:
-        submitted_at = self.clock()
-        spreadsheet_id = self.direction_spreadsheets.spreadsheet_id_for(application.direction)
-        sheet_name = target_sheet_name(
+    def resolve_target(self, application: Draft) -> tuple[str, str]:
+        spreadsheet_id = (
+            application.submission_spreadsheet_id
+            or self.direction_spreadsheets.spreadsheet_id_for(application.direction)
+        )
+        sheet_name = application.submission_sheet_name or target_sheet_name(
             application,
-            submitted_at=submitted_at,
+            submitted_at=self.clock(),
             rollout_schedule=self.rollout_schedule,
         )
+        return spreadsheet_id, sheet_name
+
+    async def submit(self, application: Draft) -> SubmissionResult:
+        submitted_at = self.clock()
+        spreadsheet_id, sheet_name = self.resolve_target(application)
         lock = self._sheet_locks.setdefault(
             (spreadsheet_id, sheet_name),
             asyncio.Lock(),
@@ -229,9 +270,11 @@ class GoogleSheetsSubmissionService:
         try:
             async with lock:
                 result = await asyncio.to_thread(
-                    self._submit_sync,
-                    application,
-                    submitted_at,
+                    execute_with_retry,
+                    lambda: self._submit_sync(application, submitted_at),
+                    config=self.google_api_retry,
+                    operation_id=f"submit:{application.application_id or 'unknown'}",
+                    reset_client=self._reset_sheets_api,
                 )
         except Exception as exc:
             return SubmissionResult(
@@ -243,17 +286,19 @@ class GoogleSheetsSubmissionService:
             )
         return result
 
+    def _reset_sheets_api(self) -> None:
+        if self._external_sheets_api:
+            return
+        self._sheets_api = None
+        if self._dashboard is not None:
+            self._dashboard._sheets_api = None
+
     def _submit_sync(self, application: Draft, submitted_at: datetime) -> SubmissionResult:
-        spreadsheet_id = self.direction_spreadsheets.spreadsheet_id_for(application.direction)
+        spreadsheet_id, sheet_name = self.resolve_target(application)
         if not spreadsheet_id:
             raise SheetConfigurationError(
                 "Для выбранного направления не задан ID Google-таблицы."
             )
-        sheet_name = target_sheet_name(
-            application,
-            submitted_at=submitted_at,
-            rollout_schedule=self.rollout_schedule,
-        )
         api = self._get_sheets_api()
 
         use_sections = application.answer_type == AnswerType.ROLLOUT.value
@@ -264,6 +309,27 @@ class GoogleSheetsSubmissionService:
             use_sections=use_sections,
         )
         schema = layout.split(":", maxsplit=1)[1]
+        existing_row = self._find_application_row(
+            api,
+            spreadsheet_id,
+            sheet_name,
+            application.application_id,
+        )
+        if existing_row is not None:
+            return SubmissionResult(
+                success=True,
+                message="Заявка уже отправлена в таблицу.",
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+                sheet_name=sheet_name,
+                row_number=existing_row,
+                row_link=spreadsheet_row_link(
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_id=sheet_id,
+                    row_number=existing_row,
+                    end_column=_worksheet_schema_layout(schema)["end_column"],
+                ),
+            )
         row_data = _draft_to_row_data(
             application,
             application_editors=self.application_editors,
@@ -323,6 +389,43 @@ class GoogleSheetsSubmissionService:
             row_number=row_number,
             row_link=row_link,
         )
+
+    def _find_application_row(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_name: str,
+        application_id: str | None,
+    ) -> int | None:
+        if not application_id:
+            return None
+        rows = self._read_rows(api, spreadsheet_id, sheet_name)
+        id_column_index: int | None = None
+        known_headers = (
+            WORKSHEET_HEADERS,
+            CURRENT_WORKSHEET_HEADERS,
+            LEGACY_WORKSHEET_HEADERS,
+        )
+        for row_number, row in enumerate(rows, start=1):
+            normalized = [str(value).strip() for value in row]
+            matched_headers = next(
+                (
+                    headers
+                    for headers in known_headers
+                    if normalized[: len(headers)] == headers
+                ),
+                None,
+            )
+            if matched_headers is not None:
+                id_column_index = matched_headers.index("ID заявки")
+                continue
+            if (
+                id_column_index is not None
+                and len(normalized) > id_column_index
+                and normalized[id_column_index] == application_id
+            ):
+                return row_number
+        return None
 
     def _ensure_sheet_ready(
         self,
