@@ -11,7 +11,11 @@ from aiogram.types import LinkPreviewOptions
 from googleapiclient.errors import HttpError
 
 from app.keyboards import build_keyboard
-from app.bulk import BULK_STAGING_HEADERS, LEGACY_BULK_STAGING_HEADERS
+from app.bulk import (
+    BULK_STAGING_HEADERS,
+    CURRENT_BULK_STAGING_HEADERS,
+    LEGACY_BULK_STAGING_HEADERS,
+)
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -25,6 +29,7 @@ from app.models import (
 )
 from app.repository import DraftRepository
 from app.submission import (
+    CURRENT_WORKSHEET_HEADERS,
     DashboardSyncService,
     DirectionSpreadsheetConfig,
     EDITOR_NOT_SELECTED,
@@ -161,8 +166,8 @@ class GoogleSheetsStatusReader:
             for sheet_name, sheet_id in sheet_ids.items():
                 rows = self._read_sheet_rows(api, spreadsheet_id, sheet_name)
                 for index, row, layout in _working_data_rows(rows):
-                    application_id = _cell(row, 0).strip()
-                    application_type = _cell(row, 2).strip()
+                    application_id = _cell(row, layout["application_id"]).strip()
+                    application_type = _cell(row, layout["application_type"]).strip()
                     if (
                         not application_id
                         or application_id == "ID заявки"
@@ -175,14 +180,14 @@ class GoogleSheetsStatusReader:
                     result[application_id] = SheetApplicationStatus(
                         application_id=application_id,
                         spreadsheet_id=spreadsheet_id,
-                        batch_id=_cell(row, 1).strip() or None,
+                        batch_id=_cell(row, layout["batch_id"]).strip() or None,
                         sheet_name=sheet_name,
                         sheet_id=sheet_id,
                         row_number=index,
-                        direction=_cell(row, 4).strip() or None,
-                        answer_type=_cell(row, 5).strip() or None,
-                        is_urgent=_sheet_bool(_cell(row, 6)),
-                        status=_cell(row, 9).strip(),
+                        direction=_cell(row, layout["direction"]).strip() or None,
+                        answer_type=_cell(row, layout["answer_type"]).strip() or None,
+                        is_urgent=_sheet_bool(_cell(row, layout["is_urgent"])),
+                        status=_cell(row, layout["status"]).strip(),
                         editor=_cell(row, layout["editor"]).strip(),
                         editor_comment=_cell(row, layout["comment"]).strip(),
                         final_answer=_cell(row, layout["final_answer"]).strip(),
@@ -213,20 +218,20 @@ class GoogleSheetsStatusReader:
             rows = self._read_sheet_rows(api, spreadsheet_id, sheet_name)
             wanted_ids = {item.application_id for item in group}
             for index, row, layout in _working_data_rows(rows):
-                application_id = _cell(row, 0).strip()
+                application_id = _cell(row, layout["application_id"]).strip()
                 if application_id not in wanted_ids:
                     continue
                 result[application_id] = SheetApplicationStatus(
                     application_id=application_id,
                     spreadsheet_id=spreadsheet_id,
-                    batch_id=_cell(row, 1).strip() or None,
+                    batch_id=_cell(row, layout["batch_id"]).strip() or None,
                     sheet_name=sheet_name,
                     sheet_id=sheet_id or 0,
                     row_number=index,
-                    direction=_cell(row, 4).strip() or None,
-                    answer_type=_cell(row, 5).strip() or None,
-                    is_urgent=_sheet_bool(_cell(row, 6)),
-                    status=_cell(row, 9).strip(),
+                    direction=_cell(row, layout["direction"]).strip() or None,
+                    answer_type=_cell(row, layout["answer_type"]).strip() or None,
+                    is_urgent=_sheet_bool(_cell(row, layout["is_urgent"])),
+                    status=_cell(row, layout["status"]).strip(),
                     editor=_cell(row, layout["editor"]).strip(),
                     editor_comment=_cell(row, layout["comment"]).strip(),
                     final_answer=_cell(row, layout["final_answer"]).strip(),
@@ -260,10 +265,10 @@ class GoogleSheetsStatusReader:
             spreadsheet_id = batch.spreadsheet_id
             if not spreadsheet_id:
                 continue
-            end_row = batch.data_start_row + batch.reserved_rows - 1
+            end_row = _bulk_batch_end_row(batch)
             range_name = (
                 f"{quote_sheet_name(batch.sheet_name)}!"
-                f"A{batch.data_start_row - 1}:M{end_row}"
+                f"A{batch.data_start_row - 1}:N{end_row}"
             )
             try:
                 response = api.spreadsheets().values().get(
@@ -289,10 +294,10 @@ class GoogleSheetsStatusReader:
             if layout is None:
                 continue
             for offset, row in enumerate(rows[1:]):
-                application_id = _cell(row, 7).strip()
+                application_id = _cell(row, layout["application_id"]).strip()
                 if not application_id:
                     continue
-                answer_type = _cell(row, 0).strip()
+                answer_type = _cell(row, layout["answer_type"]).strip()
                 result[application_id] = SheetApplicationStatus(
                     application_id=application_id,
                     spreadsheet_id=spreadsheet_id,
@@ -303,7 +308,10 @@ class GoogleSheetsStatusReader:
                     direction=batch.direction,
                     answer_type=answer_type or None,
                     is_urgent=answer_type == AnswerType.URGENT.value,
-                    status=_cell(row, 8).strip() or ApplicationStatus.NEW.value,
+                    status=(
+                        _cell(row, layout["status"]).strip()
+                        or ApplicationStatus.NEW.value
+                    ),
                     editor=_cell(row, layout["editor"]).strip(),
                     editor_comment=_cell(row, layout["comment"]).strip(),
                     final_answer=_cell(row, layout["final_answer"]).strip(),
@@ -323,7 +331,7 @@ class GoogleSheetsStatusReader:
                 continue
             range_name = (
                 f"{quote_sheet_name(batch.sheet_name)}!"
-                f"A{batch.start_row}:M{batch.data_start_row - 1}"
+                f"A{batch.start_row}:N{batch.data_start_row - 1}"
             )
             try:
                 response = api.spreadsheets().values().get(
@@ -374,10 +382,10 @@ class GoogleSheetsStatusReader:
             spreadsheet_id = batch.spreadsheet_id
             if not spreadsheet_id:
                 continue
-            end_row = batch.data_start_row + max(batch.reserved_rows, 1) - 1
+            end_row = _bulk_batch_end_row(batch)
             range_name = (
                 f"{quote_sheet_name(batch.sheet_name)}!"
-                f"A{batch.data_start_row - 1}:M{end_row}"
+                f"A{batch.data_start_row - 1}:N{end_row}"
             )
             response = api.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
@@ -396,7 +404,7 @@ class GoogleSheetsStatusReader:
                     continue
                 comments.append(
                     BulkEditorComment(
-                        application_id=_cell(row, 7).strip(),
+                        application_id=_cell(row, layout["application_id"]).strip(),
                         spreadsheet_id=spreadsheet_id,
                         sheet_name=batch.sheet_name,
                         sheet_id=batch.sheet_id,
@@ -438,7 +446,7 @@ class GoogleSheetsStatusReader:
     def _read_sheet_rows(self, api: Any, spreadsheet_id: str, sheet_name: str) -> list[list[Any]]:
         response = api.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!A:W",
+            range=f"{quote_sheet_name(sheet_name)}!A:X",
             majorDimension="ROWS",
         ).execute()
         return response.get("values", [])
@@ -910,6 +918,27 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
     headers = [str(value).strip() for value in header_row]
     if headers[: len(WORKSHEET_HEADERS)] == WORKSHEET_HEADERS:
         return {
+            "application_id": 11,
+            "batch_id": 12,
+            "application_type": 13,
+            "direction": 15,
+            "answer_type": 16,
+            "is_urgent": 17,
+            "status": 9,
+            "editor": 10,
+            "comment": 7,
+            "final_answer": 5,
+            "end_column": "X",
+        }
+    if headers[: len(CURRENT_WORKSHEET_HEADERS)] == CURRENT_WORKSHEET_HEADERS:
+        return {
+            "application_id": 0,
+            "batch_id": 1,
+            "application_type": 2,
+            "direction": 4,
+            "answer_type": 5,
+            "is_urgent": 6,
+            "status": 9,
             "editor": 10,
             "comment": 17,
             "final_answer": 19,
@@ -917,6 +946,13 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
         }
     if headers[: len(LEGACY_WORKSHEET_HEADERS)] == LEGACY_WORKSHEET_HEADERS:
         return {
+            "application_id": 0,
+            "batch_id": 1,
+            "application_type": 2,
+            "direction": 4,
+            "answer_type": 5,
+            "is_urgent": 6,
+            "status": 9,
             "editor": -1,
             "comment": 16,
             "final_answer": 18,
@@ -937,7 +973,7 @@ def _working_data_rows(
             continue
         if active_layout is None:
             continue
-        application_id = _cell(row, 0).strip()
+        application_id = _cell(row, active_layout["application_id"]).strip()
         if not application_id or application_id in {"ADD", "EDIT", "CHIPS"}:
             continue
         result.append((row_number, row, active_layout))
@@ -948,6 +984,20 @@ def _bulk_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
     headers = [str(value).strip() for value in header_row]
     if headers[: len(BULK_STAGING_HEADERS)] == BULK_STAGING_HEADERS:
         return {
+            "answer_type": 0,
+            "application_id": 13,
+            "status": 11,
+            "editor": 12,
+            "comment": 9,
+            "final_answer": 7,
+            "batch_status": 11,
+            "end_column": "N",
+        }
+    if headers[: len(CURRENT_BULK_STAGING_HEADERS)] == CURRENT_BULK_STAGING_HEADERS:
+        return {
+            "answer_type": 0,
+            "application_id": 7,
+            "status": 8,
             "editor": 9,
             "comment": 10,
             "final_answer": 12,
@@ -956,6 +1006,9 @@ def _bulk_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
         }
     if headers[: len(LEGACY_BULK_STAGING_HEADERS)] == LEGACY_BULK_STAGING_HEADERS:
         return {
+            "answer_type": 0,
+            "application_id": 7,
+            "status": 8,
             "editor": -1,
             "comment": 9,
             "final_answer": 11,
@@ -963,6 +1016,12 @@ def _bulk_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "end_column": "L",
         }
     return None
+
+
+def _bulk_batch_end_row(batch: BulkBatch) -> int:
+    if batch.data_end_row is not None:
+        return batch.data_end_row
+    return batch.data_start_row + max(batch.reserved_rows, 1) - 1
 
 
 def _cell(row: list[Any], index: int) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -75,15 +76,25 @@ def test_prompt_renderer_substitutes_all_placeholders(tmp_path):
     assert "clarification=Не было." in user
 
 
+def test_default_system_prompt_checks_completeness_without_rewriting():
+    prompt = (Path("prompts") / "gigachat_system.md").read_text(encoding="utf-8")
+
+    assert "сможет ли редактор выполнить изменение без догадок" in prompt
+    assert "Не переформулируй" in prompt
+    assert "один главный блокер" in prompt
+    assert "не используй yes/no-вопросы" in prompt
+    assert "неидеальный или разговорный стиль" in prompt
+
+
 @pytest.mark.asyncio
 async def test_gigachat_client_maps_structured_response(tmp_path):
     system_prompt, user_prompt = write_prompts(tmp_path)
     fake_client = FakeGigaChatClient(
         raw_response=(
-            '{"is_complete": true, "quality_score": 0.87, "problems": [], '
-            '"clarifying_question": null, '
-            '"formatted_change_description": "Готовая формулировка", '
-            '"short_summary": "Коротко"}'
+            '{"is_complete": false, '
+            '"blocking_problem": "Не указан итоговый результат", '
+            '"clarification_instruction": '
+            '"Дополните поле: укажите результат после изменения."}'
         )
     )
     llm_client = LlmClient(
@@ -95,10 +106,12 @@ async def test_gigachat_client_maps_structured_response(tmp_path):
 
     result = await llm_client.check_change_description(make_context())
 
-    assert result.is_complete is True
-    assert result.quality_score == 0.87
-    assert result.formatted_change_description == "Готовая формулировка"
-    assert result.short_summary == "Коротко"
+    assert result.is_complete is False
+    assert result.blocking_problem == "Не указан итоговый результат"
+    assert (
+        result.clarification_instruction
+        == "Дополните поле: укажите результат после изменения."
+    )
     assert fake_client.calls[0]["chat"].messages
 
 
@@ -115,21 +128,18 @@ async def test_gigachat_client_returns_fallback_on_exception(tmp_path):
     result = await llm_client.check_change_description(make_context(raw_change_description="raw"))
 
     assert result.is_complete is True
-    assert result.quality_score is None
-    assert result.formatted_change_description == "raw"
-    assert result.problems == ["Ошибка GigaChat: RuntimeError: boom"]
+    assert result.blocking_problem == "Ошибка GigaChat: RuntimeError: boom"
+    assert result.clarification_instruction is None
 
 
 @pytest.mark.asyncio
-async def test_gigachat_client_accepts_missing_quality_score(tmp_path):
+async def test_gigachat_client_accepts_complete_result(tmp_path):
     system_prompt, user_prompt = write_prompts(tmp_path)
     fake_client = FakeGigaChatClient(
         raw_response=(
-            '{"is_complete": false, '
-            '"problems": ["Не хватает исходного текста"], '
-            '"clarifying_question": "Пришлите исходный текст.", '
-            '"formatted_change_description": null, '
-            '"short_summary": null}'
+            '{"is_complete": true, '
+            '"blocking_problem": null, '
+            '"clarification_instruction": null}'
         )
     )
     llm_client = LlmClient(
@@ -141,9 +151,34 @@ async def test_gigachat_client_accepts_missing_quality_score(tmp_path):
 
     result = await llm_client.check_change_description(make_context())
 
-    assert result.is_complete is False
-    assert result.quality_score is None
-    assert result.problems == ["Не хватает исходного текста"]
+    assert result.is_complete is True
+    assert result.blocking_problem is None
+    assert result.clarification_instruction is None
+
+
+@pytest.mark.asyncio
+async def test_inconsistent_incomplete_response_uses_error_fallback(tmp_path):
+    system_prompt, user_prompt = write_prompts(tmp_path)
+    fake_client = FakeGigaChatClient(
+        raw_response=(
+            '{"is_complete": false, '
+            '"blocking_problem": "Не указан результат", '
+            '"clarification_instruction": null}'
+        )
+    )
+    llm_client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=fake_client,
+    )
+
+    result = await llm_client.check_change_description(make_context())
+
+    assert result.is_complete is True
+    assert result.blocking_problem is not None
+    assert result.blocking_problem.startswith("Ошибка GigaChat:")
+    assert result.clarification_instruction is None
 
 
 @pytest.mark.asyncio

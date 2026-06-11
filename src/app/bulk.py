@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -12,6 +13,7 @@ from app.models import (
     BulkApplicationStatus,
     BulkBatch,
     BulkBatchStatus,
+    BulkRegistrationState,
     ChangeType,
     Direction,
     generate_application_id,
@@ -30,10 +32,11 @@ from app.submission import (
 )
 
 
-BULK_INITIAL_INPUT_ROWS = 1
-BULK_REGISTRATION_SCAN_ROWS = 1000
+DEFAULT_BULK_RESERVED_ROWS = 100
 BULK_BATCH_SPACING_ROWS = 2
-BULK_INPUT_HEADERS = [
+DEFAULT_BULK_REGISTRATION_STALE_SECONDS = 600
+_BATCH_HEADER_PATTERN = re.compile(r"^Пачка (BATCH-[0-9A-F]+)$")
+CURRENT_BULK_INPUT_HEADERS = [
     "Тип ответа",
     "Интент",
     "Закрепленный сценарист",
@@ -42,14 +45,7 @@ BULK_INPUT_HEADERS = [
     "Исходный текст",
     "Тип изменения",
 ]
-LEGACY_BULK_SERVICE_HEADERS = [
-    "ID заявки",
-    "Статус",
-    "Вопросы/комментарии редактора",
-    "Ответ/комментарий сценариста",
-    "Итоговый ответ редактора",
-]
-BULK_SERVICE_HEADERS = [
+CURRENT_BULK_SERVICE_HEADERS = [
     "ID заявки",
     "Статус",
     "Редактор",
@@ -57,7 +53,39 @@ BULK_SERVICE_HEADERS = [
     "Ответ/комментарий сценариста",
     "Итоговый ответ редактора",
 ]
-LEGACY_BULK_STAGING_HEADERS = [*BULK_INPUT_HEADERS, *LEGACY_BULK_SERVICE_HEADERS]
+LEGACY_BULK_SERVICE_HEADERS = [
+    "ID заявки",
+    "Статус",
+    "Вопросы/комментарии редактора",
+    "Ответ/комментарий сценариста",
+    "Итоговый ответ редактора",
+]
+BULK_INPUT_HEADERS = [
+    "Тип ответа",
+    "Тип изменения",
+    "Закрепленный сценарист",
+    "Интент",
+    "Причина изменений",
+    "Суть изменений",
+    "Исходный текст",
+]
+BULK_SERVICE_HEADERS = [
+    "Итоговый ответ редактора",
+    "Комментарий качества",
+    "Вопросы/комментарии редактора",
+    "Ответ сценариста",
+    "Статус",
+    "Редактор",
+    "ID заявки",
+]
+LEGACY_BULK_STAGING_HEADERS = [
+    *CURRENT_BULK_INPUT_HEADERS,
+    *LEGACY_BULK_SERVICE_HEADERS,
+]
+CURRENT_BULK_STAGING_HEADERS = [
+    *CURRENT_BULK_INPUT_HEADERS,
+    *CURRENT_BULK_SERVICE_HEADERS,
+]
 BULK_STAGING_HEADERS = [*BULK_INPUT_HEADERS, *BULK_SERVICE_HEADERS]
 BULK_STAGING_COLUMN_COUNT = len(BULK_STAGING_HEADERS)
 BULK_STAGING_SHEET_NAME = "Массовый ввод"
@@ -76,6 +104,7 @@ class BulkRegistrationResult:
     success: bool
     message: str
     registered_count: int = 0
+    retry_allowed: bool = True
 
 
 class BulkBatchServiceProtocol(Protocol):
@@ -106,7 +135,8 @@ class InMemoryBulkBatchService:
             sheet_id=100,
             start_row=1,
             data_start_row=3,
-            reserved_rows=BULK_INITIAL_INPUT_ROWS,
+            reserved_rows=DEFAULT_BULK_RESERVED_ROWS,
+            data_end_row=2 + DEFAULT_BULK_RESERVED_ROWS,
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
         )
@@ -128,7 +158,7 @@ class GoogleSheetsBulkBatchService:
         credentials_path: str,
         repository: DraftRepository,
         sheets_api: Any | None = None,
-        reserved_rows: int = BULK_INITIAL_INPUT_ROWS,
+        reserved_rows: int = DEFAULT_BULK_RESERVED_ROWS,
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
     ) -> None:
         self.direction_spreadsheets = direction_spreadsheets or DirectionSpreadsheetConfig(
@@ -143,6 +173,9 @@ class GoogleSheetsBulkBatchService:
         self._sheets_api = sheets_api
         self.reserved_rows = reserved_rows
         self.application_editors = application_editors
+        self._sheet_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        if self.reserved_rows <= 0:
+            raise ValueError("reserved_rows must be greater than 0")
 
         if sheets_api is None and not Path(self.credentials_path).is_file():
             raise RuntimeError(f"Google credentials file not found: {self.credentials_path}")
@@ -152,26 +185,31 @@ class GoogleSheetsBulkBatchService:
         telegram_user_id: int,
         direction: str,
     ) -> BulkBatchCreationResult:
+        spreadsheet_id = self.direction_spreadsheets.spreadsheet_id_for(direction)
+        sheet_name = _bulk_sheet_name(direction)
+        lock = self._sheet_locks.setdefault((spreadsheet_id, sheet_name), asyncio.Lock())
         try:
-            existing_batches = await self.repository.list_bulk_batches()
-            batch, insert_url = await asyncio.to_thread(
-                self._create_batch_sync,
-                telegram_user_id,
-                direction,
-                existing_batches,
-            )
-            saved_batch = await self.repository.save_bulk_batch(
-                batch_id=batch.batch_id,
-                telegram_user_id=batch.telegram_user_id,
-                spreadsheet_id=batch.spreadsheet_id,
-                direction=batch.direction,
-                sheet_name=batch.sheet_name,
-                sheet_id=batch.sheet_id,
-                start_row=batch.start_row,
-                data_start_row=batch.data_start_row,
-                reserved_rows=batch.reserved_rows,
-                status_schema_version=batch.status_schema_version,
-            )
+            async with lock:
+                existing_batches = await self.repository.list_bulk_batches()
+                batch, insert_url = await asyncio.to_thread(
+                    self._create_batch_sync,
+                    telegram_user_id,
+                    direction,
+                    existing_batches,
+                )
+                saved_batch = await self.repository.save_bulk_batch(
+                    batch_id=batch.batch_id,
+                    telegram_user_id=batch.telegram_user_id,
+                    spreadsheet_id=batch.spreadsheet_id,
+                    direction=batch.direction,
+                    sheet_name=batch.sheet_name,
+                    sheet_id=batch.sheet_id,
+                    start_row=batch.start_row,
+                    data_start_row=batch.data_start_row,
+                    reserved_rows=batch.reserved_rows,
+                    data_end_row=batch.data_end_row,
+                    status_schema_version=batch.status_schema_version,
+                )
         except Exception as exc:
             return BulkBatchCreationResult(
                 success=False,
@@ -196,25 +234,23 @@ class GoogleSheetsBulkBatchService:
             raise RuntimeError("Для выбранного направления не задан ID Google-таблицы")
         sheet_name = _bulk_sheet_name(direction)
         sheet_id = self._get_or_create_sheet_id(api, spreadsheet_id, sheet_name, BULK_STAGING_COLUMN_COUNT)
-        existing_rows = self._read_rows(api, spreadsheet_id, sheet_name, "A:M")
-        if any(
-            [str(value).strip() for value in row[: len(LEGACY_BULK_STAGING_HEADERS)]]
-            == LEGACY_BULK_STAGING_HEADERS
-            for row in existing_rows
-        ):
-            raise SheetConfigurationError(
-                "Лист «Массовый ввод» использует старую схему без колонки "
-                "«Редактор». Вставьте колонку J во всем листе и повторите создание."
-            )
+        existing_rows = self._read_rows(api, spreadsheet_id, sheet_name, "A:N")
         start_row = _next_batch_start_row(
             existing_rows=existing_rows,
+            existing_batches=existing_batches,
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=sheet_name,
         )
         data_start_row = start_row + 2
+        data_end_row = data_start_row + self.reserved_rows - 1
         batch_id = generate_batch_id()
         now = utc_now_iso()
 
         rows = [
-            *[_empty_row() for _ in range(_spacing_rows_before_batch(existing_rows))],
+            *[
+                _empty_row()
+                for _ in range(_spacing_rows_before_batch(existing_rows, start_row))
+            ],
             _bulk_header_row(batch_id, telegram_user_id, now, direction),
             _bulk_column_header_row(),
             *[
@@ -234,6 +270,11 @@ class GoogleSheetsBulkBatchService:
                         }
                     },
                     *_bulk_batch_status_format_rules(sheet_id, start_row),
+                    _bulk_active_group_border_request(
+                        sheet_id,
+                        start_row=start_row,
+                        end_row=data_end_row,
+                    ),
                 ]
             },
         ).execute()
@@ -248,6 +289,7 @@ class GoogleSheetsBulkBatchService:
             start_row=start_row,
             data_start_row=data_start_row,
             reserved_rows=self.reserved_rows,
+            data_end_row=data_end_row,
             status_schema_version=2,
             created_at=now,
             updated_at=now,
@@ -268,6 +310,28 @@ class GoogleSheetsBulkBatchService:
         for sheet in metadata.get("sheets", []):
             properties = sheet.get("properties", {})
             if properties.get("title") == sheet_name:
+                current_columns = int(
+                    properties.get("gridProperties", {}).get("columnCount", column_count)
+                )
+                if current_columns < column_count:
+                    api.spreadsheets().batchUpdate(
+                        spreadsheetId=spreadsheet_id,
+                        body={
+                            "requests": [
+                                {
+                                    "updateSheetProperties": {
+                                        "properties": {
+                                            "sheetId": properties["sheetId"],
+                                            "gridProperties": {
+                                                "columnCount": column_count,
+                                            },
+                                        },
+                                        "fields": "gridProperties.columnCount",
+                                    }
+                                }
+                            ]
+                        },
+                    ).execute()
                 return int(properties["sheetId"])
 
         result = api.spreadsheets().batchUpdate(
@@ -326,6 +390,7 @@ class BulkApplicationRegistrar:
         sheets_api: Any | None = None,
         dashboard_sync: DashboardSyncService | None = None,
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
+        registration_stale_seconds: int = DEFAULT_BULK_REGISTRATION_STALE_SECONDS,
     ) -> None:
         self.repository = repository
         self.spreadsheet_id = spreadsheet_id
@@ -333,23 +398,79 @@ class BulkApplicationRegistrar:
         self._sheets_api = sheets_api
         self.dashboard_sync = dashboard_sync
         self.application_editors = application_editors
+        self.registration_stale_seconds = registration_stale_seconds
+        self._batch_locks: dict[str, asyncio.Lock] = {}
+        if self.registration_stale_seconds <= 0:
+            raise ValueError("registration_stale_seconds must be greater than 0")
 
     async def register_batch(self, batch_id: str, telegram_user_id: int) -> BulkRegistrationResult:
+        lock = self._batch_locks.setdefault(batch_id, asyncio.Lock())
+        async with lock:
+            return await self._register_batch_locked(batch_id, telegram_user_id)
+
+    async def _register_batch_locked(
+        self,
+        batch_id: str,
+        telegram_user_id: int,
+    ) -> BulkRegistrationResult:
         batch = await self.repository.get_bulk_batch(batch_id)
         if batch is None:
-            return BulkRegistrationResult(
-                success=False,
-                message="Массовая заявка не найдена.",
-            )
+            return BulkRegistrationResult(success=False, message="Массовая заявка не найдена.")
         if batch.telegram_user_id != telegram_user_id:
             return BulkRegistrationResult(
                 success=False,
                 message="Эту массовую заявку может подтвердить только ее автор.",
             )
+
+        claim = await self.repository.claim_bulk_batch_registration(
+            batch_id,
+            stale_after_seconds=self.registration_stale_seconds,
+        )
+        if claim == BulkRegistrationState.REGISTERED.value:
+            return BulkRegistrationResult(
+                success=True,
+                message=(
+                    "Массовая заявка уже зарегистрирована. "
+                    f"Строк зарегистрировано: {batch.registered_count}."
+                ),
+                registered_count=batch.registered_count,
+                retry_allowed=False,
+            )
+        if claim == BulkRegistrationState.REGISTERING.value:
+            return BulkRegistrationResult(
+                success=False,
+                message="Массовая заявка уже регистрируется. Дождитесь завершения обработки.",
+                retry_allowed=False,
+            )
+
+        try:
+            result = await self._register_claimed_batch(batch)
+        except Exception as exc:
+            await self.repository.release_bulk_batch_registration(batch_id)
+            return BulkRegistrationResult(
+                success=False,
+                message=f"Не удалось зарегистрировать массовую заявку. Причина: {exc}",
+            )
+        if not result.success:
+            await self.repository.release_bulk_batch_registration(batch_id)
+        return result
+
+    async def _register_claimed_batch(self, batch: BulkBatch) -> BulkRegistrationResult:
         api = self._get_sheets_api()
-        schema_error = await asyncio.to_thread(self._validate_batch_schema, api, batch)
-        if schema_error:
-            return BulkRegistrationResult(success=False, message=schema_error)
+        layout = await asyncio.to_thread(self._read_batch_layout, api, batch)
+        if layout is None:
+            return BulkRegistrationResult(
+                success=False,
+                message="Структура колонок массовой заявки не соответствует поддерживаемым схемам.",
+            )
+        if await asyncio.to_thread(self._has_overflow_data, api, batch, layout):
+            return BulkRegistrationResult(
+                success=False,
+                message=(
+                    "Данные выходят за выделенный диапазон массовой заявки. "
+                    f"Допустимые строки: {batch.data_start_row}-{_batch_data_end_row(batch)}."
+                ),
+            )
         registered = 0
         user_rows = 0
         actual_rows = 0
@@ -357,16 +478,16 @@ class BulkApplicationRegistrar:
         invalid_change_type_rows: list[int] = []
         normalized_change_types: list[tuple[int, str]] = []
         for offset, row in enumerate(rows):
-            if not _has_user_bulk_data(row):
+            if not _has_user_bulk_data(row, layout["user_indices"]):
                 continue
             row_number = batch.data_start_row + offset
-            raw_change_type = _cell(row, 6)
+            raw_change_type = _cell(row, layout["change_type"])
             normalized_change_type = ChangeType.normalize(raw_change_type)
             if normalized_change_type is None:
                 invalid_change_type_rows.append(row_number)
                 continue
-            row.extend([""] * (7 - len(row)))
-            row[6] = normalized_change_type.value
+            row.extend([""] * (layout["change_type"] + 1 - len(row)))
+            row[layout["change_type"]] = normalized_change_type.value
             if raw_change_type.strip() != normalized_change_type.value:
                 normalized_change_types.append((row_number, normalized_change_type.value))
 
@@ -386,18 +507,21 @@ class BulkApplicationRegistrar:
                 api,
                 batch,
                 normalized_change_types,
+                layout,
             )
         for offset, row in enumerate(rows):
             staging_row_number = batch.data_start_row + offset
-            if not _has_user_bulk_data(row):
+            if not _has_user_bulk_data(row, layout["user_indices"]):
                 continue
             user_rows += 1
             actual_rows = offset + 1
-            application_id = _cell(row, 7).strip()
+            application_id = _cell(row, layout["application_id"]).strip()
             if application_id:
                 existing = await self.repository.get_submitted_application(application_id)
                 if existing is None:
-                    await self._save_existing_application(batch, row, staging_row_number, application_id)
+                    await self._save_existing_application(
+                        batch, row, staging_row_number, application_id, layout
+                    )
                     registered += 1
                 continue
 
@@ -408,8 +532,11 @@ class BulkApplicationRegistrar:
                 batch,
                 staging_row_number,
                 application_id,
+                layout,
             )
-            await self._save_new_application(batch, row, staging_row_number, application_id)
+            await self._save_new_application(
+                batch, row, staging_row_number, application_id, layout
+            )
             registered += 1
 
         if user_rows == 0:
@@ -420,33 +547,26 @@ class BulkApplicationRegistrar:
                     "Заполните данные в Google Sheets и нажмите «Заявка заполнена» еще раз."
                 ),
             )
-        if registered:
-            await self.repository.update_bulk_batch_reserved_rows(
-                batch.batch_id,
-                reserved_rows=actual_rows,
-            )
-            await asyncio.to_thread(self._group_batch_rows, api, batch, actual_rows)
-            await self._sync_dashboard(
-                batch,
-                final_answer_present=_has_final_answer(rows, final_answer_index=12),
-            )
-            return BulkRegistrationResult(
-                success=True,
-                message=f"Массовая заявка зарегистрирована. Строк зарегистрировано: {registered}.",
-                registered_count=registered,
-            )
-        await self.repository.update_bulk_batch_reserved_rows(
-            batch.batch_id,
-            reserved_rows=actual_rows,
-        )
+        data_end_row = batch.data_start_row + actual_rows - 1
+        await asyncio.to_thread(self._group_batch_rows, api, batch, actual_rows)
         await self._sync_dashboard(
             batch,
-            final_answer_present=_has_final_answer(rows, final_answer_index=12),
+            final_answer_present=_has_final_answer(
+                rows,
+                final_answer_index=layout["final_answer"],
+                user_indices=layout["user_indices"],
+            ),
+        )
+        await self.repository.complete_bulk_batch_registration(
+            batch.batch_id,
+            registered_count=user_rows,
+            data_end_row=data_end_row,
         )
         return BulkRegistrationResult(
             success=True,
-            message="Новых строк для регистрации не найдено: все заполненные строки уже зарегистрированы.",
-            registered_count=0,
+            message=f"Массовая заявка зарегистрирована. Строк зарегистрировано: {user_rows}.",
+            registered_count=user_rows,
+            retry_allowed=False,
         )
 
     async def _sync_dashboard(self, batch: BulkBatch, *, final_answer_present: bool) -> None:
@@ -476,7 +596,7 @@ class BulkApplicationRegistrar:
     def _batch_row_link(batch: BulkBatch) -> str:
         return (
             f"https://docs.google.com/spreadsheets/d/{batch.spreadsheet_id}/edit"
-            f"#gid={batch.sheet_id}&range=A{batch.start_row}:M{batch.start_row}"
+            f"#gid={batch.sheet_id}&range=A{batch.start_row}:N{batch.start_row}"
         )
 
     async def _save_existing_application(
@@ -485,6 +605,7 @@ class BulkApplicationRegistrar:
         row: list[Any],
         row_number: int,
         application_id: str,
+        layout: dict[str, Any],
     ) -> None:
         await self.repository.save_submitted_application(
             application_id=application_id,
@@ -492,16 +613,20 @@ class BulkApplicationRegistrar:
             spreadsheet_id=batch.spreadsheet_id,
             sheet_id=batch.sheet_id,
             sheet_name=batch.sheet_name,
-            last_known_status=_cell(row, 8).strip() or ApplicationStatus.NEW.value,
+            last_known_status=(
+                _cell(row, layout["status"]).strip() or ApplicationStatus.NEW.value
+            ),
             direction=batch.direction,
-            answer_type=_normalize_answer_type(_cell(row, 0)),
+            answer_type=_normalize_answer_type(_cell(row, layout["answer_type"])),
             application_type=ApplicationType.BULK.value,
-            is_urgent=_bulk_row_is_urgent(row),
+            is_urgent=_bulk_row_is_urgent(row, layout),
             batch_id=batch.batch_id,
             last_seen_row_number=row_number,
-            last_seen_editor=_cell(row, 9).strip() or EDITOR_NOT_SELECTED,
-            last_seen_editor_comment=_cell(row, 10).strip(),
-            last_seen_final_answer=_cell(row, 12).strip(),
+            last_seen_editor=(
+                _cell(row, layout["editor"]).strip() or EDITOR_NOT_SELECTED
+            ),
+            last_seen_editor_comment=_cell(row, layout["comment"]).strip(),
+            last_seen_final_answer=_cell(row, layout["final_answer"]).strip(),
         )
 
     async def _save_new_application(
@@ -510,6 +635,7 @@ class BulkApplicationRegistrar:
         row: list[Any],
         row_number: int,
         application_id: str,
+        layout: dict[str, Any],
     ) -> None:
         await self.repository.save_submitted_application(
             application_id=application_id,
@@ -519,9 +645,9 @@ class BulkApplicationRegistrar:
             sheet_name=batch.sheet_name,
             last_known_status=ApplicationStatus.NEW.value,
             direction=batch.direction,
-            answer_type=_normalize_answer_type(_cell(row, 0)),
+            answer_type=_normalize_answer_type(_cell(row, layout["answer_type"])),
             application_type=ApplicationType.BULK.value,
-            is_urgent=_bulk_row_is_urgent(row),
+            is_urgent=_bulk_row_is_urgent(row, layout),
             batch_id=batch.batch_id,
             last_seen_row_number=row_number,
             last_seen_editor=EDITOR_NOT_SELECTED,
@@ -529,30 +655,23 @@ class BulkApplicationRegistrar:
             last_seen_final_answer="",
         )
 
-    def _validate_batch_schema(
+    def _read_batch_layout(
         self,
         api: Any,
         batch: BulkBatch,
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         header_row = batch.data_start_row - 1
         result = api.spreadsheets().values().get(
             spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
             range=(
                 f"{quote_sheet_name(batch.sheet_name)}!"
-                f"A{header_row}:M{header_row}"
+                f"A{header_row}:N{header_row}"
             ),
             majorDimension="ROWS",
         ).execute()
         rows = result.get("values", [])
         headers = [str(value).strip() for value in (rows[0] if rows else [])]
-        if headers[: len(BULK_STAGING_HEADERS)] == BULK_STAGING_HEADERS:
-            return None
-        if headers[: len(LEGACY_BULK_STAGING_HEADERS)] == LEGACY_BULK_STAGING_HEADERS:
-            return (
-                "Массовая заявка использует старую схему без колонки «Редактор». "
-                "Вставьте колонку J во всем листе «Массовый ввод» и повторите."
-            )
-        return "Структура колонок массовой заявки не соответствует ожидаемой схеме."
+        return _bulk_schema_layout(headers)
 
     def _get_or_create_sheet_id(
         self,
@@ -591,16 +710,39 @@ class BulkApplicationRegistrar:
         return int(result["replies"][0]["addSheet"]["properties"]["sheetId"])
 
     def _read_batch_rows(self, api: Any, batch: BulkBatch) -> list[list[Any]]:
-        end_row = batch.data_start_row + max(
-            batch.reserved_rows,
-            BULK_REGISTRATION_SCAN_ROWS,
-        ) - 1
+        end_row = _batch_data_end_row(batch)
         result = api.spreadsheets().values().get(
             spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
-            range=f"{quote_sheet_name(batch.sheet_name)}!A{batch.data_start_row}:M{end_row}",
+            range=f"{quote_sheet_name(batch.sheet_name)}!A{batch.data_start_row}:N{end_row}",
             majorDimension="ROWS",
         ).execute()
-        return result.get("values", [])
+        rows = result.get("values", [])
+        for index, row in enumerate(rows):
+            if _is_batch_header_row(row):
+                return rows[:index]
+        return rows
+
+    def _has_overflow_data(
+        self,
+        api: Any,
+        batch: BulkBatch,
+        layout: dict[str, Any],
+    ) -> bool:
+        end_row = _batch_data_end_row(batch)
+        result = api.spreadsheets().values().get(
+            spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
+            range=(
+                f"{quote_sheet_name(batch.sheet_name)}!"
+                f"A{end_row + 1}:N"
+            ),
+            majorDimension="ROWS",
+        ).execute()
+        for row in result.get("values", []):
+            if _is_batch_header_row(row):
+                return False
+            if _has_user_bulk_data(row, layout["user_indices"]):
+                return True
+        return False
 
     def _write_registration_cells(
         self,
@@ -608,7 +750,20 @@ class BulkApplicationRegistrar:
         batch: BulkBatch,
         row_number: int,
         application_id: str,
+        layout: dict[str, Any],
     ) -> None:
+        cell_by_index = {
+            layout["application_id"]: _string_cell(application_id),
+            layout["status"]: _status_cell(batch.status_schema_version),
+        }
+        if layout["editor"] >= 0:
+            cell_by_index[layout["editor"]] = _editor_cell(self.application_editors)
+        start_column = min(cell_by_index)
+        end_column = max(cell_by_index) + 1
+        values = [
+            cell_by_index.get(column_index, {})
+            for column_index in range(start_column, end_column)
+        ]
         api.spreadsheets().batchUpdate(
             spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
             body={
@@ -619,16 +774,12 @@ class BulkApplicationRegistrar:
                                 "sheetId": batch.sheet_id,
                                 "startRowIndex": row_number - 1,
                                 "endRowIndex": row_number,
-                                "startColumnIndex": 7,
-                                "endColumnIndex": 10,
+                                "startColumnIndex": start_column,
+                                "endColumnIndex": end_column,
                             },
                             "rows": [
                                 {
-                                    "values": [
-                                        _string_cell(application_id),
-                                        _status_cell(batch.status_schema_version),
-                                        _editor_cell(self.application_editors),
-                                    ]
+                                    "values": values
                                 }
                             ],
                             "fields": "userEnteredValue,dataValidation,userEnteredFormat",
@@ -641,14 +792,18 @@ class BulkApplicationRegistrar:
                                 "startRowIndex": row_number - 1,
                                 "endRowIndex": row_number,
                                 "startColumnIndex": 0,
-                                "endColumnIndex": 7,
+                                "endColumnIndex": len(layout["user_indices"]),
                             },
                             "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
                             "fields": "userEnteredFormat.backgroundColor",
                         }
                     },
                     *(
-                        _bulk_application_status_format_rules(batch.sheet_id, row_number)
+                        _bulk_application_status_format_rules(
+                            batch.sheet_id,
+                            row_number,
+                            column_index=layout["status"],
+                        )
                         if batch.status_schema_version >= 2
                         else []
                     ),
@@ -661,6 +816,7 @@ class BulkApplicationRegistrar:
         api: Any,
         batch: BulkBatch,
         values: list[tuple[int, str]],
+        layout: dict[str, Any],
     ) -> None:
         requests = [
             {
@@ -669,8 +825,8 @@ class BulkApplicationRegistrar:
                         "sheetId": batch.sheet_id,
                         "startRowIndex": row_number - 1,
                         "endRowIndex": row_number,
-                        "startColumnIndex": 6,
-                        "endColumnIndex": 7,
+                        "startColumnIndex": layout["change_type"],
+                        "endColumnIndex": layout["change_type"] + 1,
                     },
                     "rows": [{"values": [_string_cell(value)]}],
                     "fields": "userEnteredValue",
@@ -685,6 +841,8 @@ class BulkApplicationRegistrar:
 
     def _group_batch_rows(self, api: Any, batch: BulkBatch, actual_rows: int) -> None:
         if actual_rows <= 0:
+            return
+        if self._batch_rows_are_grouped(api, batch, actual_rows):
             return
         api.spreadsheets().batchUpdate(
             spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
@@ -703,6 +861,31 @@ class BulkApplicationRegistrar:
                 ]
             },
         ).execute()
+
+    def _batch_rows_are_grouped(
+        self,
+        api: Any,
+        batch: BulkBatch,
+        actual_rows: int,
+    ) -> bool:
+        response = api.spreadsheets().get(
+            spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
+            fields="sheets(properties(sheetId),rowGroups(range))",
+        ).execute()
+        expected_start = batch.data_start_row - 1
+        expected_end = batch.data_start_row + actual_rows - 1
+        for sheet in response.get("sheets", []):
+            properties = sheet.get("properties", {})
+            if int(properties.get("sheetId", -1)) != batch.sheet_id:
+                continue
+            for group in sheet.get("rowGroups", []):
+                group_range = group.get("range", {})
+                if (
+                    group_range.get("startIndex") == expected_start
+                    and group_range.get("endIndex") == expected_end
+                ):
+                    return True
+        return False
 
     def _get_sheets_api(self) -> Any:
         if self._sheets_api is None:
@@ -723,7 +906,7 @@ def _bulk_header_row(
     values[3] = _formatted_string_cell(direction, bold=True)
     values[4] = _formatted_string_cell(f"Telegram ID: {telegram_user_id}", bold=True)
     values[6] = _formatted_string_cell("Заполняйте строки ниже в колонках A:G", bold=True)
-    values[10] = _bulk_batch_status_cell(BulkBatchStatus.NEW.value, status_schema_version=2)
+    values[11] = _bulk_batch_status_cell(BulkBatchStatus.NEW.value, status_schema_version=2)
     return {"values": values}
 
 
@@ -733,7 +916,8 @@ def _bulk_column_header_row() -> dict[str, Any]:
 
 def _bulk_input_row(application_editors: tuple[str, ...]) -> dict[str, Any]:
     values = [_input_cell() for _ in BULK_INPUT_HEADERS]
-    values[6]["dataValidation"] = {
+    values[6]["userEnteredFormat"]["wrapStrategy"] = "CLIP"
+    values[1]["dataValidation"] = {
         "condition": {
             "type": "ONE_OF_LIST",
             "values": [
@@ -748,7 +932,8 @@ def _bulk_input_row(application_editors: tuple[str, ...]) -> dict[str, Any]:
         [
             _service_cell(),
             _service_cell(),
-            _editor_cell(application_editors),
+            _service_cell(),
+            _service_cell(),
             _service_cell(),
             _service_cell(),
             _service_cell(),
@@ -818,7 +1003,7 @@ def _bulk_batch_status_format_rules(sheet_id: int, row_number: int) -> list[dict
     return _status_format_rules(
         sheet_id=sheet_id,
         row_number=row_number,
-        column_index=10,
+        column_index=11,
         statuses=[item.value for item in BulkBatchStatus],
         color_getter=_bulk_status_color,
     )
@@ -827,11 +1012,13 @@ def _bulk_batch_status_format_rules(sheet_id: int, row_number: int) -> list[dict
 def _bulk_application_status_format_rules(
     sheet_id: int,
     row_number: int,
+    *,
+    column_index: int = 11,
 ) -> list[dict[str, Any]]:
     return _status_format_rules(
         sheet_id=sheet_id,
         row_number=row_number,
-        column_index=8,
+        column_index=column_index,
         statuses=[item.value for item in BulkApplicationStatus],
         color_getter=_bulk_application_status_color,
     )
@@ -876,19 +1063,103 @@ def _status_format_rules(
     ]
 
 
-def _has_user_bulk_data(row: list[Any]) -> bool:
-    return any(_cell(row, index).strip() for index in range(0, len(BULK_INPUT_HEADERS)))
+def _bulk_active_group_border_request(
+    sheet_id: int,
+    *,
+    start_row: int,
+    end_row: int,
+) -> dict[str, Any]:
+    return {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": start_row - 1,
+                "endRowIndex": end_row,
+                "startColumnIndex": 12,
+                "endColumnIndex": 13,
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "borders": {
+                        "right": {
+                            "style": "SOLID_THICK",
+                            "color": {"red": 0.35, "green": 0.35, "blue": 0.35},
+                        }
+                    }
+                }
+            },
+            "fields": "userEnteredFormat.borders.right",
+        }
+    }
+
+
+def _bulk_schema_layout(headers: list[Any]) -> dict[str, Any] | None:
+    normalized = [str(value).strip() for value in headers]
+    if normalized[: len(BULK_STAGING_HEADERS)] == BULK_STAGING_HEADERS:
+        return {
+            "schema": "new",
+            "answer_type": 0,
+            "change_type": 1,
+            "user_indices": tuple(range(7)),
+            "final_answer": 7,
+            "comment": 9,
+            "response": 10,
+            "status": 11,
+            "editor": 12,
+            "application_id": 13,
+            "batch_status": 11,
+            "end_column": "N",
+        }
+    if normalized[: len(CURRENT_BULK_STAGING_HEADERS)] == CURRENT_BULK_STAGING_HEADERS:
+        return {
+            "schema": "current",
+            "answer_type": 0,
+            "change_type": 6,
+            "user_indices": tuple(range(7)),
+            "application_id": 7,
+            "status": 8,
+            "editor": 9,
+            "comment": 10,
+            "response": 11,
+            "final_answer": 12,
+            "batch_status": 10,
+            "end_column": "M",
+        }
+    if normalized[: len(LEGACY_BULK_STAGING_HEADERS)] == LEGACY_BULK_STAGING_HEADERS:
+        return {
+            "schema": "legacy",
+            "answer_type": 0,
+            "change_type": 6,
+            "user_indices": tuple(range(7)),
+            "application_id": 7,
+            "status": 8,
+            "editor": -1,
+            "comment": 9,
+            "response": 10,
+            "final_answer": 11,
+            "batch_status": 9,
+            "end_column": "L",
+        }
+    return None
+
+
+def _has_user_bulk_data(
+    row: list[Any],
+    user_indices: tuple[int, ...] = tuple(range(7)),
+) -> bool:
+    return any(_cell(row, index).strip() for index in user_indices)
 
 
 def _has_final_answer(
     rows: list[list[Any]],
     *,
     final_answer_index: int = 12,
+    user_indices: tuple[int, ...] = tuple(range(7)),
 ) -> bool:
     return any(
         _cell(row, final_answer_index).strip()
         for row in rows
-        if _has_user_bulk_data(row)
+        if _has_user_bulk_data(row, user_indices)
     )
 
 
@@ -898,12 +1169,15 @@ def _normalize_answer_type(value: str) -> str:
     return text if text in valid_values else ""
 
 
-def _bulk_row_is_urgent(row: list[Any]) -> bool:
-    return _normalize_answer_type(_cell(row, 0)) == AnswerType.URGENT.value
+def _bulk_row_is_urgent(row: list[Any], layout: dict[str, Any]) -> bool:
+    return (
+        _normalize_answer_type(_cell(row, layout["answer_type"]))
+        == AnswerType.URGENT.value
+    )
 
 
 def _cell(row: list[Any], index: int) -> str:
-    if index >= len(row):
+    if index < 0 or index >= len(row):
         return ""
     return str(row[index])
 
@@ -917,16 +1191,31 @@ def _bulk_sheet_name(direction: str) -> str:
 def _next_batch_start_row(
     *,
     existing_rows: list[list[Any]],
+    existing_batches: list[BulkBatch],
+    spreadsheet_id: str,
+    sheet_name: str,
 ) -> int:
     last_non_empty_row = _last_non_empty_row_number(existing_rows)
-    if last_non_empty_row == 0:
+    last_allocated_row = max(
+        (
+            _batch_data_end_row(batch)
+            for batch in existing_batches
+            if batch.spreadsheet_id == spreadsheet_id and batch.sheet_name == sheet_name
+        ),
+        default=0,
+    )
+    last_used_row = max(last_non_empty_row, last_allocated_row)
+    if last_used_row == 0:
         return 1
-    next_row = last_non_empty_row + BULK_BATCH_SPACING_ROWS + 1
+    next_row = last_used_row + BULK_BATCH_SPACING_ROWS + 1
     return next_row
 
 
-def _spacing_rows_before_batch(existing_rows: list[list[Any]]) -> int:
-    return 0 if _last_non_empty_row_number(existing_rows) == 0 else BULK_BATCH_SPACING_ROWS
+def _spacing_rows_before_batch(
+    existing_rows: list[list[Any]],
+    start_row: int,
+) -> int:
+    return max(start_row - len(existing_rows) - 1, 0)
 
 
 def _last_non_empty_row_number(rows: list[list[Any]]) -> int:
@@ -934,6 +1223,19 @@ def _last_non_empty_row_number(rows: list[list[Any]]) -> int:
         if any(str(value).strip() for value in rows[index - 1]):
             return index
     return 0
+
+
+def _batch_data_end_row(batch: BulkBatch) -> int:
+    if batch.data_end_row is not None:
+        return batch.data_end_row
+    return batch.data_start_row + max(batch.reserved_rows, 1) - 1
+
+
+def _is_batch_header_row(row: list[Any]) -> bool:
+    first_cell = _cell(row, 0).strip()
+    second_cell = _cell(row, 1).strip()
+    match = _BATCH_HEADER_PATTERN.fullmatch(first_cell)
+    return match is not None and match.group(1) == second_cell
 
 
 def _string_cell(value: Any) -> dict[str, Any]:

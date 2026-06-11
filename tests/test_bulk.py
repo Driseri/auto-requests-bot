@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
+
+import aiosqlite
 import pytest
 
 from app.bulk import (
     BULK_STAGING_HEADERS,
+    CURRENT_BULK_STAGING_HEADERS,
     LEGACY_BULK_STAGING_HEADERS,
     BulkApplicationRegistrar,
     GoogleSheetsBulkBatchService,
@@ -14,6 +20,7 @@ from app.models import (
     ApplicationType,
     BulkApplicationStatus,
     BulkBatchStatus,
+    BulkRegistrationState,
     ChangeType,
     Direction,
 )
@@ -48,10 +55,14 @@ class FakeValuesResource:
         exact_rows = self.api.rows.get((spreadsheet_id, range_name))
         if exact_rows is not None:
             return FakeRequest({"values": exact_rows})
-        if range_name.endswith("!A1:W1"):
+        if range_name.endswith("!A1:X1"):
             headers = self.api.headers.get((spreadsheet_id, sheet_name))
             return FakeRequest({"values": [headers]} if headers else {})
-        if range_name.endswith("!A:W") or range_name.endswith("!A:M"):
+        if (
+            range_name.endswith("!A:X")
+            or range_name.endswith("!A:M")
+            or range_name.endswith("!A:N")
+        ):
             return FakeRequest({"values": self.api.rows.get((spreadsheet_id, sheet_name), [])})
         return FakeRequest({"values": []})
 
@@ -214,7 +225,7 @@ async def test_create_bulk_batch_creates_direction_week_section(tmp_path):
     append_request = api.batch_updates[-1]["body"]["requests"][0]["appendCells"]
     assert append_request["sheetId"] == 100
     assert len(append_request["rows"]) == 3
-    batch_status_cell = append_request["rows"][0]["values"][10]
+    batch_status_cell = append_request["rows"][0]["values"][11]
     assert batch_status_cell["userEnteredValue"] == {"stringValue": BulkBatchStatus.NEW.value}
     assert [
         value["userEnteredValue"]
@@ -225,9 +236,8 @@ async def test_create_bulk_batch_creates_direction_week_section(tmp_path):
         for value in batch_status_cell["dataValidation"]["condition"]["values"]
     ]
     assert "backgroundColor" in append_request["rows"][2]["values"][0]["userEnteredFormat"]
-    assert len(append_request["rows"][1]["values"]) == 13
-    editor_cell = append_request["rows"][2]["values"][9]
-    assert editor_cell["userEnteredValue"] == {"stringValue": "Редактор не выбран"}
+    assert len(append_request["rows"][1]["values"]) == 14
+    assert _row_data_to_values(append_request["rows"][1]) == BULK_STAGING_HEADERS
     batch_status_rules = [
         request["addConditionalFormatRule"]["rule"]
         for request in api.batch_updates[-1]["body"]["requests"]
@@ -237,7 +247,7 @@ async def test_create_bulk_batch_creates_direction_week_section(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_create_bulk_batch_starts_after_two_empty_rows_from_actual_sheet_end(tmp_path):
+async def test_create_bulk_batch_starts_after_previous_allocated_range(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk_spacing.db"))
     await repository.init()
     await repository.save_bulk_batch(
@@ -268,18 +278,18 @@ async def test_create_bulk_batch_starts_after_two_empty_rows_from_actual_sheet_e
 
     assert result.success is True
     assert result.batch is not None
-    assert result.batch.start_row == 7
-    assert result.batch.data_start_row == 9
+    assert result.batch.start_row == 205
+    assert result.batch.data_start_row == 207
     assert result.batch.reserved_rows == 1
-    assert result.insert_url.endswith("range=A9:G9")
+    assert result.insert_url.endswith("range=A207:G207")
     appended_rows = api.rows[(FL_SPREADSHEET, BULK_SHEET)]
-    assert not any(appended_rows[4])
-    assert not any(appended_rows[5])
-    assert appended_rows[6][0].startswith("Пачка BATCH-")
+    assert not any(appended_rows[202])
+    assert not any(appended_rows[203])
+    assert appended_rows[204][0].startswith("Пачка BATCH-")
 
 
 @pytest.mark.asyncio
-async def test_create_bulk_batch_blocks_legacy_sheet_without_editor_column(tmp_path):
+async def test_create_bulk_batch_allows_new_section_after_legacy_section(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk_legacy.db"))
     await repository.init()
     api = FakeSheetsApi(
@@ -295,8 +305,9 @@ async def test_create_bulk_batch_blocks_legacy_sheet_without_editor_column(tmp_p
 
     result = await make_service(repository, api).create_batch(123, Direction.FL.value)
 
-    assert result.success is False
-    assert "Вставьте колонку J" in result.message
+    assert result.success is True
+    assert result.batch is not None
+    assert result.batch.start_row > 3
 
 
 @pytest.mark.asyncio
@@ -317,8 +328,8 @@ async def test_bulk_registrar_returns_error_for_empty_batch(tmp_path):
     api = FakeSheetsApi(
         sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
         rows={
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:M3"): [BULK_STAGING_HEADERS],
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:M1003"): [[]],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N6"): [[]],
         },
     )
     registrar = BulkApplicationRegistrar(
@@ -371,8 +382,8 @@ async def test_bulk_registrar_registers_rows_by_batch_button_and_tracks_metadata
     api = FakeSheetsApi(
         sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
         rows={
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:M3"): [BULK_STAGING_HEADERS],
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:M1003"): [
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N6"): [
                 row_to_register,
                 [],
                 existing_row,
@@ -461,6 +472,69 @@ async def test_bulk_registrar_registers_rows_by_batch_button_and_tracks_metadata
     assert group_range["endIndex"] == 6
 
 
+def test_bulk_input_source_text_uses_clip_wrapping():
+    from app.bulk import _bulk_input_row
+
+    row = _bulk_input_row(("редактор 1", "редактор 2"))
+
+    assert row["values"][6]["userEnteredFormat"]["wrapStrategy"] == "CLIP"
+    assert row["values"][5]["userEnteredFormat"]["wrapStrategy"] == "WRAP"
+
+
+@pytest.mark.asyncio
+async def test_new_bulk_schema_registers_status_editor_and_id_in_l_to_n(tmp_path):
+    repository = DraftRepository(str(tmp_path / "new_bulk_schema.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-NEW00001",
+        telegram_user_id=123,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=1,
+    )
+    row = [""] * 14
+    row[0] = AnswerType.ROLLOUT.value
+    row[1] = ChangeType.ADD.value
+    row[2] = "Writer"
+    row[3] = "intent.one"
+    row[4] = "Reason"
+    row[5] = "Change"
+    row[6] = "Source"
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
+        rows={
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N4"): [row],
+        },
+    )
+    registrar = BulkApplicationRegistrar(
+        repository=repository,
+        spreadsheet_id=FL_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    result = await registrar.register_batch("BATCH-NEW00001", 123)
+
+    assert result.success is True
+    update_request = next(
+        request["updateCells"]
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+        if "updateCells" in request
+    )
+    assert update_request["range"]["startColumnIndex"] == 11
+    assert update_request["range"]["endColumnIndex"] == 14
+    values = update_request["rows"][0]["values"]
+    assert values[0]["userEnteredValue"] == {"stringValue": "Новая"}
+    assert values[1]["userEnteredValue"] == {"stringValue": "Редактор не выбран"}
+    assert values[2]["userEnteredValue"]["stringValue"]
+
+
 @pytest.mark.asyncio
 async def test_legacy_bulk_batch_keeps_legacy_row_status_validation(tmp_path):
     repository = DraftRepository(str(tmp_path / "legacy_statuses.db"))
@@ -481,8 +555,8 @@ async def test_legacy_bulk_batch_keeps_legacy_row_status_validation(tmp_path):
     api = FakeSheetsApi(
         sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
         rows={
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:M3"): [BULK_STAGING_HEADERS],
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:M1003"): [row],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N4"): [row],
         },
     )
     registrar = BulkApplicationRegistrar(
@@ -528,8 +602,8 @@ async def test_bulk_registration_rejects_all_rows_when_change_type_is_missing(tm
     api = FakeSheetsApi(
         sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
         rows={
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:M3"): [BULK_STAGING_HEADERS],
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:M1003"): [valid_row, invalid_row],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N5"): [valid_row, invalid_row],
         },
     )
     registrar = BulkApplicationRegistrar(
@@ -570,8 +644,8 @@ async def test_bulk_registrar_syncs_dashboard_after_registration(tmp_path):
     api = FakeSheetsApi(
         sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
         rows={
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:M3"): [BULK_STAGING_HEADERS],
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:M1003"): [row_to_register],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N6"): [row_to_register],
         },
     )
     dashboard = FakeDashboardSync()
@@ -590,7 +664,7 @@ async def test_bulk_registrar_syncs_dashboard_after_registration(tmp_path):
     upsert = dashboard.bulk_upserts[0]
     assert upsert["batch"].batch_id == "BATCH-ABC12345"
     assert upsert["status"] == BulkBatchStatus.NEW.value
-    assert upsert["row_link"].endswith("gid=100&range=A2:M2")
+    assert upsert["row_link"].endswith("gid=100&range=A2:N2")
     assert upsert["final_answer_present"] is True
 
 
@@ -620,6 +694,297 @@ async def test_bulk_registrar_rejects_non_author(tmp_path):
 
     assert result.success is False
     assert "только ее автор" in result.message
+
+
+@pytest.mark.asyncio
+async def test_first_batch_registration_stops_before_next_batch_header(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bounded_batches.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-FIRST111",
+        telegram_user_id=123,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=7,
+        data_end_row=10,
+    )
+    first_row = [AnswerType.ROLLOUT.value, "first", "", "", "", "", ChangeType.ADD.value]
+    second_row = [AnswerType.ROLLOUT.value, "second", "", "", "", "", ChangeType.EDIT.value]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
+        rows={
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N10"): [
+                first_row,
+                [],
+                [],
+                ["Пачка BATCH-AABBCC22", "BATCH-AABBCC22"],
+                CURRENT_BULK_STAGING_HEADERS,
+                second_row,
+            ],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A11:N"): [],
+        },
+    )
+    registrar = BulkApplicationRegistrar(
+        repository=repository,
+        spreadsheet_id=FL_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    result = await registrar.register_batch("BATCH-FIRST111", 123)
+    tracked = await repository.list_submitted_applications()
+
+    assert result.success is True
+    assert len(tracked) == 1
+    assert tracked[0].last_seen_row_number == 4
+    saved = await repository.get_bulk_batch("BATCH-FIRST111")
+    assert saved is not None
+    assert saved.data_end_row == 4
+    assert saved.registration_state == BulkRegistrationState.REGISTERED.value
+
+
+@pytest.mark.asyncio
+async def test_bulk_registration_rejects_data_after_allocated_boundary(tmp_path):
+    repository = DraftRepository(str(tmp_path / "overflow.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-OVERFLOW",
+        telegram_user_id=123,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=1,
+        data_end_row=4,
+    )
+    valid_row = [AnswerType.ROLLOUT.value, "inside", "", "", "", "", ChangeType.ADD.value]
+    overflow_row = [AnswerType.ROLLOUT.value, "outside", "", "", "", "", ChangeType.ADD.value]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
+        rows={
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N4"): [valid_row],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A5:N"): [overflow_row],
+        },
+    )
+    registrar = BulkApplicationRegistrar(
+        repository=repository,
+        spreadsheet_id=FL_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    result = await registrar.register_batch("BATCH-OVERFLOW", 123)
+
+    assert result.success is False
+    assert "Допустимые строки: 4-4" in result.message
+    assert await repository.list_submitted_applications() == []
+    saved = await repository.get_bulk_batch("BATCH-OVERFLOW")
+    assert saved is not None
+    assert saved.registration_state == BulkRegistrationState.DRAFT.value
+
+
+@pytest.mark.asyncio
+async def test_concurrent_bulk_registration_is_idempotent(tmp_path):
+    repository = DraftRepository(str(tmp_path / "concurrent_registration.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-CONCURR1",
+        telegram_user_id=123,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=1,
+    )
+    row = [AnswerType.ROLLOUT.value, "intent", "", "", "", "", ChangeType.ADD.value]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
+        rows={
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N4"): [row],
+        },
+    )
+    registrar = BulkApplicationRegistrar(
+        repository=repository,
+        spreadsheet_id=FL_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    first, second = await asyncio.gather(
+        registrar.register_batch("BATCH-CONCURR1", 123),
+        registrar.register_batch("BATCH-CONCURR1", 123),
+    )
+
+    assert first.success is True
+    assert second.success is True
+    assert first.registered_count == second.registered_count == 1
+    update_requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+        if "updateCells" in request
+    ]
+    group_requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+        if "addDimensionGroup" in request
+    ]
+    assert len(update_requests) == 1
+    assert len(group_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_bulk_registration_claim_can_be_recovered(tmp_path):
+    db_path = str(tmp_path / "stale_registration.db")
+    repository = DraftRepository(db_path)
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-STALE001",
+        telegram_user_id=123,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=1,
+    )
+
+    first_claim = await repository.claim_bulk_batch_registration(
+        "BATCH-STALE001",
+        stale_after_seconds=600,
+    )
+    active_claim = await repository.claim_bulk_batch_registration(
+        "BATCH-STALE001",
+        stale_after_seconds=600,
+    )
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            UPDATE bulk_batches
+            SET registration_started_at = '2020-01-01T00:00:00+00:00'
+            WHERE batch_id = 'BATCH-STALE001'
+            """
+        )
+        await db.commit()
+    recovered_claim = await repository.claim_bulk_batch_registration(
+        "BATCH-STALE001",
+        stale_after_seconds=600,
+    )
+
+    assert first_claim == "ACQUIRED"
+    assert active_claim == BulkRegistrationState.REGISTERING.value
+    assert recovered_claim == "ACQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_google_error_releases_bulk_registration_for_retry(tmp_path):
+    repository = DraftRepository(str(tmp_path / "registration_error.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-FA11ED01",
+        telegram_user_id=123,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=1,
+    )
+    row = [AnswerType.ROLLOUT.value, "intent", "", "", "", "", ChangeType.ADD.value]
+
+    class FailingSpreadsheetsResource(FakeSpreadsheetsResource):
+        def batchUpdate(self, **kwargs):
+            if any("updateCells" in request for request in kwargs["body"]["requests"]):
+                raise BrokenPipeError(32, "Broken pipe")
+            return super().batchUpdate(**kwargs)
+
+    class FailingSheetsApi(FakeSheetsApi):
+        def spreadsheets(self):
+            return FailingSpreadsheetsResource(self)
+
+    api = FailingSheetsApi(
+        sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
+        rows={
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N4"): [row],
+        },
+    )
+    registrar = BulkApplicationRegistrar(
+        repository=repository,
+        spreadsheet_id=FL_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    result = await registrar.register_batch("BATCH-FA11ED01", 123)
+    saved = await repository.get_bulk_batch("BATCH-FA11ED01")
+
+    assert result.success is False
+    assert "Broken pipe" in result.message
+    assert saved is not None
+    assert saved.registration_state == BulkRegistrationState.DRAFT.value
+
+
+@pytest.mark.asyncio
+async def test_concurrent_bulk_creation_is_serialized_per_sheet(tmp_path):
+    repository = DraftRepository(str(tmp_path / "concurrent_creation.db"))
+    await repository.init()
+    api = FakeSheetsApi()
+
+    class InstrumentedService(GoogleSheetsBulkBatchService):
+        active = 0
+        max_active = 0
+        counter_lock = threading.Lock()
+
+        def _create_batch_sync(self, *args, **kwargs):
+            with self.counter_lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.05)
+                return super()._create_batch_sync(*args, **kwargs)
+            finally:
+                with self.counter_lock:
+                    self.active -= 1
+
+    service = InstrumentedService(
+        direction_spreadsheets=DirectionSpreadsheetConfig(
+            fl_spreadsheet_id=FL_SPREADSHEET,
+            sme_spreadsheet_id="sme",
+            ai_spreadsheet_id="ai",
+            voice_collection_spreadsheet_id="voice",
+        ),
+        credentials_path="missing-for-test.json",
+        repository=repository,
+        sheets_api=api,
+        reserved_rows=2,
+    )
+
+    first, second = await asyncio.gather(
+        service.create_batch(101, Direction.FL.value),
+        service.create_batch(102, Direction.FL.value),
+    )
+
+    assert first.success is True
+    assert second.success is True
+    assert service.max_active == 1
+    assert first.batch is not None and second.batch is not None
+    assert first.batch.data_end_row is not None
+    assert second.batch.start_row > first.batch.data_end_row
 
 
 def _sheet_name_from_range(range_name: str) -> str:

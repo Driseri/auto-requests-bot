@@ -47,6 +47,8 @@ class Settings:
     status_polling_enabled: bool
     status_polling_interval_seconds: float
     dashboard_sync_interval_seconds: float
+    bulk_reserved_rows: int
+    bulk_registration_stale_seconds: int
     rollout_schedule: RolloutSchedule
     application_editors: tuple[str, ...]
 
@@ -67,6 +69,14 @@ def load_settings() -> Settings:
         raise ValueError("STATUS_POLLING_INTERVAL_SECONDS must be greater than 0")
     if dashboard_sync_interval_seconds <= 0:
         raise ValueError("DASHBOARD_SYNC_INTERVAL_SECONDS must be greater than 0")
+    bulk_reserved_rows = int(os.getenv("BULK_RESERVED_ROWS", "100").strip() or "100")
+    bulk_registration_stale_seconds = int(
+        os.getenv("BULK_REGISTRATION_STALE_SECONDS", "600").strip() or "600"
+    )
+    if bulk_reserved_rows <= 0:
+        raise ValueError("BULK_RESERVED_ROWS must be greater than 0")
+    if bulk_registration_stale_seconds <= 0:
+        raise ValueError("BULK_REGISTRATION_STALE_SECONDS must be greater than 0")
     return Settings(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL", "").strip() or None,
@@ -140,6 +150,8 @@ def load_settings() -> Settings:
         status_polling_enabled=_env_bool("STATUS_POLLING_ENABLED", default=True),
         status_polling_interval_seconds=status_polling_interval_seconds,
         dashboard_sync_interval_seconds=dashboard_sync_interval_seconds,
+        bulk_reserved_rows=bulk_reserved_rows,
+        bulk_registration_stale_seconds=bulk_registration_stale_seconds,
         rollout_schedule=RolloutSchedule.from_strings(
             timezone_name=os.getenv("BOT_TIMEZONE", DEFAULT_TIMEZONE).strip()
             or DEFAULT_TIMEZONE,

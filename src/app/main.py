@@ -42,6 +42,7 @@ async def main() -> None:
         "gigachat_retry_backoff_factor=%s gigachat_show_response_json=%s "
         "status_polling_enabled=%s status_polling_interval_seconds=%s "
         "dashboard_sync_interval_seconds=%s "
+        "bulk_reserved_rows=%s bulk_registration_stale_seconds=%s "
         "bot_timezone=%s rollout_wednesday_cutoff=%s rollout_thursday_cutoff=%s "
         "application_editors_count=%s",
         settings.sqlite_path,
@@ -67,6 +68,8 @@ async def main() -> None:
         settings.status_polling_enabled,
         settings.status_polling_interval_seconds,
         settings.dashboard_sync_interval_seconds,
+        settings.bulk_reserved_rows,
+        settings.bulk_registration_stale_seconds,
         settings.rollout_schedule.timezone_name,
         cutoff_to_string(settings.rollout_schedule.wednesday_cutoff),
         cutoff_to_string(settings.rollout_schedule.thursday_cutoff),
@@ -96,6 +99,7 @@ async def main() -> None:
         credentials_path=settings.google_credentials_path,
         dashboard_sync=dashboard_sync,
         application_editors=settings.application_editors,
+        registration_stale_seconds=settings.bulk_registration_stale_seconds,
     )
 
     flow = ApplicationFlow(
@@ -128,6 +132,7 @@ async def main() -> None:
             credentials_path=settings.google_credentials_path,
             repository=repository,
             application_editors=settings.application_editors,
+            reserved_rows=settings.bulk_reserved_rows,
         ),
         bulk_registrar=bulk_registrar,
     )

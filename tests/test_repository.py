@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import aiosqlite
 
-from app.models import ApplicationStatus, FieldName, Step
+from app.models import ApplicationStatus, BulkRegistrationState, FieldName, Step
 from app.repository import DraftRepository
 
 
@@ -137,6 +137,44 @@ async def test_repository_migrates_old_database_without_application_id(tmp_path)
     assert updated.application_id is not None
     assert len(updated.application_id) == 8
     assert updated.application_id == updated.application_id.upper()
+
+
+@pytest.mark.asyncio
+async def test_repository_replaces_old_llm_rewrite_only_once_for_active_draft(tmp_path):
+    db_path = str(tmp_path / "old_llm_rewrite.db")
+    repository = DraftRepository(db_path)
+    await repository.init()
+    await repository.get_or_create(61)
+    await repository.save_answer(61, "raw_change_description", "Исходный текст сценариста")
+    await repository.save_llm_result(
+        61,
+        formatted_change_description="Переформулированный деловой текст",
+        llm_check_status="complete",
+        llm_score=0.95,
+    )
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA user_version = 0")
+        await db.commit()
+
+    await repository.init()
+    migrated = await repository.get_by_user_id(61)
+    assert migrated is not None
+    assert migrated.formatted_change_description == "Исходный текст сценариста"
+    assert migrated.llm_score is None
+
+    await repository.save_llm_result(
+        61,
+        formatted_change_description=(
+            "Исходный текст сценариста\n\nУточнение сценариста: Новый ответ"
+        ),
+        llm_check_status="complete",
+        llm_score=None,
+        clarification_count=1,
+    )
+    await repository.init()
+    after_restart = await repository.get_by_user_id(61)
+    assert after_restart is not None
+    assert after_restart.formatted_change_description.endswith("Новый ответ")
 
 
 @pytest.mark.asyncio
@@ -300,3 +338,6 @@ async def test_repository_migrates_existing_bulk_batches_to_status_schema_v1(tmp
     assert batch is not None
     assert batch.status_schema_version == 1
     assert batch.batch_status == "Нужны пояснения"
+    assert batch.data_end_row == 7
+    assert batch.registration_state == BulkRegistrationState.DRAFT.value
+    assert batch.registered_count == 0

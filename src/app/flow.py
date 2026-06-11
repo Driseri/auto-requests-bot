@@ -58,7 +58,7 @@ STEP_PROMPTS = {
     Step.SCRIPTWRITER: "За каким сценаристом закреплен интент?",
     Step.REASON: "Опишите причину изменений.",
     Step.CHANGE_DESCRIPTION: "В чем суть изменений?",
-    Step.CHANGE_DESCRIPTION_CLARIFICATION: "Уточните суть изменений.",
+    Step.CHANGE_DESCRIPTION_CLARIFICATION: "Введите дополнение к сути изменений.",
     Step.SOURCE_TEXT: "Пришлите исходный текст ответа чат-бота.",
     Step.URGENCY: "Заявка срочная?",
     Step.PRIORITY: "Выберите приоритет заявки.",
@@ -259,6 +259,11 @@ class ApplicationFlow:
             )
         result = await self.bulk_registrar.register_batch(batch_id, telegram_user_id)
         if not result.success:
+            if not result.retry_allowed:
+                return BotResponse(
+                    text=result.message,
+                    keyboard=KeyboardKind.BULK_MENU,
+                )
             return BotResponse(
                 text=result.message,
                 keyboard=KeyboardKind.BULK_CREATED,
@@ -846,9 +851,9 @@ class ApplicationFlow:
         status = self._status_from_llm_result(llm_result)
         await self.repository.save_llm_result(
             telegram_user_id,
-            formatted_change_description=llm_result.formatted_change_description or value,
+            formatted_change_description=value,
             llm_check_status=status,
-            llm_score=llm_result.quality_score,
+            llm_score=None,
             clarification_count=0,
         )
 
@@ -895,18 +900,16 @@ class ApplicationFlow:
                 intent=draft.intent or "",
                 scriptwriter=draft.scriptwriter or "",
                 reason=draft.reason or "",
-                raw_change_description=combined_description,
+                raw_change_description=original_description,
                 clarification_text=clarification,
             )
         )
         status = self._status_from_llm_result(llm_result, after_clarification=True)
-        formatted = llm_result.formatted_change_description or combined_description
         await self.repository.save_llm_result(
             telegram_user_id,
-            formatted_change_description=formatted,
+            formatted_change_description=combined_description,
             llm_check_status=status,
-            llm_score=llm_result.quality_score,
-            raw_change_description=combined_description,
+            llm_score=None,
             clarification_count=1,
         )
         next_step = Step.REVIEW if draft.source_text and draft.is_urgent is not None else Step.SOURCE_TEXT
@@ -954,19 +957,15 @@ class ApplicationFlow:
                 "Суть изменений сохранена, но заявка будет отмечена как требующая "
                 "дополнительного внимания редактора."
             )
-        return "Суть изменений проверена и принята."
+        return "Полнота описания проверена."
 
     @staticmethod
     def _clarification_prefix(llm_result) -> str:
-        lines = [
-            "GigaChat считает, что описания пока недостаточно.",
-        ]
-        if llm_result.problems:
-            lines.append("Что нужно добавить или исправить:")
-            lines.extend(f"- {problem}" for problem in llm_result.problems)
-        if llm_result.clarifying_question:
-            lines.append("")
-            lines.append(llm_result.clarifying_question)
+        lines = ["В описании не хватает информации для выполнения заявки без догадок."]
+        if llm_result.blocking_problem:
+            lines.append(f"Главный блокер: {llm_result.blocking_problem}")
+        if llm_result.clarification_instruction:
+            lines.extend(["", llm_result.clarification_instruction])
         return "\n".join(lines)
 
     async def _return_to_review(
@@ -1171,11 +1170,10 @@ def _direction_requires_answer_type(direction: str | None) -> bool:
 
 
 def _is_llm_error_result(llm_result) -> bool:
-    if llm_result.quality_score is not None:
-        return False
-    return any(
-        problem.startswith("Ошибка GigaChat:") or problem == "GIGACHAT_CREDENTIALS не задан."
-        for problem in llm_result.problems
+    problem = llm_result.blocking_problem or ""
+    return (
+        problem.startswith("Ошибка GigaChat:")
+        or problem == "GIGACHAT_CREDENTIALS не задан."
     )
 
 
@@ -1183,11 +1181,8 @@ def _llm_result_to_json(llm_result) -> str:
     return json.dumps(
         {
             "is_complete": llm_result.is_complete,
-            "quality_score": llm_result.quality_score,
-            "problems": llm_result.problems,
-            "clarifying_question": llm_result.clarifying_question,
-            "formatted_change_description": llm_result.formatted_change_description,
-            "short_summary": llm_result.short_summary,
+            "blocking_problem": llm_result.blocking_problem,
+            "clarification_instruction": llm_result.clarification_instruction,
         },
         ensure_ascii=False,
         indent=2,

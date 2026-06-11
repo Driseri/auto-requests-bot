@@ -22,6 +22,7 @@ from app.submission import (
     DASHBOARD_HEADERS,
     DASHBOARD_SHEET_NAME,
     DashboardSyncService,
+    CURRENT_WORKSHEET_HEADERS,
     DirectionSpreadsheetConfig,
     GoogleSheetsSubmissionService,
     LEGACY_DASHBOARD_HEADERS,
@@ -63,7 +64,7 @@ class FakeValuesResource:
             rows = self.api.rows.get((spreadsheet_id, sheet_name), [])
             return FakeRequest({"values": [[row[0]] for row in rows if row]})
         headers = self.api.headers.get((spreadsheet_id, sheet_name))
-        if range_name.endswith("!A:W") and headers is not None:
+        if range_name.endswith("!A:X") and headers is not None:
             rows = self.api.rows.get((spreadsheet_id, sheet_name), [])
             if rows and rows[0] == headers:
                 return FakeRequest({"values": rows})
@@ -222,6 +223,17 @@ def test_draft_to_sheet_row_uses_new_direction_schema():
     row = draft_to_sheet_row(make_draft())
 
     assert row == [
+        "Иван Иванов",
+        "intent.change_limit",
+        "Изменились условия продукта",
+        "Лаконичный текст изменений",
+        "Исходный ответ",
+        "",
+        "",
+        "",
+        "",
+        ApplicationStatus.NEW.value,
+        "Редактор не выбран",
         "A1B2C3D4",
         "",
         ApplicationType.SINGLE.value,
@@ -231,17 +243,7 @@ def test_draft_to_sheet_row_uses_new_direction_schema():
         "Нет",
         "Иван Иванов",
         123,
-        ApplicationStatus.NEW.value,
-        "Редактор не выбран",
-        "intent.change_limit",
-        "Иван Иванов",
-        "Изменились условия продукта",
-        "Лаконичный текст изменений",
         "Сырой текст изменений",
-        "Исходный ответ",
-        "",
-        "",
-        "",
         "stub_complete",
         1.0,
         ChangeType.ADD.value,
@@ -350,8 +352,9 @@ async def test_submit_creates_week_sheet_and_appends_row():
     assert spreadsheet_id == FL_SPREADSHEET
     assert append_cells["sheetId"] == 100
     values = _append_cell_values(append_cells)
-    assert values[0] == "A1B2C3D4"
-    assert values[4] == Direction.FL.value
+    assert values[0] == "Иван Иванов"
+    assert values[11] == "A1B2C3D4"
+    assert values[15] == Direction.FL.value
     assert values[9] == ApplicationStatus.NEW.value
 
 
@@ -424,12 +427,12 @@ async def test_existing_wrong_headers_return_error_and_do_not_append():
     result = await service.submit(make_draft(created_at="2026-06-05T10:00:00+00:00"))
 
     assert result.success is False
-    assert "Первые 23 колонки" in result.message
+    assert "Структура колонок" in result.message
     assert api.append_cells == []
 
 
 @pytest.mark.asyncio
-async def test_existing_legacy_working_sheet_requires_manual_editor_column():
+async def test_existing_legacy_working_sheet_keeps_legacy_schema():
     api = FakeSheetsApi(
         sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
         headers={(FL_SPREADSHEET, "01.06 ср"): LEGACY_WORKSHEET_HEADERS.copy()},
@@ -438,9 +441,27 @@ async def test_existing_legacy_working_sheet_requires_manual_editor_column():
 
     result = await service.submit(make_draft())
 
-    assert result.success is False
-    assert "Вставьте колонку K" in result.message
-    assert api.append_cells == []
+    assert result.success is True
+    cells = api.append_cells[0][1]["rows"][0]["values"]
+    assert len(cells) == 22
+    assert cells[0]["userEnteredValue"] == {"stringValue": "A1B2C3D4"}
+
+
+@pytest.mark.asyncio
+async def test_existing_current_working_sheet_keeps_current_schema():
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "01.06 ср"): CURRENT_WORKSHEET_HEADERS.copy()},
+    )
+    service = make_service(api)
+
+    result = await service.submit(make_draft())
+
+    assert result.success is True
+    cells = api.append_cells[0][1]["rows"][0]["values"]
+    assert len(cells) == 23
+    assert cells[0]["userEnteredValue"] == {"stringValue": "A1B2C3D4"}
+    assert cells[10]["userEnteredValue"] == {"stringValue": "Редактор не выбран"}
 
 
 def test_legacy_dashboard_requires_manual_editor_column():
@@ -502,13 +523,32 @@ async def test_append_cells_contains_status_dropdown_and_source_rich_text():
         value["userEnteredValue"]
         for value in editor_cell["dataValidation"]["condition"]["values"]
     ] == ["Редактор не выбран", "редактор 1", "редактор 2"]
-    source_cell = cells[16]
+    source_cell = cells[4]
     assert source_cell["userEnteredValue"] == {"stringValue": "abcdefgh"}
+    assert source_cell["userEnteredFormat"]["wrapStrategy"] == "CLIP"
     assert source_cell["textFormatRuns"] == [
         {"startIndex": 0, "format": {"bold": True, "strikethrough": False}},
         {"startIndex": 2, "format": {"bold": True, "strikethrough": True}},
         {"startIndex": 4, "format": {"bold": False, "strikethrough": True}},
     ]
+
+
+def test_new_worksheet_formatting_has_active_group_border():
+    from app.submission import worksheet_formatting_requests
+
+    requests = worksheet_formatting_requests(42, ("редактор 1", "редактор 2"))
+    border = next(
+        request["repeatCell"]
+        for request in requests
+        if request.get("repeatCell", {})
+        .get("cell", {})
+        .get("userEnteredFormat", {})
+        .get("borders")
+    )
+
+    assert border["range"]["startColumnIndex"] == 10
+    assert border["range"]["endColumnIndex"] == 11
+    assert border["cell"]["userEnteredFormat"]["borders"]["right"]["style"] == "SOLID_THICK"
 
 
 @pytest.mark.asyncio

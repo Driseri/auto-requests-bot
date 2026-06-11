@@ -18,6 +18,8 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert cutoff_to_string(settings.rollout_schedule.thursday_cutoff) == "14:00"
     assert settings.application_editors == ("редактор 1", "редактор 2")
     assert settings.dashboard_sync_interval_seconds == 300
+    assert settings.bulk_reserved_rows == 100
+    assert settings.bulk_registration_stale_seconds == 600
 
 
 def test_load_settings_uses_custom_dashboard_sync_interval(monkeypatch):
@@ -26,6 +28,32 @@ def test_load_settings_uses_custom_dashboard_sync_interval(monkeypatch):
     settings = load_settings()
 
     assert settings.dashboard_sync_interval_seconds == 120
+
+
+def test_load_settings_uses_custom_bulk_limits(monkeypatch):
+    monkeypatch.setenv("BULK_RESERVED_ROWS", "75")
+    monkeypatch.setenv("BULK_REGISTRATION_STALE_SECONDS", "900")
+
+    settings = load_settings()
+
+    assert settings.bulk_reserved_rows == 75
+    assert settings.bulk_registration_stale_seconds == 900
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("BULK_RESERVED_ROWS", "0"),
+        ("BULK_RESERVED_ROWS", "-1"),
+        ("BULK_REGISTRATION_STALE_SECONDS", "0"),
+        ("BULK_REGISTRATION_STALE_SECONDS", "-1"),
+    ],
+)
+def test_load_settings_rejects_invalid_bulk_limits(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        load_settings()
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])

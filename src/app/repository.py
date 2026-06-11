@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,7 @@ import aiosqlite
 
 from app.models import (
     BulkBatch,
+    BulkRegistrationState,
     Draft,
     Step,
     SubmittedApplication,
@@ -121,6 +123,10 @@ class DraftRepository:
                     start_row INTEGER NOT NULL,
                     data_start_row INTEGER NOT NULL,
                     reserved_rows INTEGER NOT NULL,
+                    data_end_row INTEGER,
+                    registration_state TEXT NOT NULL DEFAULT 'DRAFT',
+                    registration_started_at TEXT,
+                    registered_count INTEGER NOT NULL DEFAULT 0,
                     status_schema_version INTEGER NOT NULL DEFAULT 1,
                     batch_status TEXT,
                     last_known_batch_status TEXT,
@@ -140,8 +146,53 @@ class DraftRepository:
                 "status_schema_version",
                 "INTEGER NOT NULL DEFAULT 1",
             )
+            await self._ensure_bulk_batches_column(db, "data_end_row", "INTEGER")
+            registration_state_added = await self._ensure_bulk_batches_column(
+                db,
+                "registration_state",
+                "TEXT NOT NULL DEFAULT 'DRAFT'",
+            )
+            await self._ensure_bulk_batches_column(db, "registration_started_at", "TEXT")
+            await self._ensure_bulk_batches_column(
+                db,
+                "registered_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            await db.execute(
+                """
+                UPDATE bulk_batches
+                SET data_end_row = data_start_row + MAX(reserved_rows, 1) - 1
+                WHERE data_end_row IS NULL
+                """
+            )
+            if registration_state_added:
+                await db.execute(
+                    """
+                    UPDATE bulk_batches
+                    SET registration_state = 'REGISTERED',
+                        registered_count = (
+                            SELECT COUNT(*)
+                            FROM submitted_applications
+                            WHERE submitted_applications.batch_id = bulk_batches.batch_id
+                        ),
+                        data_end_row = COALESCE(
+                            (
+                                SELECT MAX(last_seen_row_number)
+                                FROM submitted_applications
+                                WHERE submitted_applications.batch_id = bulk_batches.batch_id
+                            ),
+                            data_end_row
+                        )
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM submitted_applications
+                        WHERE submitted_applications.batch_id = bulk_batches.batch_id
+                    )
+                    """
+                )
             await self._ensure_user_settings_column(db, "pending_action", "TEXT")
             await self._ensure_user_settings_column(db, "default_direction", "TEXT")
+            await self._migrate_llm_completeness_check(db)
             await db.commit()
 
     async def get_or_create(self, telegram_user_id: int) -> Draft:
@@ -455,6 +506,7 @@ class DraftRepository:
         start_row: int,
         data_start_row: int,
         reserved_rows: int,
+        data_end_row: int | None = None,
         spreadsheet_id: str = "",
         direction: str = "",
         batch_status: str | None = None,
@@ -467,9 +519,9 @@ class DraftRepository:
                 """
                 INSERT INTO bulk_batches (
                     batch_id, telegram_user_id, spreadsheet_id, direction, sheet_name, sheet_id,
-                    start_row, data_start_row, reserved_rows, batch_status,
+                    start_row, data_start_row, reserved_rows, data_end_row, batch_status,
                     last_known_batch_status, status_schema_version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(batch_id) DO UPDATE SET
                     telegram_user_id = excluded.telegram_user_id,
                     spreadsheet_id = excluded.spreadsheet_id,
@@ -479,6 +531,7 @@ class DraftRepository:
                     start_row = excluded.start_row,
                     data_start_row = excluded.data_start_row,
                     reserved_rows = excluded.reserved_rows,
+                    data_end_row = excluded.data_end_row,
                     batch_status = excluded.batch_status,
                     updated_at = excluded.updated_at
                 """,
@@ -492,6 +545,7 @@ class DraftRepository:
                     start_row,
                     data_start_row,
                     reserved_rows,
+                    data_end_row or data_start_row + max(reserved_rows, 1) - 1,
                     batch_status or "Новая пачка",
                     batch_status or "Новая пачка",
                     status_schema_version,
@@ -567,6 +621,110 @@ class DraftRepository:
                     reserved_rows,
                     utc_now_iso(),
                     batch_id,
+                ),
+            )
+            await db.commit()
+
+    async def claim_bulk_batch_registration(
+        self,
+        batch_id: str,
+        *,
+        stale_after_seconds: int,
+    ) -> str:
+        now = datetime.now(timezone.utc)
+        async with aiosqlite.connect(self.sqlite_path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT registration_state, registration_started_at
+                FROM bulk_batches
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.rollback()
+                return "NOT_FOUND"
+
+            state = row["registration_state"] or BulkRegistrationState.DRAFT.value
+            if state == BulkRegistrationState.REGISTERED.value:
+                await db.commit()
+                return BulkRegistrationState.REGISTERED.value
+            if state == BulkRegistrationState.REGISTERING.value:
+                started_at = _parse_iso_datetime(row["registration_started_at"])
+                if started_at is not None and now - started_at < timedelta(
+                    seconds=stale_after_seconds
+                ):
+                    await db.commit()
+                    return BulkRegistrationState.REGISTERING.value
+
+            await db.execute(
+                """
+                UPDATE bulk_batches
+                SET registration_state = ?,
+                    registration_started_at = ?,
+                    updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (
+                    BulkRegistrationState.REGISTERING.value,
+                    now.isoformat(),
+                    now.isoformat(),
+                    batch_id,
+                ),
+            )
+            await db.commit()
+        return "ACQUIRED"
+
+    async def complete_bulk_batch_registration(
+        self,
+        batch_id: str,
+        *,
+        registered_count: int,
+        data_end_row: int,
+    ) -> None:
+        async with aiosqlite.connect(self.sqlite_path) as db:
+            await db.execute(
+                """
+                UPDATE bulk_batches
+                SET registration_state = ?,
+                    registration_started_at = NULL,
+                    registered_count = ?,
+                    data_end_row = ?,
+                    updated_at = ?
+                WHERE batch_id = ?
+                  AND registration_state = ?
+                """,
+                (
+                    BulkRegistrationState.REGISTERED.value,
+                    registered_count,
+                    data_end_row,
+                    utc_now_iso(),
+                    batch_id,
+                    BulkRegistrationState.REGISTERING.value,
+                ),
+            )
+            await db.commit()
+
+    async def release_bulk_batch_registration(self, batch_id: str) -> None:
+        async with aiosqlite.connect(self.sqlite_path) as db:
+            await db.execute(
+                """
+                UPDATE bulk_batches
+                SET registration_state = ?,
+                    registration_started_at = NULL,
+                    updated_at = ?
+                WHERE batch_id = ?
+                  AND registration_state = ?
+                """,
+                (
+                    BulkRegistrationState.DRAFT.value,
+                    utc_now_iso(),
+                    batch_id,
+                    BulkRegistrationState.REGISTERING.value,
                 ),
             )
             await db.commit()
@@ -656,6 +814,12 @@ class DraftRepository:
             start_row=row["start_row"],
             data_start_row=row["data_start_row"],
             reserved_rows=row["reserved_rows"],
+            data_end_row=row["data_end_row"],
+            registration_state=(
+                row["registration_state"] or BulkRegistrationState.DRAFT.value
+            ),
+            registration_started_at=row["registration_started_at"],
+            registered_count=row["registered_count"] or 0,
             status_schema_version=row["status_schema_version"] or 1,
             batch_status=row["batch_status"] or "Новая пачка",
             last_known_batch_status=row["last_known_batch_status"] or "Новая пачка",
@@ -690,6 +854,25 @@ class DraftRepository:
             await db.execute(f"ALTER TABLE drafts ADD COLUMN {name} {definition}")
 
     @staticmethod
+    async def _migrate_llm_completeness_check(db: aiosqlite.Connection) -> None:
+        cursor = await db.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        version = int(row[0]) if row else 0
+        if version >= 1:
+            return
+        await db.execute(
+            """
+            UPDATE drafts
+            SET formatted_change_description = raw_change_description,
+                llm_score = NULL
+            WHERE current_step != ?
+              AND raw_change_description IS NOT NULL
+            """,
+            (Step.COMPLETED.value,),
+        )
+        await db.execute("PRAGMA user_version = 1")
+
+    @staticmethod
     async def _ensure_user_settings_column(
         db: aiosqlite.Connection,
         name: str,
@@ -720,13 +903,27 @@ class DraftRepository:
         db: aiosqlite.Connection,
         name: str,
         definition: str,
-    ) -> None:
+    ) -> bool:
         cursor = await db.execute("PRAGMA table_info(bulk_batches)")
         rows = await cursor.fetchall()
         await cursor.close()
         existing_columns = {row[1] for row in rows}
         if name not in existing_columns:
             await db.execute(f"ALTER TABLE bulk_batches ADD COLUMN {name} {definition}")
+            return True
+        return False
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _row_bool(value: Any) -> bool | None:

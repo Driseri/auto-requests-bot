@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 from googleapiclient.errors import HttpError
 
-from app.bulk import BULK_STAGING_HEADERS, LEGACY_BULK_STAGING_HEADERS
+from app.bulk import (
+    BULK_STAGING_HEADERS,
+    CURRENT_BULK_STAGING_HEADERS,
+    LEGACY_BULK_STAGING_HEADERS,
+)
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -27,6 +31,7 @@ from app.notifications import (
 from app.repository import DraftRepository
 from app.submission import (
     DirectionSpreadsheetConfig,
+    CURRENT_WORKSHEET_HEADERS,
     LEGACY_WORKSHEET_HEADERS,
     SHEET_HEADERS,
 )
@@ -38,9 +43,9 @@ WEEK_SHEET = "01.06"
 
 
 def test_working_data_rows_reads_all_rollout_sections():
-    add_row = ["ADD00001", "", ApplicationType.SINGLE.value]
-    edit_row = ["EDIT0001", "", ApplicationType.SINGLE.value]
-    chips_row = ["CHIPS001", "", ApplicationType.SINGLE.value]
+    add_row = app_row("ADD00001")
+    edit_row = app_row("EDIT0001")
+    chips_row = app_row("CHIPS001")
     rows = [
         ["ADD"],
         SHEET_HEADERS,
@@ -55,7 +60,7 @@ def test_working_data_rows_reads_all_rollout_sections():
 
     found = _working_data_rows(rows)
 
-    assert [(row_number, row[0]) for row_number, row, _ in found] == [
+    assert [(row_number, row[11]) for row_number, row, _ in found] == [
         (3, "ADD00001"),
         (6, "EDIT0001"),
         (9, "CHIPS001"),
@@ -228,17 +233,17 @@ def app_row(
     final_answer: str = "",
     direction: str = Direction.FL.value,
 ) -> list[str]:
-    row = [""] * 23
-    row[0] = application_id
-    row[1] = batch_id
-    row[2] = ApplicationType.BULK.value if batch_id else ApplicationType.SINGLE.value
-    row[4] = direction
-    row[5] = AnswerType.ROLLOUT.value
-    row[6] = "Да"
+    row = [""] * 24
+    row[11] = application_id
+    row[12] = batch_id
+    row[13] = ApplicationType.BULK.value if batch_id else ApplicationType.SINGLE.value
+    row[15] = direction
+    row[16] = AnswerType.ROLLOUT.value
+    row[17] = "Да"
     row[9] = status
     row[10] = "редактор 1"
-    row[17] = comment
-    row[19] = final_answer
+    row[7] = comment
+    row[5] = final_answer
     return row
 
 
@@ -324,7 +329,7 @@ async def test_status_reader_reads_only_tracked_application_sheets():
     )
 
     assert set(statuses) == {"A1B2C3D4"}
-    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A:W"]
+    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A:X"]
     assert api.metadata_get_calls == []
 
 
@@ -364,8 +369,8 @@ async def test_status_reader_reads_bulk_rows_from_batch_sheet():
     api = FakeSheetsApi(
         rows={
             (FL_SPREADSHEET, "Массовый ввод"): [],
-            (FL_SPREADSHEET, "'Массовый ввод'!A3:M6"): [
-                BULK_STAGING_HEADERS,
+            (FL_SPREADSHEET, "'Массовый ввод'!A3:N6"): [
+                CURRENT_BULK_STAGING_HEADERS,
                 [
                     AnswerType.ROLLOUT.value,
                     "intent.one",
@@ -416,6 +421,51 @@ async def test_status_reader_reads_bulk_rows_from_batch_sheet():
 
 
 @pytest.mark.asyncio
+async def test_status_reader_reads_new_bulk_schema():
+    row = [""] * 14
+    row[0] = AnswerType.ROLLOUT.value
+    row[1] = "ADD"
+    row[7] = "Итоговый ответ"
+    row[9] = "Комментарий редактора"
+    row[11] = BulkApplicationStatus.NEEDS_CLARIFICATION.value
+    row[12] = "редактор 2"
+    row[13] = "A1B2C3D4"
+    api = FakeSheetsApi(
+        rows={
+            (FL_SPREADSHEET, "'Массовый ввод'!A3:N4"): [
+                BULK_STAGING_HEADERS,
+                row,
+            ],
+        }
+    )
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    batch = BulkBatch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name="Массовый ввод",
+        sheet_id=300,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=1,
+    )
+
+    statuses = await reader.read_bulk_application_statuses([batch])
+
+    current = statuses["A1B2C3D4"]
+    assert current.status == BulkApplicationStatus.NEEDS_CLARIFICATION.value
+    assert current.editor == "редактор 2"
+    assert current.editor_comment == "Комментарий редактора"
+    assert current.final_answer == "Итоговый ответ"
+    assert current.end_column == "N"
+
+
+@pytest.mark.asyncio
 async def test_status_reader_supports_legacy_bulk_section():
     legacy_row = [""] * 12
     legacy_row[0] = AnswerType.ROLLOUT.value
@@ -425,7 +475,7 @@ async def test_status_reader_supports_legacy_bulk_section():
     legacy_row[11] = "Итог"
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, "'Массовый ввод'!A3:M4"): [
+            (FL_SPREADSHEET, "'Массовый ввод'!A3:N4"): [
                 LEGACY_BULK_STAGING_HEADERS,
                 legacy_row,
             ]
@@ -461,8 +511,8 @@ async def test_status_reader_supports_legacy_bulk_section():
 async def test_status_reader_reads_bulk_editor_comments_from_batch_rows():
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, "'РњР°СЃСЃРѕРІС‹Р№ РІРІРѕРґ'!A3:M6"): [
-                BULK_STAGING_HEADERS,
+            (FL_SPREADSHEET, "'РњР°СЃСЃРѕРІС‹Р№ РІРІРѕРґ'!A3:N6"): [
+                CURRENT_BULK_STAGING_HEADERS,
                 ["", "", "", "", "", "", "", "A1B2C3D4", "", "редактор 1", "Clarify <intent>", "", ""],
                 ["", "", "", "", "", "", "", "B1C2D3E4", "", "редактор 1", "", "", ""],
                 ["", "", "", "", "", "", "", "C1D2E3F4", "", "редактор 2", "Add source text", "", ""],
@@ -502,11 +552,11 @@ async def test_status_reader_reads_bulk_editor_comments_from_batch_rows():
 async def test_status_reader_skips_bulk_rows_when_sheet_range_is_missing():
     missing_range_error = HttpError(
         FakeResponse(status=400, reason="Bad Request"),
-        b"{\"error\":{\"message\":\"Unable to parse range: 'Mass input'!A3:M6\"}}",
+        b"{\"error\":{\"message\":\"Unable to parse range: 'Mass input'!A3:N6\"}}",
     )
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, "'Массовый ввод'!A3:M6"): missing_range_error,
+            (FL_SPREADSHEET, "'Массовый ввод'!A3:N6"): missing_range_error,
         }
     )
     reader = GoogleSheetsStatusReader(
@@ -535,11 +585,11 @@ async def test_status_reader_skips_bulk_rows_when_sheet_range_is_missing():
 async def test_status_reader_skips_bulk_batch_status_when_sheet_range_is_missing():
     missing_range_error = HttpError(
         FakeResponse(status=400, reason="Bad Request"),
-        b"{\"error\":{\"message\":\"Unable to parse range: 'Mass input'!A2:M3\"}}",
+        b"{\"error\":{\"message\":\"Unable to parse range: 'Mass input'!A2:N3\"}}",
     )
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, "'Массовый ввод'!A2:M3"): missing_range_error,
+            (FL_SPREADSHEET, "'Массовый ввод'!A2:N3"): missing_range_error,
         }
     )
     reader = GoogleSheetsStatusReader(

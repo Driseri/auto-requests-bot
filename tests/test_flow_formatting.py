@@ -15,11 +15,8 @@ class FakeLlmClient:
     async def check_change_description(self, context):
         return LlmResult(
             is_complete=True,
-            quality_score=1.0,
-            problems=[],
-            clarifying_question=None,
-            formatted_change_description=context.raw_change_description,
-            short_summary=None,
+            blocking_problem=None,
+            clarification_instruction=None,
         )
 
 

@@ -23,11 +23,8 @@ class FakeLlmClient:
         self.results = results or [
             LlmResult(
                 is_complete=True,
-                quality_score=1.0,
-                problems=[],
-                clarifying_question=None,
-                formatted_change_description="Обновить срок рассмотрения с 3 до 5 дней",
-                short_summary=None,
+                blocking_problem=None,
+                clarification_instruction=None,
             )
         ]
         self.calls = []
@@ -187,7 +184,7 @@ async def test_collects_application_and_submits_stub(tmp_path):
     assert draft.raw_change_description == "Обновить срок рассмотрения с 3 до 5 дней"
     assert draft.formatted_change_description == "Обновить срок рассмотрения с 3 до 5 дней"
     assert draft.llm_check_status == LlmCheckStatus.COMPLETE.value
-    assert draft.llm_score == 1.0
+    assert draft.llm_score is None
     assert draft.source_text == "Ваше обращение рассмотрим за 3 дня"
     assert draft.direction == Direction.FL.value
     assert draft.answer_type == AnswerType.ROLLOUT.value
@@ -434,6 +431,32 @@ async def test_confirm_bulk_batch_filled_keeps_ready_button_on_empty_rows(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_confirm_bulk_batch_filled_hides_ready_button_while_registering(tmp_path):
+    from app.bulk import BulkRegistrationResult
+
+    repository = DraftRepository(str(tmp_path / "bulk_confirm_registering.db"))
+    await repository.init()
+    registrar = FakeBulkRegistrar(
+        BulkRegistrationResult(
+            success=False,
+            message="Массовая заявка уже регистрируется.",
+            retry_allowed=False,
+        )
+    )
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        bulk_registrar=registrar,
+    )
+
+    response = await flow.confirm_bulk_batch_filled(180, "BATCH-ABC12345")
+
+    assert response.keyboard == KeyboardKind.BULK_MENU
+    assert response.keyboard_payload is None
+
+
+@pytest.mark.asyncio
 async def test_default_direction_accepts_chatbot_label(tmp_path):
     flow, repository, _, _ = await make_flow(tmp_path)
 
@@ -509,19 +532,15 @@ async def test_incomplete_change_description_asks_one_clarification(tmp_path):
         [
             LlmResult(
                 is_complete=False,
-                quality_score=0.4,
-                problems=["Не указан ожидаемый результат"],
-                clarifying_question="Что должно измениться после правки?",
-                formatted_change_description=None,
-                short_summary=None,
+                blocking_problem="Не указан ожидаемый результат",
+                clarification_instruction=(
+                    "Дополните поле: укажите, какой результат должен получиться после правки."
+                ),
             ),
             LlmResult(
                 is_complete=True,
-                quality_score=0.9,
-                problems=[],
-                clarifying_question=None,
-                formatted_change_description="Обновить срок рассмотрения обращения.",
-                short_summary=None,
+                blocking_problem=None,
+                clarification_instruction=None,
             ),
         ]
     )
@@ -537,8 +556,9 @@ async def test_incomplete_change_description_asks_one_clarification(tmp_path):
     first_response = await flow.handle_text(18, "Поменять срок")
     draft = await repository.get_by_user_id(18)
 
-    assert "описания пока недостаточно" in first_response.text
+    assert "не хватает информации" in first_response.text
     assert "Не указан ожидаемый результат" in first_response.text
+    assert "Дополните поле: укажите, какой результат" in first_response.text
     assert draft is not None
     assert draft.current_step == Step.CHANGE_DESCRIPTION_CLARIFICATION
 
@@ -549,12 +569,14 @@ async def test_incomplete_change_description_asks_one_clarification(tmp_path):
     assert draft is not None
     assert draft.current_step == Step.SOURCE_TEXT
     assert draft.clarification_count == 1
-    assert draft.raw_change_description == (
+    assert draft.raw_change_description == "Поменять срок"
+    assert draft.formatted_change_description == (
         "Поменять срок\n\nУточнение сценариста: Нужно указать 5 рабочих дней"
     )
-    assert draft.formatted_change_description == "Обновить срок рассмотрения обращения."
     assert draft.llm_check_status == LlmCheckStatus.COMPLETE.value
     assert len(llm_client.calls) == 2
+    assert llm_client.calls[1].raw_change_description == "Поменять срок"
+    assert llm_client.calls[1].clarification_text == "Нужно указать 5 рабочих дней"
 
 
 @pytest.mark.asyncio
@@ -563,19 +585,18 @@ async def test_incomplete_after_clarification_continues_with_attention_status(tm
         [
             LlmResult(
                 is_complete=False,
-                quality_score=0.3,
-                problems=["Нет конкретики"],
-                clarifying_question="Что именно поменять?",
-                formatted_change_description=None,
-                short_summary=None,
+                blocking_problem="Не указано конкретное изменение",
+                clarification_instruction=(
+                    "Перепишите поле целиком: укажите, что изменить, что сделать "
+                    "и какой результат должен получиться."
+                ),
             ),
             LlmResult(
                 is_complete=False,
-                quality_score=0.5,
-                problems=["Все еще нет конкретики"],
-                clarifying_question="Уточните результат.",
-                formatted_change_description=None,
-                short_summary=None,
+                blocking_problem="После ответа задача все еще неоднозначна",
+                clarification_instruction=(
+                    "Укажите конкретный итоговый результат изменения."
+                ),
             ),
         ]
     )
@@ -599,19 +620,17 @@ async def test_incomplete_after_clarification_continues_with_attention_status(tm
     assert draft.formatted_change_description == (
         "Поменять текст\n\nУточнение сценариста: Сделать лучше"
     )
+    assert draft.raw_change_description == "Поменять текст"
 
 
 @pytest.mark.asyncio
-async def test_missing_quality_score_complete_keeps_complete_status(tmp_path):
+async def test_complete_check_keeps_score_empty(tmp_path):
     llm_client = FakeLlmClient(
         [
             LlmResult(
                 is_complete=True,
-                quality_score=None,
-                problems=[],
-                clarifying_question=None,
-                formatted_change_description="Готовая суть без оценки",
-                short_summary=None,
+                blocking_problem=None,
+                clarification_instruction=None,
             )
         ]
     )
@@ -634,16 +653,47 @@ async def test_missing_quality_score_complete_keeps_complete_status(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_missing_quality_score_incomplete_keeps_attention_status(tmp_path):
+async def test_llm_error_keeps_user_text_and_continues(tmp_path):
+    llm_client = FakeLlmClient(
+        [
+            LlmResult(
+                is_complete=True,
+                blocking_problem="Ошибка GigaChat: ConnectError",
+                clarification_instruction=None,
+            )
+        ]
+    )
+    flow, repository, _, _ = await make_flow(tmp_path, llm_client)
+    await flow.start_new(26)
+    await flow.select_direction(26, Direction.FL)
+    await flow.select_answer_type(26, AnswerType.ROLLOUT)
+    await flow.select_change_type(26, ChangeType.ADD)
+    await flow.handle_text(26, "intent.change_limit")
+    await flow.handle_text(26, "Иван Иванов")
+    await flow.handle_text(26, "Изменились условия")
+
+    response = await flow.handle_text(26, "Поменять срок ответа на 5 дней")
+    draft = await repository.get_by_user_id(26)
+
+    assert draft is not None
+    assert draft.current_step == Step.SOURCE_TEXT
+    assert draft.llm_check_status == LlmCheckStatus.ERROR.value
+    assert draft.raw_change_description == "Поменять срок ответа на 5 дней"
+    assert draft.formatted_change_description == "Поменять срок ответа на 5 дней"
+    assert draft.llm_score is None
+    assert "Продолжаем с исходным текстом" in response.text
+
+
+@pytest.mark.asyncio
+async def test_incomplete_check_keeps_score_empty(tmp_path):
     llm_client = FakeLlmClient(
         [
             LlmResult(
                 is_complete=False,
-                quality_score=None,
-                problems=["Не хватает деталей"],
-                clarifying_question="Что нужно изменить?",
-                formatted_change_description=None,
-                short_summary=None,
+                blocking_problem="Не указано, что изменить",
+                clarification_instruction=(
+                    "Дополните поле: укажите изменяемый фрагмент и требуемый результат."
+                ),
             )
         ]
     )
@@ -671,19 +721,13 @@ async def test_edit_change_description_runs_llm_again(tmp_path):
         [
             LlmResult(
                 is_complete=True,
-                quality_score=1.0,
-                problems=[],
-                clarifying_question=None,
-                formatted_change_description="Первичная суть",
-                short_summary=None,
+                blocking_problem=None,
+                clarification_instruction=None,
             ),
             LlmResult(
                 is_complete=True,
-                quality_score=0.95,
-                problems=[],
-                clarifying_question=None,
-                formatted_change_description="Обновленная суть",
-                short_summary=None,
+                blocking_problem=None,
+                clarification_instruction=None,
             ),
         ]
     )
@@ -696,7 +740,9 @@ async def test_edit_change_description_runs_llm_again(tmp_path):
 
     assert response.keyboard == KeyboardKind.REVIEW
     assert draft is not None
-    assert draft.formatted_change_description == "Обновленная суть"
+    assert draft.formatted_change_description == "Новая суть"
+    assert draft.raw_change_description == "Новая суть"
+    assert draft.clarification_count == 0
     assert len(llm_client.calls) == 2
 
 
@@ -713,7 +759,8 @@ async def test_can_show_gigachat_json_response_in_bot_message(tmp_path):
 
     response = await flow.handle_text(21, "Обновить срок рассмотрения с 3 до 5 дней")
 
-    assert "Суть изменений проверена и принята." in response.text
+    assert "Полнота описания проверена." in response.text
     assert "Ответ GigaChat:" in response.text
     assert '"is_complete": true' in response.text
-    assert '"formatted_change_description": "Обновить срок рассмотрения с 3 до 5 дней"' in response.text
+    assert '"blocking_problem": null' in response.text
+    assert '"clarification_instruction": null' in response.text

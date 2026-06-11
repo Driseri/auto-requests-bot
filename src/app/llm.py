@@ -7,7 +7,7 @@ from string import Formatter
 from types import SimpleNamespace
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 from app.models import LlmContext, LlmResult
 
@@ -20,11 +20,22 @@ logger = logging.getLogger(__name__)
 
 class LlmResultSchema(BaseModel):
     is_complete: bool
-    quality_score: float | None = Field(default=None, ge=0, le=1)
-    problems: list[str] = Field(default_factory=list)
-    clarifying_question: str | None = None
-    formatted_change_description: str | None = None
-    short_summary: str | None = None
+    blocking_problem: str | None = None
+    clarification_instruction: str | None = None
+
+    @model_validator(mode="after")
+    def validate_completeness_fields(self) -> "LlmResultSchema":
+        if self.is_complete:
+            if self.blocking_problem or self.clarification_instruction:
+                raise ValueError(
+                    "Complete result must not contain a blocker or clarification instruction"
+                )
+            return self
+        if not (self.blocking_problem or "").strip():
+            raise ValueError("Incomplete result must contain blocking_problem")
+        if not (self.clarification_instruction or "").strip():
+            raise ValueError("Incomplete result must contain clarification_instruction")
+        return self
 
 
 class PromptRenderer:
@@ -135,12 +146,11 @@ class LlmClient:
             parsed = LlmResultSchema.model_validate(json.loads(raw_response))
             result = _schema_to_result(parsed, context)
             logger.info(
-                "GigaChat check completed: is_complete=%s quality_score=%s "
-                "problems_count=%s has_formatted=%s",
+                "GigaChat completeness check completed: is_complete=%s has_blocker=%s "
+                "has_clarification_instruction=%s",
                 result.is_complete,
-                result.quality_score,
-                len(result.problems),
-                bool(result.formatted_change_description),
+                bool(result.blocking_problem),
+                bool(result.clarification_instruction),
             )
             return result
         except (ValidationError, ValueError, OSError, Exception) as exc:
@@ -241,16 +251,10 @@ def _format_prompt(template: str, values: dict[str, str]) -> str:
 
 
 def _schema_to_result(schema: LlmResultSchema, context: LlmContext) -> LlmResult:
-    formatted = schema.formatted_change_description
-    if schema.is_complete and not formatted:
-        formatted = context.raw_change_description
     return LlmResult(
         is_complete=schema.is_complete,
-        quality_score=schema.quality_score,
-        problems=schema.problems,
-        clarifying_question=schema.clarifying_question,
-        formatted_change_description=formatted,
-        short_summary=schema.short_summary,
+        blocking_problem=schema.blocking_problem,
+        clarification_instruction=schema.clarification_instruction,
     )
 
 
@@ -269,9 +273,6 @@ def _exception_chain(exc: BaseException) -> str:
 def _fallback_result(context: LlmContext, problem: str) -> LlmResult:
     return LlmResult(
         is_complete=True,
-        quality_score=None,
-        problems=[problem],
-        clarifying_question=None,
-        formatted_change_description=context.raw_change_description,
-        short_summary=None,
+        blocking_problem=problem,
+        clarification_instruction=None,
     )

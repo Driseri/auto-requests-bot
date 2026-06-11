@@ -53,10 +53,36 @@ LEGACY_WORKSHEET_HEADERS = [
     "LLM оценка",
     "Тип изменения",
 ]
-WORKSHEET_HEADERS = [
+CURRENT_WORKSHEET_HEADERS = [
     *LEGACY_WORKSHEET_HEADERS[:10],
     "Редактор",
     *LEGACY_WORKSHEET_HEADERS[10:],
+]
+WORKSHEET_HEADERS = [
+    "Закрепленный сценарист",
+    "Интент",
+    "Причина изменений",
+    "Суть изменений",
+    "Исходный текст",
+    "Итоговый ответ редактора",
+    "Комментарий качества",
+    "Вопросы/комментарии редактора",
+    "Ответ сценариста",
+    "Статус",
+    "Редактор",
+    "ID заявки",
+    "ID пачки",
+    "Тип заявки",
+    "Дата заявки",
+    "Направление",
+    "Тип ответа",
+    "Срочная",
+    "Автор заявки",
+    "Telegram ID",
+    "Исходная суть изменений",
+    "LLM статус",
+    "LLM оценка",
+    "Тип изменения",
 ]
 
 LEGACY_DASHBOARD_HEADERS = [
@@ -90,6 +116,7 @@ BATCH_DASHBOARD_HEADERS = [
 SHEET_HEADERS = WORKSHEET_HEADERS
 LEGACY_SHEET_HEADERS = LEGACY_WORKSHEET_HEADERS
 LEGACY_SHEET_COLUMN_COUNT = len(LEGACY_WORKSHEET_HEADERS)
+CURRENT_SHEET_COLUMN_COUNT = len(CURRENT_WORKSHEET_HEADERS)
 SHEET_COLUMN_COUNT = len(WORKSHEET_HEADERS)
 DASHBOARD_SHEET_NAME = "Заявки"
 BATCH_DASHBOARD_SHEET_NAME = "Пачки"
@@ -236,11 +263,13 @@ class GoogleSheetsSubmissionService:
             sheet_name,
             use_sections=use_sections,
         )
+        schema = layout.split(":", maxsplit=1)[1]
         row_data = _draft_to_row_data(
             application,
             application_editors=self.application_editors,
+            schema=schema,
         )
-        if layout == "sectioned":
+        if layout.startswith("sectioned:"):
             row_number = self._insert_section_row(
                 api,
                 spreadsheet_id,
@@ -272,7 +301,7 @@ class GoogleSheetsSubmissionService:
             spreadsheet_id=spreadsheet_id,
             sheet_id=sheet_id,
             row_number=row_number,
-            end_column="W",
+            end_column=_worksheet_schema_layout(schema)["end_column"],
         )
 
         if self.dashboard_spreadsheet_id:
@@ -315,29 +344,19 @@ class GoogleSheetsSubmissionService:
         if not rows:
             if use_sections:
                 self._initialize_sectioned_sheet(api, spreadsheet_id, sheet_id, sheet_name)
-                layout = "sectioned"
+                layout = "sectioned:new"
             else:
                 self._initialize_empty_sheet(api, spreadsheet_id, sheet_id, sheet_name)
-                layout = "flat"
-        elif _is_sectioned_working_sheet(rows):
-            layout = "sectioned"
+                layout = "flat:new"
+        elif sectioned_schema := _sectioned_working_sheet_schema(rows):
+            layout = f"sectioned:{sectioned_schema}"
         else:
-            header_values = rows[0]
-            actual_headers = [str(value).strip() for value in header_values[:SHEET_COLUMN_COUNT]]
-            if actual_headers != WORKSHEET_HEADERS:
-                legacy_headers = [
-                    str(value).strip()
-                    for value in header_values[:LEGACY_SHEET_COLUMN_COUNT]
-                ]
-                if legacy_headers == LEGACY_WORKSHEET_HEADERS:
-                    raise SheetConfigurationError(
-                        "Рабочая вкладка использует старую схему без колонки "
-                        "«Редактор». Вставьте колонку K и повторите отправку."
-                    )
+            schema = _working_sheet_schema(rows[0])
+            if schema is None:
                 raise SheetConfigurationError(
-                    "Первые 23 колонки рабочей вкладки не совпадают с ожидаемой схемой."
+                    "Структура колонок рабочей вкладки не совпадает с поддерживаемыми схемами."
                 )
-            layout = "flat"
+            layout = f"flat:{schema}"
         self._prepared_sheets[cache_key] = layout
         return sheet_id, layout
 
@@ -374,7 +393,7 @@ class GoogleSheetsSubmissionService:
     def _read_header(self, api: Any, spreadsheet_id: str, sheet_name: str) -> list[Any]:
         result = api.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!A1:W1",
+            range=f"{quote_sheet_name(sheet_name)}!A1:X1",
             majorDimension="ROWS",
         ).execute()
         values = result.get("values", [])
@@ -388,7 +407,7 @@ class GoogleSheetsSubmissionService:
     ) -> list[list[Any]]:
         result = api.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!A:W",
+            range=f"{quote_sheet_name(sheet_name)}!A:X",
             majorDimension="ROWS",
         ).execute()
         return result.get("values", [])
@@ -402,7 +421,7 @@ class GoogleSheetsSubmissionService:
     ) -> None:
         api.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!A1:W1",
+            range=f"{quote_sheet_name(sheet_name)}!A1:X1",
             valueInputOption="USER_ENTERED",
             body={"values": [WORKSHEET_HEADERS]},
         ).execute()
@@ -438,7 +457,7 @@ class GoogleSheetsSubmissionService:
             rows.append(WORKSHEET_HEADERS)
         api.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!A1:W6",
+            range=f"{quote_sheet_name(sheet_name)}!A1:X6",
             valueInputOption="USER_ENTERED",
             body={"values": rows},
         ).execute()
@@ -506,7 +525,7 @@ class GoogleSheetsSubmissionService:
                             "startRowIndex": insert_index,
                             "endRowIndex": insert_index + 1,
                             "startColumnIndex": 0,
-                            "endColumnIndex": SHEET_COLUMN_COUNT,
+                            "endColumnIndex": len(row_data["values"]),
                         },
                         "rows": [row_data],
                         "fields": (
@@ -921,6 +940,35 @@ def week_sheet_name(created_at: str | None = None) -> str:
 
 def draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
     return [
+        draft.scriptwriter or "",
+        draft.intent or "",
+        draft.reason or "",
+        draft.formatted_change_description or draft.raw_change_description or "",
+        draft.source_text or "",
+        "",
+        "",
+        "",
+        "",
+        ApplicationStatus.NEW.value,
+        EDITOR_NOT_SELECTED,
+        draft.application_id or "",
+        batch_id,
+        draft.application_type or ApplicationType.SINGLE.value,
+        draft.created_at,
+        draft.direction or "",
+        draft.answer_type or "",
+        bool_to_sheet_value(draft.is_urgent),
+        draft.author_name or draft.scriptwriter or "",
+        draft.telegram_user_id,
+        draft.raw_change_description or "",
+        draft.llm_check_status or "",
+        draft.llm_score if draft.llm_score is not None else "",
+        draft.change_type or "",
+    ]
+
+
+def _current_draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
+    return [
         draft.application_id or "",
         batch_id,
         draft.application_type or ApplicationType.SINGLE.value,
@@ -945,6 +993,12 @@ def draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
         draft.llm_score if draft.llm_score is not None else "",
         draft.change_type or "",
     ]
+
+
+def _legacy_draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
+    row = _current_draft_to_sheet_row(draft, batch_id=batch_id)
+    del row[10]
+    return row
 
 
 def dashboard_row(
@@ -1083,23 +1137,60 @@ def _draft_to_row_data(
     *,
     batch_id: str = "",
     application_editors: tuple[str, ...] = (),
+    schema: str = "new",
 ) -> dict[str, Any]:
-    row = draft_to_sheet_row(draft, batch_id=batch_id)
+    layout = _worksheet_schema_layout(schema)
+    if schema == "new":
+        row = draft_to_sheet_row(draft, batch_id=batch_id)
+    elif schema == "current":
+        row = _current_draft_to_sheet_row(draft, batch_id=batch_id)
+    else:
+        row = _legacy_draft_to_sheet_row(draft, batch_id=batch_id)
     cells: list[dict[str, Any]] = []
     for index, value in enumerate(row):
-        if index == 8:
+        if index == layout["telegram_id"]:
             cells.append(_number_cell_data(value))
-        elif index == 9:
+        elif index == layout["status"]:
             cells.append(_status_cell_data(ApplicationStatus.NEW.value))
-        elif index == 16:
+        elif index == layout["source_text"]:
             cells.append(_source_text_cell_data(draft))
-        elif index == 10:
+        elif index == layout["editor"]:
             cells.append(_editor_cell_data(value, application_editors))
-        elif index == 21 and value != "":
+        elif index == layout["llm_score"] and value != "":
             cells.append(_number_cell_data(value))
         else:
             cells.append(_cell_data(value))
     return {"values": cells}
+
+
+def _worksheet_schema_layout(schema: str) -> dict[str, Any]:
+    layouts = {
+        "new": {
+            "status": 9,
+            "editor": 10,
+            "source_text": 4,
+            "telegram_id": 19,
+            "llm_score": 22,
+            "end_column": "X",
+        },
+        "current": {
+            "status": 9,
+            "editor": 10,
+            "source_text": 16,
+            "telegram_id": 8,
+            "llm_score": 21,
+            "end_column": "W",
+        },
+        "legacy": {
+            "status": 9,
+            "editor": -1,
+            "source_text": 15,
+            "telegram_id": 8,
+            "llm_score": 20,
+            "end_column": "V",
+        },
+    }
+    return layouts[schema]
 
 
 def _status_cell_data(status: str) -> dict[str, Any]:
@@ -1125,6 +1216,7 @@ def _editor_cell_data(
 
 def _source_text_cell_data(draft: Draft) -> dict[str, Any]:
     cell = _cell_data(draft.source_text or "")
+    cell["userEnteredFormat"] = {"wrapStrategy": "CLIP"}
     runs = build_text_format_runs(
         draft.source_text or "",
         deserialize_formatting_spans(draft.source_text_formatting_json),
@@ -1181,6 +1273,7 @@ def worksheet_formatting_requests(
             editor_column_index=10,
             application_editors=application_editors,
         ),
+        _right_border_request(sheet_id, column_index=10),
     ]
     requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=9))
     requests.append(_urgent_conditional_formatting_request(sheet_id))
@@ -1194,6 +1287,7 @@ def sectioned_worksheet_formatting_requests(
     requests: list[dict[str, Any]] = [
         _column_width_request(sheet_id, 0, SHEET_COLUMN_COUNT, 170),
         _column_width_request(sheet_id, 10, 19, 300),
+        _right_border_request(sheet_id, column_index=10),
     ]
     for marker_row_index in (0, 2, 4):
         requests.append(
@@ -1357,6 +1451,29 @@ def _column_width_request(
     }
 
 
+def _right_border_request(sheet_id: int, *, column_index: int) -> dict[str, Any]:
+    return {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startColumnIndex": column_index,
+                "endColumnIndex": column_index + 1,
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "borders": {
+                        "right": {
+                            "style": "SOLID_THICK",
+                            "color": {"red": 0.35, "green": 0.35, "blue": 0.35},
+                        }
+                    }
+                }
+            },
+            "fields": "userEnteredFormat.borders.right",
+        }
+    }
+
+
 def _status_dropdown_request(
     sheet_id: int,
     *,
@@ -1481,7 +1598,7 @@ def _urgent_conditional_formatting_request(sheet_id: int) -> dict[str, Any]:
                 "booleanRule": {
                     "condition": {
                         "type": "CUSTOM_FORMULA",
-                        "values": [{"userEnteredValue": '=$G2="Да"'}],
+                        "values": [{"userEnteredValue": '=$R2="Да"'}],
                     },
                     "format": {"backgroundColor": {"red": 1.0, "green": 0.90, "blue": 0.82}},
                 },
@@ -1543,7 +1660,18 @@ def _cell(row: list[Any], index: int) -> str:
     return str(row[index])
 
 
-def _is_sectioned_working_sheet(rows: list[list[Any]]) -> bool:
+def _working_sheet_schema(header_row: list[Any]) -> str | None:
+    headers = [str(value).strip() for value in header_row]
+    if headers[: len(WORKSHEET_HEADERS)] == WORKSHEET_HEADERS:
+        return "new"
+    if headers[: len(CURRENT_WORKSHEET_HEADERS)] == CURRENT_WORKSHEET_HEADERS:
+        return "current"
+    if headers[: len(LEGACY_WORKSHEET_HEADERS)] == LEGACY_WORKSHEET_HEADERS:
+        return "legacy"
+    return None
+
+
+def _sectioned_working_sheet_schema(rows: list[list[Any]]) -> str | None:
     marker_positions: dict[str, int] = {}
     for index, row in enumerate(rows):
         marker = _cell(row, 0).strip()
@@ -1553,17 +1681,20 @@ def _is_sectioned_working_sheet(rows: list[list[Any]]) -> bool:
         return False
     positions = [marker_positions[marker] for marker in ROLLOUT_SECTION_MARKERS]
     if positions != sorted(positions):
-        return False
+        return None
+    schemas: set[str] = set()
     for position in positions:
         if position + 1 >= len(rows):
-            return False
-        headers = [
-            str(value).strip()
-            for value in rows[position + 1][:SHEET_COLUMN_COUNT]
-        ]
-        if headers != WORKSHEET_HEADERS:
-            return False
-    return True
+            return None
+        schema = _working_sheet_schema(rows[position + 1])
+        if schema is None:
+            return None
+        schemas.add(schema)
+    return schemas.pop() if len(schemas) == 1 else None
+
+
+def _is_sectioned_working_sheet(rows: list[list[Any]]) -> bool:
+    return _sectioned_working_sheet_schema(rows) is not None
 
 
 def _find_row_by_id(rows: list[list[Any]], application_id: str) -> int | None:

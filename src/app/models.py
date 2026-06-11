@@ -107,6 +107,12 @@ class BulkApplicationStatus(StrEnum):
     ACCEPTED = "Принято"
 
 
+class BulkRegistrationState(StrEnum):
+    DRAFT = "DRAFT"
+    REGISTERING = "REGISTERING"
+    REGISTERED = "REGISTERED"
+
+
 class ApplicationStatus(StrEnum):
     NEW = "Новая"
     IN_PROGRESS = "В работе"
@@ -246,11 +252,8 @@ class LlmContext:
 @dataclass(slots=True)
 class LlmResult:
     is_complete: bool
-    quality_score: float | None
-    problems: list[str]
-    clarifying_question: str | None
-    formatted_change_description: str | None
-    short_summary: str | None
+    blocking_problem: str | None
+    clarification_instruction: str | None
 
 
 @dataclass(slots=True)
@@ -296,6 +299,10 @@ class BulkBatch:
     start_row: int
     data_start_row: int
     reserved_rows: int
+    data_end_row: int | None = None
+    registration_state: str = BulkRegistrationState.DRAFT.value
+    registration_started_at: str | None = None
+    registered_count: int = 0
     status_schema_version: int = 2
     batch_status: str = BulkBatchStatus.NEW.value
     last_known_batch_status: str = BulkBatchStatus.NEW.value

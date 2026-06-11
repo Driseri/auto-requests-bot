@@ -252,7 +252,7 @@ def create_router(flow: ApplicationFlow) -> Router:
         user_id = _user_id(message)
         await flow.remember_author(user_id, _message_author_name(message))
         if await flow.should_show_llm_processing(user_id):
-            await message.answer("Обрабатываю описание через GigaChat...")
+            await message.answer("Проверяю полноту описания через GigaChat...")
         await _send_message(
             message,
             await flow.handle_text(
