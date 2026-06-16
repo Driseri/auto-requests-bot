@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from html import escape
+from uuid import uuid4
 
 from app.formatting import (
     TextFormattingSpan,
@@ -17,6 +18,8 @@ from app.models import (
     ApplicationStatus,
     ApplicationType,
     BotResponse,
+    BulkBatch,
+    BulkCreationState,
     ChangeType,
     Direction,
     Draft,
@@ -27,11 +30,12 @@ from app.models import (
     Priority,
     Step,
     SubmissionState,
+    generate_batch_id,
     direction_display_label,
     direction_value_from_display_label,
 )
 from app.repository import DraftRepository
-from app.submission import SubmissionServiceProtocol
+from app.submission import SubmissionServiceProtocol, dashboard_projection, dashboard_row
 
 
 FIELD_LABELS = {
@@ -76,6 +80,8 @@ STEP_PROMPTS = {
 
 
 class ApplicationFlow:
+    """Оркестрирует пользовательские сценарии независимо от aiogram handlers."""
+
     def __init__(
         self,
         repository: DraftRepository,
@@ -84,6 +90,9 @@ class ApplicationFlow:
         bulk_service: BulkBatchServiceProtocol | None = None,
         bulk_registrar: BulkApplicationRegistrar | None = None,
         show_llm_response_json: bool = False,
+        bulk_reserved_rows: int = 100,
+        bulk_creation_stale_seconds: int = 600,
+        dashboard_enabled: bool = False,
     ) -> None:
         self.repository = repository
         self.llm_client = llm_client
@@ -91,6 +100,9 @@ class ApplicationFlow:
         self.bulk_service = bulk_service
         self.bulk_registrar = bulk_registrar
         self.show_llm_response_json = show_llm_response_json
+        self.bulk_reserved_rows = bulk_reserved_rows
+        self.bulk_creation_stale_seconds = bulk_creation_stale_seconds
+        self.dashboard_enabled = dashboard_enabled
         self._submission_locks: dict[str, asyncio.Lock] = {}
 
     async def show_start(self) -> BotResponse:
@@ -114,6 +126,55 @@ class ApplicationFlow:
             keyboard=KeyboardKind.CREATE_MODE,
         )
 
+    async def resume_from_notification(
+        self,
+        telegram_user_id: int,
+        *,
+        author_name: str | None = None,
+    ) -> BotResponse:
+        """Восстановить незавершенный workflow перед показом главного меню."""
+        settings = await self.repository.get_user_settings(telegram_user_id)
+        pending_action = settings.pending_action or ""
+        if pending_action.startswith(f"{PENDING_CREATE_BULK_DIRECTION}:"):
+            idempotency_key = pending_action.split(":", maxsplit=1)[1]
+            request = await self.repository.get_bulk_creation_request(idempotency_key)
+            if request is not None and request.telegram_user_id == telegram_user_id:
+                if request.state == BulkCreationState.CREATED.value:
+                    await self.repository.save_user_setting(
+                        telegram_user_id,
+                        "pending_action",
+                        None,
+                    )
+                    return self._bulk_created_response(
+                        request.batch_id,
+                        request.insert_url or "",
+                    )
+                return BotResponse(
+                    text=(
+                        "Продолжите создание массовой заявки: "
+                        "выберите направление."
+                    ),
+                    keyboard=KeyboardKind.BULK_DIRECTION,
+                    keyboard_payload=idempotency_key,
+                )
+
+        batch = await self.repository.get_latest_unregistered_bulk_batch(
+            telegram_user_id
+        )
+        if batch is not None:
+            return self._bulk_created_response(
+                batch.batch_id,
+                self._bulk_insert_url(batch),
+            )
+        draft = await self.repository.get_by_user_id(telegram_user_id)
+        if draft is not None and draft.is_active:
+            await self.remember_author(telegram_user_id, author_name)
+            return await self.continue_existing(telegram_user_id)
+        return await self.start_new(
+            telegram_user_id,
+            author_name=author_name,
+        )
+
     async def start_single(
         self,
         telegram_user_id: int,
@@ -121,6 +182,7 @@ class ApplicationFlow:
         force: bool = False,
         author_name: str | None = None,
     ) -> BotResponse:
+        """Начать одиночную заявку или предложить продолжить активный черновик."""
         existing = await self.repository.get_by_user_id(telegram_user_id)
         if existing is not None and existing.is_active and not force:
             await self.remember_author(telegram_user_id, author_name)
@@ -203,44 +265,87 @@ class ApplicationFlow:
         )
 
     async def create_bulk_batch(self, telegram_user_id: int) -> BotResponse:
+        """Запустить выбор направления перед созданием секции массовой заявки."""
         if self.bulk_service is None:
             return BotResponse(
                 text="Массовая загрузка не настроена.",
                 keyboard=KeyboardKind.BULK_MENU,
             )
+        idempotency_key = uuid4().hex
+        await self.repository.create_bulk_creation_request(
+            idempotency_key=idempotency_key,
+            telegram_user_id=telegram_user_id,
+            batch_id=generate_batch_id(),
+        )
         await self.repository.save_user_setting(
             telegram_user_id,
             "pending_action",
-            PENDING_CREATE_BULK_DIRECTION,
+            f"{PENDING_CREATE_BULK_DIRECTION}:{idempotency_key}",
         )
-        settings = await self.repository.get_user_settings(telegram_user_id)
         return BotResponse(
             text="Выберите направление массовой заявки.",
-            keyboard=(
-                KeyboardKind.DIRECTION_WITH_DEFAULT
-                if settings.default_direction
-                else KeyboardKind.DIRECTION
-            ),
+            keyboard=KeyboardKind.BULK_DIRECTION,
+            keyboard_payload=idempotency_key,
         )
 
     async def _create_bulk_batch_for_direction(
         self,
         telegram_user_id: int,
         direction: str,
+        idempotency_key: str,
     ) -> BotResponse:
         if self.bulk_service is None:
             return BotResponse(text="Массовая загрузка не настроена.", keyboard=KeyboardKind.BULK_MENU)
-        await self.repository.save_user_setting(telegram_user_id, "pending_action", None)
-        result = await self.bulk_service.create_batch(telegram_user_id, direction)
+        request = await self.repository.claim_bulk_creation(
+            idempotency_key,
+            direction=direction,
+            stale_after_seconds=self.bulk_creation_stale_seconds,
+        )
+        if request is None or request.telegram_user_id != telegram_user_id:
+            return BotResponse(
+                text="Запрос на создание массовой заявки не найден.",
+                keyboard=KeyboardKind.BULK_MENU,
+            )
+        if request.state == BulkCreationState.CREATED:
+            return self._bulk_created_response(request.batch_id, request.insert_url or "")
+        result = await self.bulk_service.create_batch(
+            telegram_user_id,
+            direction,
+            batch_id=request.batch_id,
+        )
         if not result.success:
+            await self.repository.fail_bulk_creation(
+                idempotency_key,
+                error=result.message,
+            )
             return BotResponse(text=result.message, keyboard=KeyboardKind.BULK_MENU)
         batch_id = result.batch.batch_id if result.batch else "-"
         insert_url = result.insert_url or ""
+        await self.repository.complete_bulk_creation(
+            idempotency_key,
+            insert_url=insert_url,
+        )
+        await self.repository.save_user_setting(telegram_user_id, "pending_action", None)
+        return self._bulk_created_response(batch_id, insert_url)
+
+    async def select_bulk_direction(
+        self,
+        telegram_user_id: int,
+        idempotency_key: str,
+        direction: Direction,
+    ) -> BotResponse:
+        return await self._create_bulk_batch_for_direction(
+            telegram_user_id,
+            direction.value,
+            idempotency_key,
+        )
+
+    def _bulk_created_response(self, batch_id: str, insert_url: str) -> BotResponse:
         return BotResponse(
             text=(
                 f"Создана массовая заявка <b>{escape(batch_id)}</b>.\n\n"
                 "Заполните строки в колонках A:G, начиная с первой строки по ссылке. "
-                "Можно вставить любое количество строк вниз.\n"
+                f"Можно заполнить до {self.bulk_reserved_rows} строк.\n"
                 "После заполнения вернитесь сюда и нажмите «Заявка заполнена», чтобы бот выдал ID заявок.\n\n"
                 f'<a href="{escape(insert_url, quote=True)}">Открыть место для вставки</a>'
             ),
@@ -249,11 +354,19 @@ class ApplicationFlow:
             parse_mode="HTML",
         )
 
+    @staticmethod
+    def _bulk_insert_url(batch: BulkBatch) -> str:
+        return (
+            f"https://docs.google.com/spreadsheets/d/{batch.spreadsheet_id}/edit"
+            f"#gid={batch.sheet_id}&range=A{batch.data_start_row}:G{batch.data_start_row}"
+        )
+
     async def confirm_bulk_batch_filled(
         self,
         telegram_user_id: int,
         batch_id: str,
     ) -> BotResponse:
+        """По подтверждению автора зарегистрировать строки массовой заявки."""
         if self.bulk_registrar is None:
             return BotResponse(
                 text="Регистрация массовой заявки не настроена.",
@@ -262,19 +375,28 @@ class ApplicationFlow:
             )
         result = await self.bulk_registrar.register_batch(batch_id, telegram_user_id)
         if not result.success:
+            link = (
+                "\n\n"
+                f'<a href="{escape(result.insert_url, quote=True)}">'
+                "Открыть исходный диапазон</a>"
+                if result.insert_url
+                else ""
+            )
             if not result.retry_allowed:
                 return BotResponse(
-                    text=result.message,
+                    text=f"{escape(result.message)}{link}",
                     keyboard=KeyboardKind.BULK_MENU,
+                    parse_mode="HTML",
                 )
             return BotResponse(
-                text=result.message,
+                text=f"{escape(result.message)}{link}",
                 keyboard=KeyboardKind.BULK_CREATED,
                 keyboard_payload=batch_id,
+                parse_mode="HTML",
             )
         return BotResponse(
             text=result.message,
-            keyboard=KeyboardKind.BULK_MENU,
+            keyboard=KeyboardKind.BULK_COMPLETED,
         )
 
     async def open_defaults_menu(self, telegram_user_id: int) -> BotResponse:
@@ -347,10 +469,14 @@ class ApplicationFlow:
                 draft,
                 prefix="Направление по умолчанию пока не задано.",
             )
-        if settings.pending_action == PENDING_CREATE_BULK_DIRECTION:
+        if settings.pending_action and settings.pending_action.startswith(
+            f"{PENDING_CREATE_BULK_DIRECTION}:"
+        ):
+            idempotency_key = settings.pending_action.split(":", maxsplit=1)[1]
             return await self._create_bulk_batch_for_direction(
                 telegram_user_id,
                 settings.default_direction,
+                idempotency_key,
             )
         return await self.select_direction(
             telegram_user_id,
@@ -419,6 +545,7 @@ class ApplicationFlow:
         text: str | None,
         formatting_spans: list[TextFormattingSpan] | None = None,
     ) -> BotResponse:
+        """Обработать текст согласно текущему шагу черновика или настройки."""
         pending_response = await self._handle_pending_settings_text(telegram_user_id, text)
         if pending_response is not None:
             return pending_response
@@ -547,8 +674,15 @@ class ApplicationFlow:
 
     async def select_direction(self, telegram_user_id: int, direction: Direction) -> BotResponse:
         settings = await self.repository.get_user_settings(telegram_user_id)
-        if settings.pending_action == PENDING_CREATE_BULK_DIRECTION:
-            return await self._create_bulk_batch_for_direction(telegram_user_id, direction.value)
+        if settings.pending_action and settings.pending_action.startswith(
+            f"{PENDING_CREATE_BULK_DIRECTION}:"
+        ):
+            idempotency_key = settings.pending_action.split(":", maxsplit=1)[1]
+            return await self._create_bulk_batch_for_direction(
+                telegram_user_id,
+                direction.value,
+                idempotency_key,
+            )
 
         draft = await self._get_active_or_start(telegram_user_id)
         if draft.current_step not in {Step.DIRECTION, Step.EDIT_DIRECTION}:
@@ -789,6 +923,7 @@ class ApplicationFlow:
         return self._review_response(draft)
 
     async def submit(self, telegram_user_id: int) -> BotResponse:
+        """Идемпотентно отправить одиночную заявку и завершить ее tracking."""
         draft = await self.repository.get_by_user_id(telegram_user_id)
         if draft is None:
             draft = await self.repository.get_or_create(telegram_user_id)
@@ -859,6 +994,20 @@ class ApplicationFlow:
                 answer_type=draft.answer_type,
                 application_type=draft.application_type,
                 is_urgent=draft.is_urgent,
+                submitted_at=result.submitted_at,
+                dashboard_projection=(
+                    dashboard_projection(
+                        dashboard_row(
+                            draft,
+                            ApplicationStatus.NEW.value,
+                            False,
+                            result.row_link or "",
+                            submitted_at=result.submitted_at,
+                        )
+                    )
+                    if self.dashboard_enabled
+                    else None
+                ),
             )
         return BotResponse(
             text=f"{result.message}\n\nЧтобы создать новую заявку, отправьте /new.",
@@ -873,6 +1022,7 @@ class ApplicationFlow:
         *,
         edit_mode: bool = False,
     ) -> BotResponse:
+        """Проверить полноту описания и запросить не более одного уточнения."""
         draft = await self.repository.save_answer(
             telegram_user_id,
             "raw_change_description",
@@ -880,6 +1030,9 @@ class ApplicationFlow:
         )
         llm_result = await self.llm_client.check_change_description(
             LlmContext(
+                direction=draft.direction or "",
+                answer_type=draft.answer_type or "",
+                change_type=draft.change_type or "",
                 intent=draft.intent or "",
                 scriptwriter=draft.scriptwriter or "",
                 reason=draft.reason or "",
@@ -935,6 +1088,9 @@ class ApplicationFlow:
         ).strip()
         llm_result = await self.llm_client.check_change_description(
             LlmContext(
+                direction=draft.direction or "",
+                answer_type=draft.answer_type or "",
+                change_type=draft.change_type or "",
                 intent=draft.intent or "",
                 scriptwriter=draft.scriptwriter or "",
                 reason=draft.reason or "",

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from app.google_api import GoogleApiRetryConfig, execute_with_retry
 from app.models import (
@@ -22,11 +23,14 @@ from app.models import (
     utc_now_iso,
 )
 from app.repository import DraftRepository
+from app.scheduling import DEFAULT_TIMEZONE
+from app.sheet_dates import google_sheets_date_cell, utc_iso
 from app.submission import (
     DashboardSyncService,
     DirectionSpreadsheetConfig,
     EDITOR_NOT_SELECTED,
-    SheetConfigurationError,
+    dashboard_bulk_batch_row,
+    dashboard_projection,
     build_google_sheets_api,
     quote_sheet_name,
     _editor_data_validation_rule,
@@ -106,6 +110,7 @@ class BulkRegistrationResult:
     message: str
     registered_count: int = 0
     retry_allowed: bool = True
+    insert_url: str | None = None
 
 
 class BulkBatchServiceProtocol(Protocol):
@@ -113,6 +118,7 @@ class BulkBatchServiceProtocol(Protocol):
         self,
         telegram_user_id: int,
         direction: str,
+        batch_id: str | None = None,
     ) -> BulkBatchCreationResult:
         ...
 
@@ -125,10 +131,11 @@ class InMemoryBulkBatchService:
         self,
         telegram_user_id: int,
         direction: str,
+        batch_id: str | None = None,
     ) -> BulkBatchCreationResult:
         self.created.append(telegram_user_id)
         batch = BulkBatch(
-            batch_id=generate_batch_id(),
+            batch_id=batch_id or generate_batch_id(),
             telegram_user_id=telegram_user_id,
             spreadsheet_id="test-spreadsheet",
             direction=direction,
@@ -150,6 +157,8 @@ class InMemoryBulkBatchService:
 
 
 class GoogleSheetsBulkBatchService:
+    """Создает изолированные секции массовых заявок в листах направлений."""
+
     def __init__(
         self,
         *,
@@ -161,6 +170,8 @@ class GoogleSheetsBulkBatchService:
         sheets_api: Any | None = None,
         reserved_rows: int = DEFAULT_BULK_RESERVED_ROWS,
         google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
+        timezone_name: str = DEFAULT_TIMEZONE,
+        clock: Callable[[], datetime] | None = None,
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
     ) -> None:
         self.direction_spreadsheets = direction_spreadsheets or DirectionSpreadsheetConfig(
@@ -177,6 +188,8 @@ class GoogleSheetsBulkBatchService:
         self.google_api_retry = google_api_retry
         self.reserved_rows = reserved_rows
         self.application_editors = application_editors
+        self.timezone_name = timezone_name
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._sheet_locks: dict[tuple[str, str], asyncio.Lock] = {}
         if self.reserved_rows <= 0:
             raise ValueError("reserved_rows must be greater than 0")
@@ -188,14 +201,17 @@ class GoogleSheetsBulkBatchService:
         self,
         telegram_user_id: int,
         direction: str,
+        batch_id: str | None = None,
     ) -> BulkBatchCreationResult:
+        """Создать секцию под блокировкой листа и сохранить ее точные границы."""
         spreadsheet_id = self.direction_spreadsheets.spreadsheet_id_for(direction)
         sheet_name = _bulk_sheet_name(direction)
         lock = self._sheet_locks.setdefault((spreadsheet_id, sheet_name), asyncio.Lock())
         try:
             async with lock:
                 existing_batches = await self.repository.list_bulk_batches()
-                batch_id = generate_batch_id()
+                batch_id = batch_id or generate_batch_id()
+                created_at = self.clock()
                 batch, insert_url = await asyncio.to_thread(
                     execute_with_retry,
                     lambda: self._create_batch_sync(
@@ -203,6 +219,7 @@ class GoogleSheetsBulkBatchService:
                         direction,
                         existing_batches,
                         batch_id,
+                        created_at,
                     ),
                     config=self.google_api_retry,
                     operation_id=f"bulk-create:{telegram_user_id}:{direction}",
@@ -220,6 +237,7 @@ class GoogleSheetsBulkBatchService:
                     reserved_rows=batch.reserved_rows,
                     data_end_row=batch.data_end_row,
                     status_schema_version=batch.status_schema_version,
+                    created_at=batch.created_at,
                 )
         except Exception as exc:
             return BulkBatchCreationResult(
@@ -239,6 +257,7 @@ class GoogleSheetsBulkBatchService:
         direction: str,
         existing_batches: list[BulkBatch],
         batch_id: str,
+        created_at: datetime,
     ) -> tuple[BulkBatch, str]:
         api = self._get_sheets_api()
         spreadsheet_id = self.direction_spreadsheets.spreadsheet_id_for(direction)
@@ -269,8 +288,8 @@ class GoogleSheetsBulkBatchService:
                 reserved_rows=self.reserved_rows,
                 data_end_row=data_start_row + self.reserved_rows - 1,
                 status_schema_version=2,
-                created_at=utc_now_iso(),
-                updated_at=utc_now_iso(),
+                created_at=utc_iso(created_at),
+                updated_at=utc_iso(created_at),
             )
             return batch, self._insert_url(
                 spreadsheet_id,
@@ -285,14 +304,20 @@ class GoogleSheetsBulkBatchService:
         )
         data_start_row = start_row + 2
         data_end_row = data_start_row + self.reserved_rows - 1
-        now = utc_now_iso()
+        now = utc_iso(created_at)
 
         rows = [
             *[
                 _empty_row()
                 for _ in range(_spacing_rows_before_batch(existing_rows, start_row))
             ],
-            _bulk_header_row(batch_id, telegram_user_id, now, direction),
+            _bulk_header_row(
+                batch_id,
+                telegram_user_id,
+                created_at,
+                direction,
+                timezone_name=self.timezone_name,
+            ),
             _bulk_column_header_row(),
             *[
                 _bulk_input_row(self.application_editors)
@@ -426,6 +451,8 @@ class GoogleSheetsBulkBatchService:
 
 
 class BulkApplicationRegistrar:
+    """Идемпотентно регистрирует заполненные строки одной массовой заявки."""
+
     def __init__(
         self,
         *,
@@ -452,6 +479,7 @@ class BulkApplicationRegistrar:
             raise ValueError("registration_stale_seconds must be greater than 0")
 
     async def register_batch(self, batch_id: str, telegram_user_id: int) -> BulkRegistrationResult:
+        """Зарегистрировать пачку под per-batch lock, не выходя за ее диапазон."""
         lock = self._batch_locks.setdefault(batch_id, asyncio.Lock())
         async with lock:
             return await self._register_batch_locked(batch_id, telegram_user_id)
@@ -464,6 +492,7 @@ class BulkApplicationRegistrar:
         batch = await self.repository.get_bulk_batch(batch_id)
         if batch is None:
             return BulkRegistrationResult(success=False, message="Массовая заявка не найдена.")
+        insert_url = self._batch_insert_url(batch)
         if batch.telegram_user_id != telegram_user_id:
             return BulkRegistrationResult(
                 success=False,
@@ -483,12 +512,14 @@ class BulkApplicationRegistrar:
                 ),
                 registered_count=batch.registered_count,
                 retry_allowed=False,
+                insert_url=insert_url,
             )
         if claim == BulkRegistrationState.REGISTERING.value:
             return BulkRegistrationResult(
                 success=False,
                 message="Массовая заявка уже регистрируется. Дождитесь завершения обработки.",
                 retry_allowed=False,
+                insert_url=insert_url,
             )
 
         try:
@@ -498,12 +529,15 @@ class BulkApplicationRegistrar:
             return BulkRegistrationResult(
                 success=False,
                 message=f"Не удалось зарегистрировать массовую заявку. Причина: {exc}",
+                insert_url=insert_url,
             )
         if not result.success:
             await self.repository.release_bulk_batch_registration(batch_id)
+        result.insert_url = result.insert_url or insert_url
         return result
 
     async def _register_claimed_batch(self, batch: BulkBatch) -> BulkRegistrationResult:
+        """Проверить всю пачку и завершить регистрацию без частичного успеха."""
         layout = await self._run_google(
             lambda: self._read_batch_layout(self._get_sheets_api(), batch),
             f"bulk-layout:{batch.batch_id}",
@@ -609,25 +643,35 @@ class BulkApplicationRegistrar:
             )
         data_end_row = batch.data_start_row + actual_rows - 1
         await self._run_google(
-            lambda: self._group_batch_rows(
+            lambda: self._organize_registered_batch_rows(
                 self._get_sheets_api(),
                 batch,
                 actual_rows,
             ),
-            f"bulk-group:{batch.batch_id}",
+            f"bulk-organize-rows:{batch.batch_id}",
         )
-        await self._sync_dashboard(
-            batch,
-            final_answer_present=_has_final_answer(
-                rows,
-                final_answer_index=layout["final_answer"],
-                user_indices=layout["user_indices"],
-            ),
-        )
+        editors = await self._batch_editors(batch.batch_id)
         await self.repository.complete_bulk_batch_registration(
             batch.batch_id,
             registered_count=user_rows,
             data_end_row=data_end_row,
+            dashboard_projection=(
+                dashboard_projection(
+                    dashboard_bulk_batch_row(
+                        batch=batch,
+                        status=batch.batch_status,
+                        row_link=self._batch_row_link(batch),
+                        final_answer_present=_has_final_answer(
+                            rows,
+                            final_answer_index=layout["final_answer"],
+                            user_indices=layout["user_indices"],
+                        ),
+                        editors=editors,
+                    )
+                )
+                if self.dashboard_sync is not None
+                else None
+            ),
         )
         return BulkRegistrationResult(
             success=True,
@@ -645,21 +689,6 @@ class BulkApplicationRegistrar:
             reset_client=self._reset_sheets_api,
         )
 
-    async def _sync_dashboard(self, batch: BulkBatch, *, final_answer_present: bool) -> None:
-        if self.dashboard_sync is None:
-            return
-        try:
-            await asyncio.to_thread(
-                self.dashboard_sync.upsert_bulk_batch,
-                batch=batch,
-                status=batch.batch_status,
-                row_link=self._batch_row_link(batch),
-                final_answer_present=final_answer_present,
-                editors=await self._batch_editors(batch.batch_id),
-            )
-        except SheetConfigurationError:
-            return
-
     async def _batch_editors(self, batch_id: str) -> tuple[str, ...]:
         applications = await self.repository.list_submitted_applications()
         return tuple(
@@ -673,6 +702,13 @@ class BulkApplicationRegistrar:
         return (
             f"https://docs.google.com/spreadsheets/d/{batch.spreadsheet_id}/edit"
             f"#gid={batch.sheet_id}&range=A{batch.start_row}:N{batch.start_row}"
+        )
+
+    @staticmethod
+    def _batch_insert_url(batch: BulkBatch) -> str:
+        return (
+            f"https://docs.google.com/spreadsheets/d/{batch.spreadsheet_id}/edit"
+            f"#gid={batch.sheet_id}&range=A{batch.data_start_row}:G{batch.data_start_row}"
         )
 
     async def _save_existing_application(
@@ -786,6 +822,7 @@ class BulkApplicationRegistrar:
         return int(result["replies"][0]["addSheet"]["properties"]["sheetId"])
 
     def _read_batch_rows(self, api: Any, batch: BulkBatch) -> list[list[Any]]:
+        """Прочитать сохраненный диапазон и остановиться перед следующей шапкой."""
         end_row = _batch_data_end_row(batch)
         result = api.spreadsheets().values().get(
             spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
@@ -915,53 +952,89 @@ class BulkApplicationRegistrar:
             body={"requests": requests},
         ).execute()
 
-    def _group_batch_rows(self, api: Any, batch: BulkBatch, actual_rows: int) -> None:
-        if actual_rows <= 0:
-            return
-        if self._batch_rows_are_grouped(api, batch, actual_rows):
-            return
-        api.spreadsheets().batchUpdate(
-            spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
-            body={
-                "requests": [
-                    {
-                        "addDimensionGroup": {
-                            "range": {
-                                "sheetId": batch.sheet_id,
-                                "dimension": "ROWS",
-                                "startIndex": batch.data_start_row - 1,
-                                "endIndex": batch.data_start_row + actual_rows - 1,
-                            }
-                        }
-                    }
-                ]
-            },
-        ).execute()
-
-    def _batch_rows_are_grouped(
+    def _organize_registered_batch_rows(
         self,
         api: Any,
         batch: BulkBatch,
         actual_rows: int,
-    ) -> bool:
+    ) -> None:
+        """Сгруппировать заполненную часть и скрыть пустой хвост резерва."""
+        filled_start_index = batch.data_start_row - 1
+        filled_end_index = filled_start_index + actual_rows
+        if actual_rows <= 0:
+            return
+
+        reserved_end_row = _batch_reserved_end_row(batch)
+        existing_groups = self._batch_row_group_ranges(api, batch)
+        requests: list[dict[str, Any]] = []
+        if (filled_start_index, filled_end_index) not in existing_groups:
+            requests.append(
+                {
+                    "addDimensionGroup": {
+                        "range": {
+                            "sheetId": batch.sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": filled_start_index,
+                            "endIndex": filled_end_index,
+                        }
+                    }
+                }
+            )
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": batch.sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": filled_start_index,
+                        "endIndex": filled_end_index,
+                    },
+                    "properties": {"hiddenByUser": False},
+                    "fields": "hiddenByUser",
+                }
+            }
+        )
+        if filled_end_index < reserved_end_row:
+            requests.append(
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": batch.sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": filled_end_index,
+                            "endIndex": reserved_end_row,
+                        },
+                        "properties": {"hiddenByUser": True},
+                        "fields": "hiddenByUser",
+                    }
+                }
+            )
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+
+    def _batch_row_group_ranges(
+        self,
+        api: Any,
+        batch: BulkBatch,
+    ) -> set[tuple[int, int]]:
         response = api.spreadsheets().get(
             spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
             fields="sheets(properties(sheetId),rowGroups(range))",
         ).execute()
-        expected_start = batch.data_start_row - 1
-        expected_end = batch.data_start_row + actual_rows - 1
+        ranges: set[tuple[int, int]] = set()
         for sheet in response.get("sheets", []):
             properties = sheet.get("properties", {})
             if int(properties.get("sheetId", -1)) != batch.sheet_id:
                 continue
             for group in sheet.get("rowGroups", []):
                 group_range = group.get("range", {})
-                if (
-                    group_range.get("startIndex") == expected_start
-                    and group_range.get("endIndex") == expected_end
-                ):
-                    return True
-        return False
+                start_index = group_range.get("startIndex")
+                end_index = group_range.get("endIndex")
+                if isinstance(start_index, int) and isinstance(end_index, int):
+                    ranges.add((start_index, end_index))
+        return ranges
 
     def _get_sheets_api(self) -> Any:
         if self._sheets_api is None:
@@ -976,13 +1049,19 @@ class BulkApplicationRegistrar:
 def _bulk_header_row(
     batch_id: str,
     telegram_user_id: int,
-    created_at: str,
+    created_at: datetime | str,
     direction: str,
+    *,
+    timezone_name: str = DEFAULT_TIMEZONE,
 ) -> dict[str, Any]:
     values = [{} for _ in range(BULK_STAGING_COLUMN_COUNT)]
     values[0] = _formatted_string_cell(f"Пачка {batch_id}", bold=True)
     values[1] = _formatted_string_cell(batch_id, bold=True)
-    values[2] = _formatted_string_cell(created_at, bold=True)
+    values[2] = google_sheets_date_cell(
+        created_at,
+        timezone_name=timezone_name,
+        bold=True,
+    )
     values[3] = _formatted_string_cell(direction, bold=True)
     values[4] = _formatted_string_cell(f"Telegram ID: {telegram_user_id}", bold=True)
     values[6] = _formatted_string_cell("Заполняйте строки ниже в колонках A:G", bold=True)
@@ -1278,7 +1357,7 @@ def _next_batch_start_row(
     last_non_empty_row = _last_non_empty_row_number(existing_rows)
     last_allocated_row = max(
         (
-            _batch_data_end_row(batch)
+            _batch_reserved_end_row(batch)
             for batch in existing_batches
             if batch.spreadsheet_id == spreadsheet_id and batch.sheet_name == sheet_name
         ),
@@ -1308,6 +1387,10 @@ def _last_non_empty_row_number(rows: list[list[Any]]) -> int:
 def _batch_data_end_row(batch: BulkBatch) -> int:
     if batch.data_end_row is not None:
         return batch.data_end_row
+    return _batch_reserved_end_row(batch)
+
+
+def _batch_reserved_end_row(batch: BulkBatch) -> int:
     return batch.data_start_row + max(batch.reserved_rows, 1) - 1
 
 

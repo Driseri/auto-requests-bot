@@ -2,16 +2,23 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 import aiosqlite
 
 from app.models import (
+    BulkCreationRequest,
+    BulkCreationState,
     BulkBatch,
     BulkBatchStatus,
     BulkRegistrationState,
+    DashboardOutboxItem,
+    DashboardOutboxState,
     Draft,
+    NotificationOutboxItem,
+    NotificationOutboxState,
     Step,
     SubmissionState,
     SubmittedApplication,
@@ -24,10 +31,13 @@ from app.models import (
 
 
 class DraftRepository:
+    """Единая точка доступа к черновикам, tracking и массовым заявкам в SQLite."""
+
     def __init__(self, sqlite_path: str) -> None:
         self.sqlite_path = sqlite_path
 
     async def init(self) -> None:
+        """Подготовить SQLite, выполнить совместимые миграции и создать индексы."""
         db_path = Path(self.sqlite_path)
         if db_path.parent and str(db_path.parent) != ".":
             db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +103,8 @@ class DraftRepository:
                     default_intent TEXT,
                     default_scriptwriter TEXT,
                     pending_action TEXT,
+                    active_chat_id INTEGER,
+                    active_message_id INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -116,6 +128,7 @@ class DraftRepository:
                     last_seen_editor TEXT,
                     last_seen_editor_comment TEXT,
                     last_seen_final_answer TEXT,
+                    submitted_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -130,6 +143,7 @@ class DraftRepository:
             await self._ensure_submitted_applications_column(db, "is_urgent", "INTEGER")
             await self._ensure_submitted_applications_column(db, "last_seen_final_answer", "TEXT")
             await self._ensure_submitted_applications_column(db, "last_seen_editor", "TEXT")
+            await self._ensure_submitted_applications_column(db, "submitted_at", "TEXT")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bulk_batches (
@@ -152,6 +166,61 @@ class DraftRepository:
                     last_seen_final_answers_digest_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    telegram_user_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    html TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    chunk_count INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'PENDING',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    sending_started_at TEXT,
+                    last_error TEXT,
+                    telegram_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bulk_creation_requests (
+                    idempotency_key TEXT PRIMARY KEY,
+                    telegram_user_id INTEGER NOT NULL,
+                    direction TEXT,
+                    state TEXT NOT NULL,
+                    batch_id TEXT NOT NULL UNIQUE,
+                    insert_url TEXT,
+                    last_error TEXT,
+                    started_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_outbox (
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'PENDING',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    sending_started_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (entity_type, entity_id)
                 )
                 """
             )
@@ -211,6 +280,8 @@ class DraftRepository:
                 )
             await self._ensure_user_settings_column(db, "pending_action", "TEXT")
             await self._ensure_user_settings_column(db, "default_direction", "TEXT")
+            await self._ensure_user_settings_column(db, "active_chat_id", "INTEGER")
+            await self._ensure_user_settings_column(db, "active_message_id", "INTEGER")
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_submitted_applications_batch_id
@@ -235,10 +306,35 @@ class DraftRepository:
                 ON bulk_batches(registration_state, last_known_batch_status)
                 """
             )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notification_outbox_delivery
+                ON notification_outbox(state, next_attempt_at, created_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notification_outbox_user
+                ON notification_outbox(telegram_user_id, created_at, chunk_index)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bulk_creation_user
+                ON bulk_creation_requests(telegram_user_id, created_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_outbox_delivery
+                ON dashboard_outbox(state, next_attempt_at, updated_at)
+                """
+            )
             await self._migrate_llm_completeness_check(db)
             await db.commit()
 
     async def get_or_create(self, telegram_user_id: int) -> Draft:
+        """Вернуть черновик пользователя или создать новый с application_id."""
         draft = await self.get_by_user_id(telegram_user_id)
         if draft is not None:
             return draft
@@ -358,6 +454,7 @@ class DraftRepository:
         sheet_name: str,
         stale_after_seconds: int = 600,
     ) -> Draft:
+        """Атомарно зафиксировать маршрут и перевести одиночную заявку в PENDING."""
         now = datetime.now(timezone.utc)
         async with self._connection() as db:
             db.row_factory = aiosqlite.Row
@@ -429,7 +526,10 @@ class DraftRepository:
         answer_type: str | None,
         application_type: str | None,
         is_urgent: bool | None,
+        submitted_at: str | None = None,
+        dashboard_projection: dict[str, Any] | None = None,
     ) -> Draft:
+        """Одной транзакцией сохранить tracking и отметить черновик отправленным."""
         now = utc_now_iso()
         async with self._connection() as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -438,12 +538,16 @@ class DraftRepository:
                 INSERT INTO submitted_applications (
                     application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
                     last_known_status, direction, answer_type, application_type, is_urgent,
-                    last_seen_row_number, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_seen_row_number, submitted_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(application_id) DO UPDATE SET
                     spreadsheet_id = excluded.spreadsheet_id,
                     sheet_id = excluded.sheet_id,
                     sheet_name = excluded.sheet_name,
+                    submitted_at = COALESCE(
+                        submitted_applications.submitted_at,
+                        excluded.submitted_at
+                    ),
                     last_seen_row_number = COALESCE(
                         excluded.last_seen_row_number,
                         submitted_applications.last_seen_row_number
@@ -462,6 +566,7 @@ class DraftRepository:
                     application_type,
                     1 if is_urgent else 0 if is_urgent is not None else None,
                     row_number,
+                    submitted_at,
                     now,
                     now,
                 ),
@@ -490,6 +595,14 @@ class DraftRepository:
                     telegram_user_id,
                 ),
             )
+            if dashboard_projection is not None:
+                await self._upsert_dashboard_projection_in_connection(
+                    db,
+                    entity_type="APPLICATION",
+                    entity_id=application_id,
+                    snapshot=dashboard_projection,
+                    now=now,
+                )
             await db.commit()
         draft = await self.get_by_user_id(telegram_user_id)
         if draft is None:
@@ -546,6 +659,36 @@ class DraftRepository:
         settings = await self.get_user_settings(telegram_user_id)
         return settings.pending_action
 
+    async def set_active_message(
+        self,
+        telegram_user_id: int,
+        *,
+        chat_id: int,
+        message_id: int,
+    ) -> UserSettings:
+        """Атомарно назначить единственное активное управляющее сообщение."""
+        await self.get_user_settings(telegram_user_id)
+        await self._update_user_settings(
+            telegram_user_id,
+            {
+                "active_chat_id": chat_id,
+                "active_message_id": message_id,
+            },
+        )
+        return await self.get_user_settings(telegram_user_id)
+
+    async def clear_active_message(self, telegram_user_id: int) -> UserSettings:
+        """Атомарно очистить координаты активной inline-клавиатуры."""
+        await self.get_user_settings(telegram_user_id)
+        await self._update_user_settings(
+            telegram_user_id,
+            {
+                "active_chat_id": None,
+                "active_message_id": None,
+            },
+        )
+        return await self.get_user_settings(telegram_user_id)
+
     async def save_submitted_application(
         self,
         *,
@@ -564,6 +707,7 @@ class DraftRepository:
         last_seen_editor: str | None = None,
         last_seen_editor_comment: str | None = None,
         last_seen_final_answer: str | None = None,
+        submitted_at: str | None = None,
     ) -> SubmittedApplication:
         now = utc_now_iso()
         async with self._connection() as db:
@@ -573,8 +717,9 @@ class DraftRepository:
                     application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
                     last_known_status, direction, answer_type, application_type, is_urgent,
                     batch_id, last_seen_row_number, last_seen_editor,
-                    last_seen_editor_comment, last_seen_final_answer, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_seen_editor_comment, last_seen_final_answer, submitted_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(application_id) DO UPDATE SET
                     telegram_user_id = excluded.telegram_user_id,
                     spreadsheet_id = excluded.spreadsheet_id,
@@ -590,6 +735,10 @@ class DraftRepository:
                     last_seen_editor = excluded.last_seen_editor,
                     last_seen_editor_comment = excluded.last_seen_editor_comment,
                     last_seen_final_answer = excluded.last_seen_final_answer,
+                    submitted_at = COALESCE(
+                        submitted_applications.submitted_at,
+                        excluded.submitted_at
+                    ),
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -608,6 +757,7 @@ class DraftRepository:
                     last_seen_editor,
                     last_seen_editor_comment,
                     last_seen_final_answer,
+                    submitted_at,
                     now,
                     now,
                 ),
@@ -700,9 +850,10 @@ class DraftRepository:
         direction: str = "",
         batch_status: str | None = None,
         status_schema_version: int = 2,
+        created_at: str | None = None,
     ) -> BulkBatch:
         batch_id = batch_id or generate_batch_id()
-        now = utc_now_iso()
+        now = created_at or utc_now_iso()
         async with self._connection() as db:
             await db.execute(
                 """
@@ -767,7 +918,33 @@ class DraftRepository:
             await cursor.close()
         return [self._bulk_batch_from_row(row) for row in rows]
 
+    async def get_latest_unregistered_bulk_batch(
+        self,
+        telegram_user_id: int,
+    ) -> BulkBatch | None:
+        """Вернуть последнюю пачку пользователя, которую еще можно зарегистрировать."""
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM bulk_batches
+                WHERE telegram_user_id = ?
+                  AND registration_state != ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (
+                    telegram_user_id,
+                    BulkRegistrationState.REGISTERED.value,
+                ),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return self._bulk_batch_from_row(row) if row is not None else None
+
     async def list_active_bulk_batches(self) -> list[BulkBatch]:
+        """Вернуть пачки, которые еще требуется проверять в частом polling."""
         async with self._connection() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
@@ -789,8 +966,11 @@ class DraftRepository:
         *,
         batch_status: str,
         last_known_batch_status: str,
+        dashboard_projection: dict[str, Any] | None = None,
     ) -> None:
         async with self._connection() as db:
+            now = utc_now_iso()
+            await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 """
                 UPDATE bulk_batches
@@ -802,10 +982,18 @@ class DraftRepository:
                 (
                     batch_status,
                     last_known_batch_status,
-                    utc_now_iso(),
+                    now,
                     batch_id,
                 ),
             )
+            if dashboard_projection is not None:
+                await self._upsert_dashboard_projection_in_connection(
+                    db,
+                    entity_type="BULK_BATCH",
+                    entity_id=batch_id,
+                    snapshot=dashboard_projection,
+                    now=now,
+                )
             await db.commit()
 
     async def update_bulk_batch_reserved_rows(
@@ -836,6 +1024,7 @@ class DraftRepository:
         *,
         stale_after_seconds: int,
     ) -> str:
+        """Атомарно захватить пачку для регистрации или восстановить stale-захват."""
         now = datetime.now(timezone.utc)
         async with self._connection() as db:
             db.row_factory = aiosqlite.Row
@@ -890,7 +1079,9 @@ class DraftRepository:
         *,
         registered_count: int,
         data_end_row: int,
+        dashboard_projection: dict[str, Any] | None = None,
     ) -> None:
+        """Зафиксировать фактическую границу и успешный результат регистрации пачки."""
         async with self._connection() as db:
             await db.execute(
                 """
@@ -912,7 +1103,178 @@ class DraftRepository:
                     BulkRegistrationState.REGISTERING.value,
                 ),
             )
+            if dashboard_projection is not None:
+                await self._upsert_dashboard_projection_in_connection(
+                    db,
+                    entity_type="BULK_BATCH",
+                    entity_id=batch_id,
+                    snapshot=dashboard_projection,
+                    now=utc_now_iso(),
+                )
             await db.commit()
+
+    async def upsert_dashboard_projection(
+        self,
+        *,
+        entity_type: str,
+        entity_id: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await self._upsert_dashboard_projection_in_connection(
+                db,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                snapshot=snapshot,
+                now=now,
+            )
+            await db.commit()
+
+    async def claim_dashboard_projections(
+        self,
+        *,
+        stale_after_seconds: int,
+        limit: int = 100,
+    ) -> list[DashboardOutboxItem]:
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        stale_before = (now - timedelta(seconds=stale_after_seconds)).isoformat()
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                UPDATE dashboard_outbox
+                SET state = ?, sending_started_at = NULL, updated_at = ?
+                WHERE state = ? AND sending_started_at < ?
+                """,
+                (
+                    DashboardOutboxState.PENDING.value,
+                    now_iso,
+                    DashboardOutboxState.SENDING.value,
+                    stale_before,
+                ),
+            )
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM dashboard_outbox
+                WHERE state = ?
+                  AND COALESCE(next_attempt_at, '') <= ?
+                ORDER BY updated_at, entity_type, entity_id
+                LIMIT ?
+                """,
+                (DashboardOutboxState.PENDING.value, now_iso, limit),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            keys = [(row["entity_type"], row["entity_id"]) for row in rows]
+            for entity_type, entity_id in keys:
+                await db.execute(
+                    """
+                    UPDATE dashboard_outbox
+                    SET state = ?, sending_started_at = ?, updated_at = ?
+                    WHERE entity_type = ? AND entity_id = ? AND state = ?
+                    """,
+                    (
+                        DashboardOutboxState.SENDING.value,
+                        now_iso,
+                        now_iso,
+                        entity_type,
+                        entity_id,
+                        DashboardOutboxState.PENDING.value,
+                    ),
+                )
+            await db.commit()
+        return [self._dashboard_outbox_from_row(row) for row in rows]
+
+    async def complete_dashboard_projections(
+        self,
+        items: list[DashboardOutboxItem],
+    ) -> None:
+        if not items:
+            return
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for item in items:
+                await db.execute(
+                    """
+                    DELETE FROM dashboard_outbox
+                    WHERE entity_type = ? AND entity_id = ? AND state = ?
+                    """,
+                    (
+                        item.entity_type,
+                        item.entity_id,
+                        DashboardOutboxState.SENDING.value,
+                    ),
+                )
+            await db.commit()
+
+    async def fail_dashboard_projections(
+        self,
+        items: list[DashboardOutboxItem],
+        *,
+        error: str,
+        retry_base_seconds: int,
+        retry_max_seconds: int,
+    ) -> None:
+        if not items:
+            return
+        now = datetime.now(timezone.utc)
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for item in items:
+                attempts = item.attempts + 1
+                delay = min(
+                    retry_max_seconds,
+                    retry_base_seconds * (2 ** max(attempts - 1, 0)),
+                )
+                await db.execute(
+                    """
+                    UPDATE dashboard_outbox
+                    SET state = ?, attempts = ?, next_attempt_at = ?,
+                        sending_started_at = NULL, last_error = ?, updated_at = ?
+                    WHERE entity_type = ? AND entity_id = ? AND state = ?
+                    """,
+                    (
+                        DashboardOutboxState.PENDING.value,
+                        attempts,
+                        (now + timedelta(seconds=delay)).isoformat(),
+                        error[:1000],
+                        now.isoformat(),
+                        item.entity_type,
+                        item.entity_id,
+                        DashboardOutboxState.SENDING.value,
+                    ),
+                )
+            await db.commit()
+
+    async def list_dashboard_outbox(self) -> list[DashboardOutboxItem]:
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM dashboard_outbox ORDER BY updated_at, entity_type, entity_id"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [self._dashboard_outbox_from_row(row) for row in rows]
+
+    async def list_completed_bulk_batches(self) -> list[BulkBatch]:
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM bulk_batches
+                WHERE COALESCE(last_known_batch_status, '') = ?
+                ORDER BY created_at ASC
+                """,
+                (BulkBatchStatus.DONE.value,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [self._bulk_batch_from_row(row) for row in rows]
 
     async def release_bulk_batch_registration(self, batch_id: str) -> None:
         async with self._connection() as db:
@@ -933,6 +1295,423 @@ class DraftRepository:
                 ),
             )
             await db.commit()
+
+    async def enqueue_notification_event(
+        self,
+        *,
+        telegram_user_id: int,
+        event_type: str,
+        dedupe_key: str,
+        snapshot_json: str,
+        chunks: list[str],
+        application_updates: list[dict[str, Any]] | None = None,
+        batch_updates: list[dict[str, Any]] | None = None,
+        dashboard_projections: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Atomically persist an observed event and advance its tracking state."""
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT 1 FROM notification_outbox WHERE dedupe_key LIKE ? LIMIT 1",
+                (f"{dedupe_key}:%",),
+            )
+            exists = await cursor.fetchone()
+            await cursor.close()
+            if exists is not None:
+                await db.commit()
+                return False
+
+            chunk_count = len(chunks)
+            for chunk_index, html in enumerate(chunks):
+                await db.execute(
+                    """
+                    INSERT INTO notification_outbox (
+                        event_id, dedupe_key, telegram_user_id, event_type,
+                        snapshot_json, html, chunk_index, chunk_count,
+                        state, next_attempt_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        generate_application_id(),
+                        f"{dedupe_key}:{chunk_index}",
+                        telegram_user_id,
+                        event_type,
+                        snapshot_json,
+                        html,
+                        chunk_index,
+                        chunk_count,
+                        NotificationOutboxState.PENDING.value,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+
+            for update in application_updates or []:
+                await self._update_submitted_application_in_connection(db, update, now)
+            for update in batch_updates or []:
+                await db.execute(
+                    """
+                    UPDATE bulk_batches
+                    SET batch_status = ?, last_known_batch_status = ?, updated_at = ?
+                    WHERE batch_id = ?
+                    """,
+                    (
+                        update["status"],
+                        update["status"],
+                        now,
+                        update["batch_id"],
+                    ),
+                )
+            for projection in dashboard_projections or []:
+                await self._upsert_dashboard_projection_in_connection(
+                    db,
+                    entity_type=projection["entity_type"],
+                    entity_id=projection["entity_id"],
+                    snapshot=projection["snapshot"],
+                    now=now,
+                )
+            await db.commit()
+        return True
+
+    async def update_application_tracking_batch(
+        self,
+        updates: list[dict[str, Any]],
+        *,
+        dashboard_projections: list[dict[str, Any]] | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for update in updates:
+                await self._update_submitted_application_in_connection(db, update, now)
+            for projection in dashboard_projections or []:
+                await self._upsert_dashboard_projection_in_connection(
+                    db,
+                    entity_type=projection["entity_type"],
+                    entity_id=projection["entity_id"],
+                    snapshot=projection["snapshot"],
+                    now=now,
+                )
+            await db.commit()
+
+    async def claim_next_notification(
+        self,
+        *,
+        stale_after_seconds: int,
+    ) -> NotificationOutboxItem | None:
+        now = datetime.now(timezone.utc)
+        stale_before = (now - timedelta(seconds=stale_after_seconds)).isoformat()
+        now_iso = now.isoformat()
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                UPDATE notification_outbox
+                SET state = ?, sending_started_at = NULL, updated_at = ?
+                WHERE state = ? AND sending_started_at < ?
+                """,
+                (
+                    NotificationOutboxState.PENDING.value,
+                    now_iso,
+                    NotificationOutboxState.SENDING.value,
+                    stale_before,
+                ),
+            )
+            cursor = await db.execute(
+                """
+                SELECT candidate.*
+                FROM notification_outbox AS candidate
+                WHERE candidate.state = ?
+                  AND COALESCE(candidate.next_attempt_at, '') <= ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM notification_outbox AS earlier
+                      WHERE earlier.telegram_user_id = candidate.telegram_user_id
+                        AND earlier.state IN (?, ?)
+                        AND earlier.rowid < candidate.rowid
+                  )
+                ORDER BY candidate.rowid
+                LIMIT 1
+                """,
+                (
+                    NotificationOutboxState.PENDING.value,
+                    now_iso,
+                    NotificationOutboxState.PENDING.value,
+                    NotificationOutboxState.SENDING.value,
+                ),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.commit()
+                return None
+            await db.execute(
+                """
+                UPDATE notification_outbox
+                SET state = ?, sending_started_at = ?, updated_at = ?
+                WHERE event_id = ? AND state = ?
+                """,
+                (
+                    NotificationOutboxState.SENDING.value,
+                    now_iso,
+                    now_iso,
+                    row["event_id"],
+                    NotificationOutboxState.PENDING.value,
+                ),
+            )
+            await db.commit()
+        return self._notification_outbox_from_row(row)
+
+    async def complete_notification(
+        self,
+        event_id: str,
+        *,
+        telegram_message_id: int | None,
+    ) -> None:
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE notification_outbox
+                SET state = ?, telegram_message_id = ?, sending_started_at = NULL,
+                    last_error = NULL, updated_at = ?
+                WHERE event_id = ?
+                """,
+                (
+                    NotificationOutboxState.SENT.value,
+                    telegram_message_id,
+                    utc_now_iso(),
+                    event_id,
+                ),
+            )
+            await db.commit()
+
+    async def fail_notification(
+        self,
+        event_id: str,
+        *,
+        error: str,
+        max_attempts: int,
+        retry_base_seconds: int,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT attempts FROM notification_outbox WHERE event_id = ?",
+                (event_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            attempts = int(row["attempts"] if row else 0) + 1
+            state = (
+                NotificationOutboxState.FAILED.value
+                if attempts >= max_attempts
+                else NotificationOutboxState.PENDING.value
+            )
+            delay = retry_base_seconds * min(2 ** max(attempts - 1, 0), 32)
+            next_attempt_at = (
+                None
+                if state == NotificationOutboxState.FAILED.value
+                else (now + timedelta(seconds=delay)).isoformat()
+            )
+            await db.execute(
+                """
+                UPDATE notification_outbox
+                SET state = ?, attempts = ?, next_attempt_at = ?,
+                    sending_started_at = NULL, last_error = ?, updated_at = ?
+                WHERE event_id = ?
+                """,
+                (
+                    state,
+                    attempts,
+                    next_attempt_at,
+                    error[:1000],
+                    now.isoformat(),
+                    event_id,
+                ),
+            )
+            await db.commit()
+
+    async def list_notification_outbox(self) -> list[NotificationOutboxItem]:
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM notification_outbox ORDER BY rowid"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [self._notification_outbox_from_row(row) for row in rows]
+
+    async def create_bulk_creation_request(
+        self,
+        *,
+        idempotency_key: str,
+        telegram_user_id: int,
+        batch_id: str,
+    ) -> BulkCreationRequest:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO bulk_creation_requests (
+                    idempotency_key, telegram_user_id, state, batch_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key,
+                    telegram_user_id,
+                    BulkCreationState.AWAITING_DIRECTION.value,
+                    batch_id,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+        request = await self.get_bulk_creation_request(idempotency_key)
+        if request is None:
+            raise LookupError(f"Bulk creation request not found: {idempotency_key}")
+        return request
+
+    async def get_bulk_creation_request(
+        self,
+        idempotency_key: str,
+    ) -> BulkCreationRequest | None:
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM bulk_creation_requests WHERE idempotency_key = ?",
+                (idempotency_key,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return self._bulk_creation_from_row(row) if row is not None else None
+
+    async def claim_bulk_creation(
+        self,
+        idempotency_key: str,
+        *,
+        direction: str,
+        stale_after_seconds: int,
+    ) -> BulkCreationRequest | None:
+        now = datetime.now(timezone.utc)
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM bulk_creation_requests WHERE idempotency_key = ?",
+                (idempotency_key,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.rollback()
+                return None
+            state = row["state"]
+            started_at = _parse_iso_datetime(row["started_at"])
+            if state == BulkCreationState.BULK_CREATING.value and (
+                started_at is None
+                or now - started_at < timedelta(seconds=stale_after_seconds)
+            ):
+                await db.commit()
+                return self._bulk_creation_from_row(row)
+            if state == BulkCreationState.CREATED.value:
+                await db.commit()
+                return self._bulk_creation_from_row(row)
+            await db.execute(
+                """
+                UPDATE bulk_creation_requests
+                SET direction = ?, state = ?, started_at = ?, last_error = NULL, updated_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (
+                    direction,
+                    BulkCreationState.BULK_CREATING.value,
+                    now.isoformat(),
+                    now.isoformat(),
+                    idempotency_key,
+                ),
+            )
+            await db.commit()
+        return await self.get_bulk_creation_request(idempotency_key)
+
+    async def complete_bulk_creation(
+        self,
+        idempotency_key: str,
+        *,
+        insert_url: str,
+    ) -> None:
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE bulk_creation_requests
+                SET state = ?, insert_url = ?, started_at = NULL,
+                    last_error = NULL, updated_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (
+                    BulkCreationState.CREATED.value,
+                    insert_url,
+                    utc_now_iso(),
+                    idempotency_key,
+                ),
+            )
+            await db.commit()
+
+    async def fail_bulk_creation(self, idempotency_key: str, *, error: str) -> None:
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE bulk_creation_requests
+                SET state = ?, started_at = NULL, last_error = ?, updated_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (
+                    BulkCreationState.FAILED.value,
+                    error[:1000],
+                    utc_now_iso(),
+                    idempotency_key,
+                ),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def _update_submitted_application_in_connection(
+        db: aiosqlite.Connection,
+        update: dict[str, Any],
+        now: str,
+    ) -> None:
+        await db.execute(
+            """
+            UPDATE submitted_applications
+            SET spreadsheet_id = COALESCE(?, spreadsheet_id),
+                sheet_id = COALESCE(?, sheet_id),
+                sheet_name = ?,
+                last_known_status = ?,
+                last_seen_row_number = ?,
+                last_seen_editor = ?,
+                last_seen_editor_comment = ?,
+                last_seen_final_answer = ?,
+                updated_at = ?
+            WHERE application_id = ?
+            """,
+            (
+                update.get("spreadsheet_id"),
+                update.get("sheet_id"),
+                update["sheet_name"],
+                update["last_known_status"],
+                update.get("last_seen_row_number"),
+                update.get("last_seen_editor"),
+                update.get("last_seen_editor_comment"),
+                update.get("last_seen_final_answer"),
+                now,
+                update["application_id"],
+            ),
+        )
 
     async def _update_fields(self, telegram_user_id: int, values: dict[str, Any]) -> None:
         values = {**values, "updated_at": utc_now_iso()}
@@ -987,6 +1766,8 @@ class DraftRepository:
             default_intent=row["default_intent"],
             default_scriptwriter=row["default_scriptwriter"],
             pending_action=row["pending_action"],
+            active_chat_id=row["active_chat_id"],
+            active_message_id=row["active_message_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -1009,6 +1790,7 @@ class DraftRepository:
             last_seen_editor=row["last_seen_editor"],
             last_seen_editor_comment=row["last_seen_editor_comment"],
             last_seen_final_answer=row["last_seen_final_answer"],
+            submitted_at=row["submitted_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -1039,6 +1821,57 @@ class DraftRepository:
             updated_at=row["updated_at"],
         )
 
+    @staticmethod
+    def _notification_outbox_from_row(row: aiosqlite.Row) -> NotificationOutboxItem:
+        return NotificationOutboxItem(
+            event_id=row["event_id"],
+            dedupe_key=row["dedupe_key"],
+            telegram_user_id=row["telegram_user_id"],
+            event_type=row["event_type"],
+            snapshot_json=row["snapshot_json"],
+            html=row["html"],
+            chunk_index=row["chunk_index"],
+            chunk_count=row["chunk_count"],
+            state=row["state"],
+            attempts=row["attempts"],
+            next_attempt_at=row["next_attempt_at"],
+            sending_started_at=row["sending_started_at"],
+            last_error=row["last_error"],
+            telegram_message_id=row["telegram_message_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _dashboard_outbox_from_row(row: aiosqlite.Row) -> DashboardOutboxItem:
+        return DashboardOutboxItem(
+            entity_type=row["entity_type"],
+            entity_id=row["entity_id"],
+            snapshot_json=row["snapshot_json"],
+            state=row["state"],
+            attempts=row["attempts"],
+            next_attempt_at=row["next_attempt_at"],
+            sending_started_at=row["sending_started_at"],
+            last_error=row["last_error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _bulk_creation_from_row(row: aiosqlite.Row) -> BulkCreationRequest:
+        return BulkCreationRequest(
+            idempotency_key=row["idempotency_key"],
+            telegram_user_id=row["telegram_user_id"],
+            state=row["state"],
+            batch_id=row["batch_id"],
+            direction=row["direction"],
+            insert_url=row["insert_url"],
+            last_error=row["last_error"],
+            started_at=row["started_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
     async def _update_user_settings(
         self,
         telegram_user_id: int,
@@ -1056,6 +1889,41 @@ class DraftRepository:
             await db.commit()
 
     @staticmethod
+    async def _upsert_dashboard_projection_in_connection(
+        db: aiosqlite.Connection,
+        *,
+        entity_type: str,
+        entity_id: str,
+        snapshot: dict[str, Any],
+        now: str,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO dashboard_outbox (
+                entity_type, entity_id, snapshot_json, state, attempts,
+                next_attempt_at, sending_started_at, last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+            ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                snapshot_json = excluded.snapshot_json,
+                state = excluded.state,
+                attempts = 0,
+                next_attempt_at = excluded.next_attempt_at,
+                sending_started_at = NULL,
+                last_error = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (
+                entity_type,
+                entity_id,
+                json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                DashboardOutboxState.PENDING.value,
+                now,
+                now,
+                now,
+            ),
+        )
+
+    @staticmethod
     async def _ensure_column(db: aiosqlite.Connection, name: str, definition: str) -> None:
         cursor = await db.execute("PRAGMA table_info(drafts)")
         rows = await cursor.fetchall()
@@ -1066,6 +1934,7 @@ class DraftRepository:
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Открыть соединение с WAL-совместимым ожиданием блокировок."""
         db = await aiosqlite.connect(self.sqlite_path, timeout=10)
         try:
             await db.execute("PRAGMA busy_timeout=10000")

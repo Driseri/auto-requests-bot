@@ -159,10 +159,39 @@ class KeyboardKind(StrEnum):
     EDIT_MENU = "edit_menu"
     EDIT_MENU_ROLLOUT = "edit_menu_rollout"
     BULK_MENU = "bulk_menu"
+    BULK_DIRECTION = "bulk_direction"
     BULK_CREATED = "bulk_created"
     DEFAULTS_MENU = "defaults_menu"
     DEFAULTS_BACK = "defaults_back"
+    NOTIFICATION = "notification"
+    NOTIFICATION_BULK_BACK = "notification_bulk_back"
+    NOTIFICATION_SINGLE_BACK = "notification_single_back"
+    BULK_COMPLETED = "bulk_completed"
     NONE = "none"
+
+
+class NotificationOutboxState(StrEnum):
+    PENDING = "PENDING"
+    SENDING = "SENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+
+
+class DashboardOutboxState(StrEnum):
+    PENDING = "PENDING"
+    SENDING = "SENDING"
+
+
+class DashboardEntityType(StrEnum):
+    APPLICATION = "APPLICATION"
+    BULK_BATCH = "BULK_BATCH"
+
+
+class BulkCreationState(StrEnum):
+    AWAITING_DIRECTION = "AWAITING_DIRECTION"
+    BULK_CREATING = "BULK_CREATING"
+    CREATED = "CREATED"
+    FAILED = "FAILED"
 
 
 class FieldName(StrEnum):
@@ -249,6 +278,8 @@ class UserSettings:
     default_intent: str | None = None
     default_scriptwriter: str | None = None
     pending_action: str | None = None
+    active_chat_id: int | None = None
+    active_message_id: int | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -259,6 +290,9 @@ class LlmContext:
     scriptwriter: str
     reason: str
     raw_change_description: str
+    direction: str = ""
+    answer_type: str = ""
+    change_type: str = ""
     clarification_text: str = ""
 
 
@@ -278,6 +312,7 @@ class SubmissionResult:
     sheet_name: str | None = None
     row_number: int | None = None
     row_link: str | None = None
+    submitted_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -297,6 +332,7 @@ class SubmittedApplication:
     last_seen_editor: str | None = None
     last_seen_editor_comment: str | None = None
     last_seen_final_answer: str | None = None
+    submitted_at: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -320,6 +356,54 @@ class BulkBatch:
     batch_status: str = BulkBatchStatus.NEW.value
     last_known_batch_status: str = BulkBatchStatus.NEW.value
     last_seen_final_answers_digest_at: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(slots=True)
+class NotificationOutboxItem:
+    event_id: str
+    dedupe_key: str
+    telegram_user_id: int
+    event_type: str
+    snapshot_json: str
+    html: str
+    chunk_index: int
+    chunk_count: int
+    state: str = NotificationOutboxState.PENDING.value
+    attempts: int = 0
+    next_attempt_at: str | None = None
+    sending_started_at: str | None = None
+    last_error: str | None = None
+    telegram_message_id: int | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(slots=True)
+class DashboardOutboxItem:
+    entity_type: str
+    entity_id: str
+    snapshot_json: str
+    state: str = DashboardOutboxState.PENDING.value
+    attempts: int = 0
+    next_attempt_at: str | None = None
+    sending_started_at: str | None = None
+    last_error: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(slots=True)
+class BulkCreationRequest:
+    idempotency_key: str
+    telegram_user_id: int
+    state: str
+    batch_id: str
+    direction: str | None = None
+    insert_url: str | None = None
+    last_error: str | None = None
+    started_at: str | None = None
     created_at: str = ""
     updated_at: str = ""
 

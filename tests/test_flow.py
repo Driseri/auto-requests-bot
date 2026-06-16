@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from app.flow import ApplicationFlow
 from app.keyboards import build_keyboard
@@ -37,16 +39,25 @@ class FakeLlmClient:
 
 
 class FakeBulkService:
-    async def create_batch(self, telegram_user_id: int, direction: str):
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str, str | None]] = []
+
+    async def create_batch(
+        self,
+        telegram_user_id: int,
+        direction: str,
+        batch_id: str | None = None,
+    ):
         from app.bulk import BulkBatchCreationResult
         from app.models import BulkBatch, utc_now_iso
 
         now = utc_now_iso()
+        self.calls.append((telegram_user_id, direction, batch_id))
         return BulkBatchCreationResult(
             success=True,
             message="ok",
             batch=BulkBatch(
-                batch_id="BATCH-ABC12345",
+                batch_id=batch_id or "BATCH-ABC12345",
                 telegram_user_id=telegram_user_id,
                 spreadsheet_id="sheet",
                 direction=direction,
@@ -172,6 +183,7 @@ async def test_non_rollout_skips_and_clears_change_type(tmp_path):
 @pytest.mark.asyncio
 async def test_collects_application_and_submits_stub(tmp_path):
     flow, repository, submission_service, llm_client = await make_flow(tmp_path)
+    flow.dashboard_enabled = True
 
     await fill_to_review(flow, 11)
     draft = await repository.get_by_user_id(11)
@@ -204,6 +216,11 @@ async def test_collects_application_and_submits_stub(tmp_path):
     assert tracked.sheet_name == "01.06"
     assert tracked.spreadsheet_id == "test-spreadsheet"
     assert tracked.last_known_status == ApplicationStatus.NEW.value
+    dashboard_outbox = await repository.list_dashboard_outbox()
+    assert len(dashboard_outbox) == 1
+    dashboard_row = json.loads(dashboard_outbox[0].snapshot_json)["row"]
+    assert dashboard_row[0] == draft.application_id
+    assert dashboard_row[8] == ApplicationStatus.NEW.value
 
 
 @pytest.mark.asyncio
@@ -243,6 +260,16 @@ def test_bulk_created_keyboard_has_only_ready_button():
     assert len(keyboard.inline_keyboard[0]) == 1
     assert keyboard.inline_keyboard[0][0].text == "Заявка заполнена"
     assert keyboard.inline_keyboard[0][0].callback_data == "app:bulk_ready:BATCH-ABC12345"
+
+
+def test_bulk_completed_keyboard_has_only_main_menu():
+    keyboard = build_keyboard(KeyboardKind.BULK_COMPLETED)
+
+    assert keyboard is not None
+    assert len(keyboard.inline_keyboard) == 1
+    assert len(keyboard.inline_keyboard[0]) == 1
+    assert keyboard.inline_keyboard[0][0].text == "Главное меню"
+    assert keyboard.inline_keyboard[0][0].callback_data == "app:new"
 
 
 @pytest.mark.asyncio
@@ -369,13 +396,158 @@ async def test_create_bulk_batch_returns_ready_button(tmp_path):
         InMemorySubmissionService(),
         bulk_service=FakeBulkService(),
     )
-    await repository.save_user_setting(180, "pending_action", "create_bulk_direction")
+    direction_response = await flow.create_bulk_batch(180)
+    idempotency_key = direction_response.keyboard_payload
+    assert idempotency_key is not None
+    response = await flow.select_bulk_direction(180, idempotency_key, Direction.FL)
 
-    response = await flow.select_direction(180, Direction.FL)
+    assert response.keyboard == KeyboardKind.BULK_CREATED
+    assert response.keyboard_payload is not None
+    assert "Заявка заполнена" in response.text
+    assert "до 100 строк" in response.text
+
+
+@pytest.mark.asyncio
+async def test_bulk_creation_callback_is_idempotent(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_idempotent.db"))
+    await repository.init()
+    service = FakeBulkService()
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        bulk_service=service,
+    )
+    direction_response = await flow.create_bulk_batch(180)
+    idempotency_key = direction_response.keyboard_payload
+    assert idempotency_key is not None
+
+    first = await flow.select_bulk_direction(180, idempotency_key, Direction.FL)
+    second = await flow.select_bulk_direction(180, idempotency_key, Direction.FL)
+
+    assert first.keyboard_payload == second.keyboard_payload
+    assert len(service.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_notification_menu_restores_bulk_direction_selection(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_notification_direction.db"))
+    await repository.init()
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        bulk_service=FakeBulkService(),
+    )
+    initial = await flow.create_bulk_batch(180)
+
+    response = await flow.resume_from_notification(180)
+
+    assert response.keyboard == KeyboardKind.BULK_DIRECTION
+    assert response.keyboard_payload == initial.keyboard_payload
+    assert "выберите направление" in response.text
+
+
+@pytest.mark.asyncio
+async def test_notification_menu_restores_unregistered_bulk_batch(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_notification_created.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=180,
+        spreadsheet_id="sheet",
+        direction=Direction.FL.value,
+        sheet_name="Массовый ввод",
+        sheet_id=100,
+        start_row=1,
+        data_start_row=3,
+        reserved_rows=100,
+    )
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+    )
+
+    response = await flow.resume_from_notification(180)
 
     assert response.keyboard == KeyboardKind.BULK_CREATED
     assert response.keyboard_payload == "BATCH-ABC12345"
     assert "Заявка заполнена" in response.text
+    assert "gid=100&amp;range=A3:G3" in response.text
+
+
+@pytest.mark.asyncio
+async def test_notification_menu_restores_exact_single_application_step(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    await flow.start_single(181)
+    await flow.select_direction(181, Direction.FL)
+
+    response = await flow.resume_from_notification(181)
+    draft = await repository.get_by_user_id(181)
+
+    assert draft is not None
+    assert draft.current_step == Step.ANSWER_TYPE
+    assert response.keyboard == KeyboardKind.ANSWER_TYPE
+    assert "Продолжаем незавершенную заявку" in response.text
+
+
+@pytest.mark.asyncio
+async def test_notification_menu_prefers_bulk_over_single_application(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    await flow.start_single(182)
+    await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=182,
+        spreadsheet_id="sheet",
+        direction=Direction.FL.value,
+        sheet_name="Массовый ввод",
+        sheet_id=100,
+        start_row=1,
+        data_start_row=3,
+        reserved_rows=100,
+    )
+
+    response = await flow.resume_from_notification(182)
+
+    assert response.keyboard == KeyboardKind.BULK_CREATED
+    assert response.keyboard_payload == "BATCH-ABC12345"
+
+
+@pytest.mark.asyncio
+async def test_notification_menu_ignores_registered_bulk_batch(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_notification_registered.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=180,
+        spreadsheet_id="sheet",
+        direction=Direction.FL.value,
+        sheet_name="Массовый ввод",
+        sheet_id=100,
+        start_row=1,
+        data_start_row=3,
+        reserved_rows=100,
+    )
+    await repository.claim_bulk_batch_registration(
+        "BATCH-ABC12345",
+        stale_after_seconds=600,
+    )
+    await repository.complete_bulk_batch_registration(
+        "BATCH-ABC12345",
+        data_end_row=3,
+        registered_count=1,
+    )
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+    )
+
+    response = await flow.resume_from_notification(180)
+
+    assert response.keyboard == KeyboardKind.CREATE_MODE
+    assert response.keyboard_payload is None
 
 
 @pytest.mark.asyncio
@@ -401,7 +573,7 @@ async def test_confirm_bulk_batch_filled_calls_registrar(tmp_path):
     response = await flow.confirm_bulk_batch_filled(180, "BATCH-ABC12345")
 
     assert registrar.calls == [("BATCH-ABC12345", 180)]
-    assert response.keyboard == KeyboardKind.BULK_MENU
+    assert response.keyboard == KeyboardKind.BULK_COMPLETED
     assert "Строк зарегистрировано: 2" in response.text
 
 
@@ -575,6 +747,9 @@ async def test_incomplete_change_description_asks_one_clarification(tmp_path):
     )
     assert draft.llm_check_status == LlmCheckStatus.COMPLETE.value
     assert len(llm_client.calls) == 2
+    assert llm_client.calls[0].direction == Direction.FL.value
+    assert llm_client.calls[0].answer_type == AnswerType.ROLLOUT.value
+    assert llm_client.calls[0].change_type == ChangeType.ADD.value
     assert llm_client.calls[1].raw_change_description == "Поменять срок"
     assert llm_client.calls[1].clarification_text == "Нужно указать 5 рабочих дней"
 

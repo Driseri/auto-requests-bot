@@ -7,7 +7,7 @@ from string import Formatter
 from types import SimpleNamespace
 from typing import Any
 
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.models import LlmContext, LlmResult
 
@@ -19,9 +19,25 @@ logger = logging.getLogger(__name__)
 
 
 class LlmResultSchema(BaseModel):
-    is_complete: bool
-    blocking_problem: str | None = None
-    clarification_instruction: str | None = None
+    is_complete: bool = Field(
+        description=(
+            "True, только если редактор может выполнить изменение без догадок "
+            "и дополнительной переписки."
+        )
+    )
+    blocking_problem: str | None = Field(
+        default=None,
+        description=(
+            "Один главный недостаток описания. Должен быть null при is_complete=true."
+        ),
+    )
+    clarification_instruction: str | None = Field(
+        default=None,
+        description=(
+            "Одна конкретная инструкция автору, что дополнить. "
+            "Должна быть null при is_complete=true."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_completeness_fields(self) -> "LlmResultSchema":
@@ -44,9 +60,13 @@ class PromptRenderer:
         self.user_prompt_path = Path(user_prompt_path)
 
     def render(self, context: LlmContext) -> tuple[str, str]:
+        """Собрать system/user prompts из шаблонов и уже известных полей заявки."""
         system_prompt = self._read_prompt(self.system_prompt_path)
         user_template = self._read_prompt(self.user_prompt_path)
         values = {
+            "direction": context.direction or "Не указано.",
+            "answer_type": context.answer_type or "Не указан.",
+            "change_type": context.change_type or "Не указан.",
             "intent": context.intent,
             "scriptwriter": context.scriptwriter,
             "reason": context.reason,
@@ -92,6 +112,7 @@ class LlmClient:
         self._client = gigachat_client
 
     async def check_change_description(self, context: LlmContext) -> LlmResult:
+        """Проверить выполнимость описания без переформулировки текста автором LLM."""
         if not self.credentials and self._client is None:
             logger.warning(
                 "GigaChat credentials are not configured; using fallback LLM result"

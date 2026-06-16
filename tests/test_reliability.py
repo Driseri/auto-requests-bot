@@ -10,7 +10,7 @@ import pytest
 
 from app.flow import ApplicationFlow
 from app.google_api import GoogleApiRetryConfig, execute_with_retry
-from app.health import check_health, write_heartbeat
+from app.health import ExternalProbeError, check_health, write_heartbeat
 from app.maintenance import create_backup, restore_backup, verify_database
 from app.models import (
     AnswerType,
@@ -249,6 +249,216 @@ def test_healthcheck_accepts_fresh_heartbeat(tmp_path):
 
     assert healthy
     assert message == "ok"
+
+
+def _health_files(tmp_path):
+    database = tmp_path / "app.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE marker (id INTEGER)")
+    heartbeat = tmp_path / "heartbeat.json"
+    write_heartbeat(str(heartbeat), iteration=1)
+    credentials = tmp_path / "credentials.json"
+    credentials.write_text(
+        json.dumps(
+            {
+                "type": "service_account",
+                "client_email": "bot@example.test",
+                "private_key": "test-private-key",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return database, heartbeat, credentials
+
+
+def _external_health_kwargs(tmp_path):
+    database, heartbeat, credentials = _health_files(tmp_path)
+    return {
+        "polling_enabled": True,
+        "heartbeat_path": str(heartbeat),
+        "sqlite_path": str(database),
+        "max_age_seconds": 60,
+        "telegram_bot_token": "test-token",
+        "google_credentials_path": str(credentials),
+        "required_spreadsheet_ids": {
+            "FL": "fl-sheet",
+            "SME": "sme-sheet",
+            "AI": "ai-sheet",
+            "VOICE": "voice-sheet",
+        },
+        "optional_spreadsheet_ids": {"DASHBOARD": "dashboard-sheet"},
+        "external_cache_path": str(tmp_path / "external-health.json"),
+        "external_check_interval_seconds": 300,
+        "external_failure_threshold": 2,
+        "external_timeout_seconds": 10,
+    }
+
+
+def test_healthcheck_rejects_missing_required_spreadsheet_id(tmp_path):
+    kwargs = _external_health_kwargs(tmp_path)
+    kwargs["required_spreadsheet_ids"]["SME"] = ""
+
+    healthy, message = check_health(
+        **kwargs,
+        telegram_probe=lambda *_: None,
+        google_probe=lambda *_: None,
+    )
+
+    assert not healthy
+    assert "SME" in message
+
+
+@pytest.mark.parametrize(
+    ("contents", "message_fragment"),
+    [
+        ("not-json", "JSON is invalid"),
+        (json.dumps({"type": "service_account"}), "fields are missing"),
+        (
+            json.dumps(
+                {
+                    "type": "authorized_user",
+                    "client_email": "bot@example.test",
+                    "private_key": "key",
+                }
+            ),
+            "must be a service account",
+        ),
+    ],
+)
+def test_healthcheck_rejects_invalid_google_credentials(tmp_path, contents, message_fragment):
+    kwargs = _external_health_kwargs(tmp_path)
+    Path(kwargs["google_credentials_path"]).write_text(contents, encoding="utf-8")
+
+    healthy, message = check_health(
+        **kwargs,
+        telegram_probe=lambda *_: None,
+        google_probe=lambda *_: None,
+    )
+
+    assert not healthy
+    assert message_fragment in message
+
+
+def test_healthcheck_rejects_missing_google_credentials_file(tmp_path):
+    kwargs = _external_health_kwargs(tmp_path)
+    Path(kwargs["google_credentials_path"]).unlink()
+
+    healthy, message = check_health(
+        **kwargs,
+        telegram_probe=lambda *_: None,
+        google_probe=lambda *_: None,
+    )
+
+    assert not healthy
+    assert "credentials file is unavailable" in message
+
+
+def test_healthcheck_caches_successful_external_checks(tmp_path):
+    kwargs = _external_health_kwargs(tmp_path)
+    calls = {"telegram": 0, "google": 0}
+    checked_ids = []
+
+    def telegram_probe(*_):
+        calls["telegram"] += 1
+
+    def google_probe(_, spreadsheet_ids, __):
+        calls["google"] += 1
+        checked_ids.extend(spreadsheet_ids)
+
+    first_time = datetime(2026, 6, 14, 10, 0, tzinfo=timezone.utc)
+    first = check_health(
+        **kwargs,
+        telegram_probe=telegram_probe,
+        google_probe=google_probe,
+        now=first_time,
+    )
+    second = check_health(
+        **kwargs,
+        telegram_probe=telegram_probe,
+        google_probe=google_probe,
+        now=first_time + timedelta(seconds=299),
+    )
+
+    assert first == (True, "ok")
+    assert second == (True, "ok")
+    assert calls == {"telegram": 1, "google": 1}
+    assert checked_ids == [
+        "fl-sheet",
+        "sme-sheet",
+        "ai-sheet",
+        "voice-sheet",
+        "dashboard-sheet",
+    ]
+    assert not Path(f"{kwargs['external_cache_path']}.tmp").exists()
+
+
+def test_healthcheck_marks_second_consecutive_external_failure_unhealthy(tmp_path):
+    kwargs = _external_health_kwargs(tmp_path)
+    current = datetime(2026, 6, 14, 10, 0, tzinfo=timezone.utc)
+    assert check_health(
+        **kwargs,
+        telegram_probe=lambda *_: None,
+        google_probe=lambda *_: None,
+        now=current,
+    ) == (True, "ok")
+
+    def failing_probe(*_):
+        raise ExternalProbeError("telegram", status=503)
+
+    first_failure = check_health(
+        **kwargs,
+        telegram_probe=failing_probe,
+        google_probe=lambda *_: None,
+        now=current + timedelta(seconds=301),
+    )
+    second_failure = check_health(
+        **kwargs,
+        telegram_probe=failing_probe,
+        google_probe=lambda *_: None,
+        now=current + timedelta(seconds=602),
+    )
+
+    assert first_failure == (True, "ok (external checks degraded: telegram: HTTP 503)")
+    assert second_failure == (False, "external checks failed: telegram: HTTP 503")
+
+
+def test_healthcheck_first_external_failure_without_success_is_unhealthy(tmp_path):
+    kwargs = _external_health_kwargs(tmp_path)
+
+    def failing_probe(*_):
+        raise TimeoutError("secret details must not be exposed")
+
+    healthy, message = check_health(
+        **kwargs,
+        telegram_probe=failing_probe,
+        google_probe=lambda *_: None,
+        now=datetime(2026, 6, 14, 10, 0, tzinfo=timezone.utc),
+    )
+
+    assert not healthy
+    assert message == "external checks failed: external: TimeoutError"
+    assert "secret details" not in message
+
+
+def test_healthcheck_recovers_after_external_failure(tmp_path):
+    kwargs = _external_health_kwargs(tmp_path)
+    current = datetime(2026, 6, 14, 10, 0, tzinfo=timezone.utc)
+
+    def failing_probe(*_):
+        raise ExternalProbeError("google", status=403)
+
+    assert not check_health(
+        **kwargs,
+        telegram_probe=lambda *_: None,
+        google_probe=failing_probe,
+        now=current,
+    )[0]
+    assert check_health(
+        **kwargs,
+        telegram_probe=lambda *_: None,
+        google_probe=lambda *_: None,
+        now=current + timedelta(seconds=301),
+    ) == (True, "ok")
 
 
 @pytest.mark.asyncio

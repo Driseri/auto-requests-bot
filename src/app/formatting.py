@@ -18,6 +18,7 @@ class TextFormattingSpan:
 
 
 def extract_formatting_spans(text: str, entities: list[Any] | None) -> list[TextFormattingSpan]:
+    """Извлечь поддерживаемые Telegram-стили, сохраняя UTF-16 offsets API."""
     if not text or not entities:
         return []
 
@@ -87,6 +88,7 @@ def build_text_format_runs(
     text: str,
     spans: list[TextFormattingSpan] | None,
 ) -> list[dict[str, Any]]:
+    """Преобразовать пересекающиеся spans в Google Sheets textFormatRuns."""
     if not text or not spans:
         return []
 
@@ -137,6 +139,7 @@ def render_html_with_formatting(
     text: str | None,
     spans: list[TextFormattingSpan] | None,
 ) -> str:
+    """Безопасно отрендерить сохраненные bold/strikethrough spans в Telegram HTML."""
     if not text:
         return "-"
     if not spans:

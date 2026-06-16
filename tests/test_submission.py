@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -11,6 +12,7 @@ from app.models import (
     ApplicationType,
     BulkBatch,
     ChangeType,
+    DashboardOutboxItem,
     Direction,
     Draft,
     LlmCheckStatus,
@@ -18,6 +20,11 @@ from app.models import (
     SubmittedApplication,
 )
 from app.scheduling import RolloutSchedule, rollout_sheet_name
+from app.sheet_dates import (
+    GOOGLE_SHEETS_DATE_TIME_PATTERN,
+    GOOGLE_SHEETS_EPOCH,
+    google_sheets_date_cell,
+)
 from app.submission import (
     DASHBOARD_HEADERS,
     DASHBOARD_SHEET_NAME,
@@ -29,8 +36,12 @@ from app.submission import (
     LEGACY_WORKSHEET_HEADERS,
     SHEET_HEADERS,
     SheetConfigurationError,
+    dashboard_projection,
     dashboard_tracked_row,
+    _draft_to_row_data,
     _dashboard_duplicate_row_numbers,
+    _repair_dashboard_headers,
+    _repair_sheet_bool,
     draft_to_sheet_row,
     target_sheet_name,
     week_sheet_name,
@@ -250,6 +261,70 @@ def test_draft_to_sheet_row_uses_new_direction_schema():
     ]
 
 
+def test_google_sheets_date_cell_converts_utc_to_bot_timezone():
+    cell = google_sheets_date_cell(
+        datetime(2026, 6, 15, 10, 30, 45, tzinfo=timezone.utc),
+        timezone_name="Europe/Moscow",
+    )
+    expected_serial = (
+        datetime(2026, 6, 15, 13, 30, 45) - GOOGLE_SHEETS_EPOCH
+    ).total_seconds() / 86400
+
+    assert cell["userEnteredValue"]["numberValue"] == pytest.approx(expected_serial)
+    assert cell["userEnteredFormat"]["numberFormat"] == {
+        "type": "DATE_TIME",
+        "pattern": GOOGLE_SHEETS_DATE_TIME_PATTERN,
+    }
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected_hour"),
+    [
+        ("2026-03-08T06:30:00+00:00", 1),
+        ("2026-03-08T07:30:00+00:00", 3),
+    ],
+)
+def test_google_sheets_date_cell_respects_dst(timestamp, expected_hour):
+    cell = google_sheets_date_cell(
+        timestamp,
+        timezone_name="America/New_York",
+    )
+    serial = cell["userEnteredValue"]["numberValue"]
+    local_value = GOOGLE_SHEETS_EPOCH + timedelta(days=serial)
+
+    assert local_value.hour == expected_hour
+
+
+def test_google_sheets_date_cell_treats_naive_datetime_as_utc():
+    aware = google_sheets_date_cell(
+        datetime(2026, 6, 15, 10, 30, tzinfo=timezone.utc),
+        timezone_name="Europe/Moscow",
+    )
+    naive = google_sheets_date_cell(
+        datetime(2026, 6, 15, 10, 30),
+        timezone_name="Europe/Moscow",
+    )
+
+    assert naive == aware
+
+
+@pytest.mark.parametrize(
+    ("schema", "date_index"),
+    [("new", 14), ("current", 3), ("legacy", 3)],
+)
+def test_all_working_sheet_schemas_use_typed_submission_date(schema, date_index):
+    row_data = _draft_to_row_data(
+        make_draft(created_at="2020-01-01T00:00:00+00:00"),
+        schema=schema,
+        submitted_at=datetime(2026, 6, 15, 10, 30, tzinfo=timezone.utc),
+        timezone_name="Europe/Moscow",
+    )
+
+    date_cell = row_data["values"][date_index]
+    assert "stringValue" not in date_cell["userEnteredValue"]
+    assert date_cell["userEnteredFormat"]["numberFormat"]["type"] == "DATE_TIME"
+
+
 def test_target_sheet_name_uses_week_or_integration():
     submitted_at = datetime(2026, 6, 3, 10, 59, 59, tzinfo=timezone.utc)
     assert target_sheet_name(make_draft(), submitted_at=submitted_at) == "01.06 ср"
@@ -414,6 +489,12 @@ async def test_submit_routes_by_submission_time_not_draft_creation_time():
 
     assert result.success is True
     assert result.sheet_name == "08.06 ср"
+    assert result.submitted_at == "2026-06-04T11:00:00+00:00"
+    date_cell = api.append_cells[0][1]["rows"][0]["values"][14]
+    expected_serial = (
+        datetime(2026, 6, 4, 14, 0) - GOOGLE_SHEETS_EPOCH
+    ).total_seconds() / 86400
+    assert date_cell["userEnteredValue"]["numberValue"] == pytest.approx(expected_serial)
 
 
 @pytest.mark.asyncio
@@ -428,6 +509,25 @@ async def test_existing_wrong_headers_return_error_and_do_not_append():
 
     assert result.success is False
     assert "Структура колонок" in result.message
+    assert api.append_cells == []
+
+
+@pytest.mark.asyncio
+async def test_idempotent_retry_does_not_rewrite_existing_submission_date():
+    existing_row = [""] * len(SHEET_HEADERS)
+    existing_row[11] = "A1B2C3D4"
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "01.06 ср"): SHEET_HEADERS.copy()},
+        rows={(FL_SPREADSHEET, "01.06 ср"): [SHEET_HEADERS, existing_row]},
+    )
+    service = make_service(api)
+
+    result = await service.submit(make_draft())
+
+    assert result.success is True
+    assert result.row_number == 2
+    assert result.submitted_at is None
     assert api.append_cells == []
 
 
@@ -484,6 +584,61 @@ def test_legacy_dashboard_requires_manual_editor_column():
             status=ApplicationStatus.NEW.value,
             row_link="row-link",
         )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (" Да ", "Да"),
+        ("дА", "Да"),
+        ("YES", "Да"),
+        ("true", "Да"),
+        ("1", "Да"),
+        ("Нет", "Нет"),
+        ("nO", "Нет"),
+        ("FALSE", "Нет"),
+        ("0", "Нет"),
+        ("Р”Р°", "Да"),
+        ("РќРµС‚", "Нет"),
+        ("??", "Да"),
+        ("???", "Нет"),
+        ("неизвестно", "неизвестно"),
+    ],
+)
+def test_repair_sheet_bool_handles_supported_values(value, expected):
+    assert _repair_sheet_bool(value) == expected
+
+
+def test_repair_dashboard_headers_restores_reversible_mojibake():
+    damaged = []
+    for header in DASHBOARD_HEADERS:
+        encoded = header.encode("utf-8")
+        try:
+            damaged.append(encoded.decode("cp1251"))
+        except UnicodeDecodeError:
+            damaged.append(encoded.decode("latin1"))
+
+    assert _repair_dashboard_headers(damaged) == DASHBOARD_HEADERS
+
+
+def test_repair_dashboard_headers_restores_exact_question_mark_fingerprints():
+    damaged = [
+        "".join("?" if character.isalpha() and character not in {"I", "D"} else character for character in header)
+        for header in DASHBOARD_HEADERS
+    ]
+
+    assert _repair_dashboard_headers(damaged) == DASHBOARD_HEADERS
+
+
+def test_repair_dashboard_headers_rejects_ambiguous_or_foreign_schema():
+    ambiguous = ["?" * len(header) for header in DASHBOARD_HEADERS]
+    ambiguous[0] = "?" * len(DASHBOARD_HEADERS[0])
+    foreign = DASHBOARD_HEADERS.copy()
+    foreign[3] = "Посторонняя колонка"
+
+    assert _repair_dashboard_headers(ambiguous) != DASHBOARD_HEADERS
+    assert _repair_dashboard_headers(foreign) != DASHBOARD_HEADERS
+    assert _repair_dashboard_headers(DASHBOARD_HEADERS[:-1]) != DASHBOARD_HEADERS
 
 
 @pytest.mark.asyncio
@@ -552,24 +707,16 @@ def test_new_worksheet_formatting_has_active_group_border():
 
 
 @pytest.mark.asyncio
-async def test_dashboard_row_is_created_when_configured():
+async def test_submission_does_not_write_dashboard_directly_when_configured():
     api = FakeSheetsApi()
     service = make_service(api, dashboard=True)
 
     result = await service.submit(make_draft(created_at="2026-06-05T10:00:00+00:00"))
 
     assert result.success is True
-    assert api.headers[(DASHBOARD_SPREADSHEET, "Заявки")] == DASHBOARD_HEADERS
-    dashboard_appends = [
-        append for append in api.append_cells if append[0] == DASHBOARD_SPREADSHEET
-    ]
-    assert len(dashboard_appends) == 1
-    values = _append_cell_values(dashboard_appends[0][1])
-    assert values[0] == "A1B2C3D4"
-    assert values[3] == Direction.FL.value
-    assert values[8] == ApplicationStatus.NEW.value
-    assert values[9] == "Редактор не выбран"
-    assert values[11].startswith("https://docs.google.com/spreadsheets/d/fl-spreadsheet")
+    assert not any(
+        append[0] == DASHBOARD_SPREADSHEET for append in api.append_cells
+    )
 
 
 def test_week_sheet_name_uses_monday():
@@ -632,7 +779,7 @@ def test_dashboard_tracked_row_preserves_existing_unknown_fields():
     )
 
     assert row[2] == "2026-06-05T10:00:00+00:00"
-    assert row[6] == "Р”Р°"
+    assert row[6] == "Да"
     assert row[7] == "РђРІС‚РѕСЂ"
     assert row[8] == ApplicationStatus.IN_PROGRESS.value
     assert row[9] == "редактор 1"
@@ -681,6 +828,10 @@ def test_dashboard_bulk_batch_upsert_updates_existing_batch_row():
             ["Пачка", "BATCH-ABC12345", "old-date", Direction.FL.value, ApplicationType.BULK.value, "", "", "Telegram 123", ApplicationStatus.IN_PROGRESS.value, "Редактор не выбран", "Нет", "new-link"],
         )
     ]
+    dashboard_reads = [
+        call for call in api.value_get_calls if call["range"].endswith("!A:L")
+    ]
+    assert dashboard_reads[-1]["valueRenderOption"] == "UNFORMATTED_VALUE"
 
 
 def test_dashboard_bulk_batch_upsert_finds_legacy_batch_id_in_first_column():
@@ -753,6 +904,80 @@ def test_dashboard_bulk_batch_aggregates_multiple_editors():
 
     values = _append_cell_values(api.append_cells[0][1])
     assert values[9] == "Несколько редакторов"
+
+
+def test_dashboard_sync_batches_updates_and_merges_duplicates():
+    existing_rows = [
+        DASHBOARD_HEADERS,
+        [
+            "A1B2C3D4",
+            "",
+            46100.5,
+            Direction.FL.value,
+            ApplicationType.SINGLE.value,
+            AnswerType.ROLLOUT.value,
+            "Нет",
+            "Автор",
+            ApplicationStatus.NEW.value,
+            "Редактор не выбран",
+            "Нет",
+            "https://example.test/first",
+        ],
+        [
+            "A1B2C3D4",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ApplicationStatus.IN_PROGRESS.value,
+            "редактор 2",
+            "Да",
+            "",
+        ],
+    ]
+    api = FakeSheetsApi(
+        sheets={DASHBOARD_SPREADSHEET: {DASHBOARD_SHEET_NAME: 200}},
+        headers={(DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): DASHBOARD_HEADERS},
+        rows={(DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): existing_rows},
+    )
+    service = DashboardSyncService(
+        spreadsheet_id=DASHBOARD_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    projected = list(existing_rows[1])
+    projected[8] = ApplicationStatus.ACCEPTED.value
+    projected[9] = "редактор 3"
+    projected[10] = "Нет"
+    item = DashboardOutboxItem(
+        entity_type="APPLICATION",
+        entity_id="A1B2C3D4",
+        snapshot_json=json.dumps(
+            dashboard_projection(projected),
+            ensure_ascii=False,
+        ),
+    )
+
+    service.sync_projections([item])
+
+    dashboard_reads = [
+        call
+        for call in api.value_get_calls
+        if call["range"].endswith("!A:L")
+    ]
+    assert len(dashboard_reads) == 1
+    requests = api.batch_updates[-1]["body"]["requests"]
+    assert sum("updateCells" in request for request in requests) == 1
+    assert sum("deleteDimension" in request for request in requests) == 1
+    update_values = requests[0]["updateCells"]["rows"][0]["values"]
+    assert update_values[8]["userEnteredValue"] == {
+        "stringValue": ApplicationStatus.ACCEPTED.value
+    }
+    assert update_values[9]["userEnteredValue"] == {"stringValue": "редактор 3"}
+    assert update_values[10]["userEnteredValue"] == {"stringValue": "Да"}
 
 
 def _sheet_name_from_range(range_name: str) -> str:

@@ -21,6 +21,7 @@ def create_backup(
     retention_days: int = 7,
     now: datetime | None = None,
 ) -> Path:
+    """Создать консистентную SQLite-копию, проверить ее и применить retention."""
     source = Path(source_path)
     destination_directory = Path(backup_directory)
     destination_directory.mkdir(parents=True, exist_ok=True)
@@ -40,6 +41,7 @@ def create_backup(
 
 
 def restore_backup(backup_path: str, destination_path: str) -> Path:
+    """Восстановить базу через SQLite Backup API с проверкой до и после."""
     backup = Path(backup_path)
     destination = Path(destination_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +54,7 @@ def restore_backup(backup_path: str, destination_path: str) -> Path:
 
 
 def verify_database(path: str | Path) -> None:
+    """Проверить целостность SQLite и наличие обязательных таблиц приложения."""
     with sqlite3.connect(path, timeout=10) as connection:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if not integrity or integrity[0] != "ok":

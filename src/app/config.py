@@ -48,8 +48,17 @@ class Settings:
     status_polling_enabled: bool
     status_polling_interval_seconds: float
     dashboard_sync_interval_seconds: float
+    completed_bulk_dashboard_scan_interval_seconds: float
+    dashboard_outbox_retry_base_seconds: int
+    dashboard_outbox_retry_max_seconds: int
+    dashboard_outbox_sending_stale_seconds: int
     bulk_reserved_rows: int
     bulk_registration_stale_seconds: int
+    bulk_creation_stale_seconds: int
+    notification_max_attempts: int
+    notification_retry_base_seconds: int
+    notification_sending_stale_seconds: int
+    notification_message_max_chars: int
     rollout_schedule: RolloutSchedule
     application_editors: tuple[str, ...]
     google_api_retry: GoogleApiRetryConfig
@@ -57,6 +66,7 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    """Загрузить и проверить конфигурацию приложения из переменных окружения."""
     load_dotenv()
     docker_credentials_path = Path("/run/secrets/google_credentials.json")
     default_credentials_path = (
@@ -68,18 +78,67 @@ def load_settings() -> Settings:
     dashboard_sync_interval_seconds = float(
         os.getenv("DASHBOARD_SYNC_INTERVAL_SECONDS", "300").strip() or "300"
     )
+    completed_bulk_dashboard_scan_interval_seconds = float(
+        os.getenv(
+            "COMPLETED_BULK_DASHBOARD_SCAN_INTERVAL_SECONDS",
+            "3600",
+        ).strip()
+        or "3600"
+    )
+    dashboard_outbox_retry_base_seconds = int(
+        os.getenv("DASHBOARD_OUTBOX_RETRY_BASE_SECONDS", "60").strip() or "60"
+    )
+    dashboard_outbox_retry_max_seconds = int(
+        os.getenv("DASHBOARD_OUTBOX_RETRY_MAX_SECONDS", "3600").strip() or "3600"
+    )
+    dashboard_outbox_sending_stale_seconds = int(
+        os.getenv("DASHBOARD_OUTBOX_SENDING_STALE_SECONDS", "300").strip() or "300"
+    )
     if status_polling_interval_seconds <= 0:
         raise ValueError("STATUS_POLLING_INTERVAL_SECONDS must be greater than 0")
     if dashboard_sync_interval_seconds <= 0:
         raise ValueError("DASHBOARD_SYNC_INTERVAL_SECONDS must be greater than 0")
+    if completed_bulk_dashboard_scan_interval_seconds <= 0:
+        raise ValueError(
+            "COMPLETED_BULK_DASHBOARD_SCAN_INTERVAL_SECONDS must be greater than 0"
+        )
     bulk_reserved_rows = int(os.getenv("BULK_RESERVED_ROWS", "100").strip() or "100")
     bulk_registration_stale_seconds = int(
         os.getenv("BULK_REGISTRATION_STALE_SECONDS", "600").strip() or "600"
     )
+    bulk_creation_stale_seconds = int(
+        os.getenv("BULK_CREATION_STALE_SECONDS", "600").strip() or "600"
+    )
+    notification_max_attempts = int(
+        os.getenv("NOTIFICATION_MAX_ATTEMPTS", "10").strip() or "10"
+    )
+    notification_retry_base_seconds = int(
+        os.getenv("NOTIFICATION_RETRY_BASE_SECONDS", "30").strip() or "30"
+    )
+    notification_sending_stale_seconds = int(
+        os.getenv("NOTIFICATION_SENDING_STALE_SECONDS", "300").strip() or "300"
+    )
+    notification_message_max_chars = int(
+        os.getenv("NOTIFICATION_MESSAGE_MAX_CHARS", "3500").strip() or "3500"
+    )
     if bulk_reserved_rows <= 0:
         raise ValueError("BULK_RESERVED_ROWS must be greater than 0")
-    if bulk_registration_stale_seconds <= 0:
-        raise ValueError("BULK_REGISTRATION_STALE_SECONDS must be greater than 0")
+    positive_values = {
+        "BULK_REGISTRATION_STALE_SECONDS": bulk_registration_stale_seconds,
+        "BULK_CREATION_STALE_SECONDS": bulk_creation_stale_seconds,
+        "NOTIFICATION_MAX_ATTEMPTS": notification_max_attempts,
+        "NOTIFICATION_RETRY_BASE_SECONDS": notification_retry_base_seconds,
+        "NOTIFICATION_SENDING_STALE_SECONDS": notification_sending_stale_seconds,
+        "NOTIFICATION_MESSAGE_MAX_CHARS": notification_message_max_chars,
+        "DASHBOARD_OUTBOX_RETRY_BASE_SECONDS": dashboard_outbox_retry_base_seconds,
+        "DASHBOARD_OUTBOX_RETRY_MAX_SECONDS": dashboard_outbox_retry_max_seconds,
+        "DASHBOARD_OUTBOX_SENDING_STALE_SECONDS": (
+            dashboard_outbox_sending_stale_seconds
+        ),
+    }
+    for name, value in positive_values.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be greater than 0")
     return Settings(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL", "").strip() or None,
@@ -153,8 +212,19 @@ def load_settings() -> Settings:
         status_polling_enabled=_env_bool("STATUS_POLLING_ENABLED", default=True),
         status_polling_interval_seconds=status_polling_interval_seconds,
         dashboard_sync_interval_seconds=dashboard_sync_interval_seconds,
+        completed_bulk_dashboard_scan_interval_seconds=(
+            completed_bulk_dashboard_scan_interval_seconds
+        ),
+        dashboard_outbox_retry_base_seconds=dashboard_outbox_retry_base_seconds,
+        dashboard_outbox_retry_max_seconds=dashboard_outbox_retry_max_seconds,
+        dashboard_outbox_sending_stale_seconds=dashboard_outbox_sending_stale_seconds,
         bulk_reserved_rows=bulk_reserved_rows,
         bulk_registration_stale_seconds=bulk_registration_stale_seconds,
+        bulk_creation_stale_seconds=bulk_creation_stale_seconds,
+        notification_max_attempts=notification_max_attempts,
+        notification_retry_base_seconds=notification_retry_base_seconds,
+        notification_sending_stale_seconds=notification_sending_stale_seconds,
+        notification_message_max_chars=notification_message_max_chars,
         rollout_schedule=RolloutSchedule.from_strings(
             timezone_name=os.getenv("BOT_TIMEZONE", DEFAULT_TIMEZONE).strip()
             or DEFAULT_TIMEZONE,

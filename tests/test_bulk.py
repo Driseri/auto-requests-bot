@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+import json
 import threading
 import time
 
@@ -115,6 +117,16 @@ class FakeSpreadsheetsResource:
                             for row_data in request["appendCells"]["rows"]
                         )
                     replies.append({})
+                elif "addDimensionGroup" in request:
+                    group_range = request["addDimensionGroup"]["range"]
+                    sheet_id = group_range["sheetId"]
+                    for sheet in self.api.sheets_by_spreadsheet[spreadsheet_id]:
+                        if sheet["properties"]["sheetId"] == sheet_id:
+                            sheet.setdefault("rowGroups", []).append(
+                                {"range": dict(group_range)}
+                            )
+                            break
+                    replies.append({})
                 else:
                     replies.append({})
             return {"replies": replies}
@@ -180,7 +192,14 @@ class FakeDashboardSync:
         )
 
 
-def make_service(repository: DraftRepository, api: FakeSheetsApi, *, reserved_rows: int = 1):
+def make_service(
+    repository: DraftRepository,
+    api: FakeSheetsApi,
+    *,
+    reserved_rows: int = 1,
+    clock=None,
+    timezone_name: str = "Europe/Moscow",
+):
     return GoogleSheetsBulkBatchService(
         direction_spreadsheets=DirectionSpreadsheetConfig(
             fl_spreadsheet_id=FL_SPREADSHEET,
@@ -192,6 +211,8 @@ def make_service(repository: DraftRepository, api: FakeSheetsApi, *, reserved_ro
         repository=repository,
         sheets_api=api,
         reserved_rows=reserved_rows,
+        clock=clock,
+        timezone_name=timezone_name,
     )
 
 
@@ -200,7 +221,11 @@ async def test_create_bulk_batch_creates_direction_week_section(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk.db"))
     await repository.init()
     api = FakeSheetsApi()
-    service = make_service(repository, api)
+    service = make_service(
+        repository,
+        api,
+        clock=lambda: datetime(2026, 6, 15, 10, 30, tzinfo=timezone.utc),
+    )
 
     result = await service.create_batch(123, Direction.FL.value)
 
@@ -226,6 +251,13 @@ async def test_create_bulk_batch_creates_direction_week_section(tmp_path):
     assert append_request["sheetId"] == 100
     assert len(append_request["rows"]) == 3
     batch_status_cell = append_request["rows"][0]["values"][11]
+    date_cell = append_request["rows"][0]["values"][2]
+    assert "numberValue" in date_cell["userEnteredValue"]
+    assert date_cell["userEnteredFormat"]["numberFormat"] == {
+        "type": "DATE_TIME",
+        "pattern": "dd.MM.yyyy hh:mm",
+    }
+    assert saved.created_at == "2026-06-15T10:30:00+00:00"
     assert batch_status_cell["userEnteredValue"] == {"stringValue": BulkBatchStatus.NEW.value}
     assert [
         value["userEnteredValue"]
@@ -260,6 +292,7 @@ async def test_create_bulk_batch_starts_after_previous_allocated_range(tmp_path)
         start_row=1,
         data_start_row=3,
         reserved_rows=200,
+        data_end_row=4,
     )
     api = FakeSheetsApi(
         sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
@@ -360,7 +393,7 @@ async def test_bulk_registrar_registers_rows_by_batch_button_and_tracks_metadata
         sheet_id=100,
         start_row=2,
         data_start_row=4,
-        reserved_rows=3,
+        reserved_rows=5,
     )
     row_to_register = [""] * 13
     row_to_register[0] = AnswerType.ROLLOUT.value
@@ -383,7 +416,7 @@ async def test_bulk_registrar_registers_rows_by_batch_button_and_tracks_metadata
         sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
         rows={
             (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N6"): [
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N8"): [
                 row_to_register,
                 [],
                 existing_row,
@@ -423,7 +456,8 @@ async def test_bulk_registrar_registers_rows_by_batch_button_and_tracks_metadata
     assert existing.last_seen_final_answer == "Final answer"
     saved_batch = await repository.get_bulk_batch("BATCH-ABC12345")
     assert saved_batch is not None
-    assert saved_batch.reserved_rows == 3
+    assert saved_batch.reserved_rows == 5
+    assert saved_batch.data_end_row == 6
 
     update_requests = [
         request
@@ -453,13 +487,29 @@ async def test_bulk_registrar_registers_rows_by_batch_button_and_tracks_metadata
     ]
     assert len(row_status_rules) == 3
 
-    hide_requests = [
+    dimension_requests = [
         request
         for batch in api.batch_updates
         for request in batch["body"]["requests"]
         if "updateDimensionProperties" in request
     ]
-    assert hide_requests == []
+    assert len(dimension_requests) == 2
+    visible_request = next(
+        request
+        for request in dimension_requests
+        if request["updateDimensionProperties"]["properties"]["hiddenByUser"] is False
+    )
+    visible_range = visible_request["updateDimensionProperties"]["range"]
+    assert visible_range["startIndex"] == 3
+    assert visible_range["endIndex"] == 6
+    hidden_request = next(
+        request
+        for request in dimension_requests
+        if request["updateDimensionProperties"]["properties"]["hiddenByUser"] is True
+    )
+    hidden_range = hidden_request["updateDimensionProperties"]["range"]
+    assert hidden_range["startIndex"] == 6
+    assert hidden_range["endIndex"] == 8
     group_requests = [
         request
         for batch in api.batch_updates
@@ -470,6 +520,15 @@ async def test_bulk_registrar_registers_rows_by_batch_button_and_tracks_metadata
     group_range = group_requests[0]["addDimensionGroup"]["range"]
     assert group_range["startIndex"] == 3
     assert group_range["endIndex"] == 6
+
+    registrar._organize_registered_batch_rows(api, saved_batch, actual_rows=3)
+    repeated_group_requests = [
+        request
+        for batch in api.batch_updates
+        for request in batch["body"]["requests"]
+        if "addDimensionGroup" in request
+    ]
+    assert len(repeated_group_requests) == 1
 
 
 def test_bulk_input_source_text_uses_clip_wrapping():
@@ -660,12 +719,14 @@ async def test_bulk_registrar_syncs_dashboard_after_registration(tmp_path):
     result = await registrar.register_batch("BATCH-ABC12345", 123)
 
     assert result.success is True
-    assert len(dashboard.bulk_upserts) == 1
-    upsert = dashboard.bulk_upserts[0]
-    assert upsert["batch"].batch_id == "BATCH-ABC12345"
-    assert upsert["status"] == BulkBatchStatus.NEW.value
-    assert upsert["row_link"].endswith("gid=100&range=A2:N2")
-    assert upsert["final_answer_present"] is True
+    assert dashboard.bulk_upserts == []
+    outbox = await repository.list_dashboard_outbox()
+    assert len(outbox) == 1
+    assert outbox[0].entity_id == "BATCH-ABC12345"
+    row = json.loads(outbox[0].snapshot_json)["row"]
+    assert row[8] == BulkBatchStatus.NEW.value
+    assert row[10] == "Да"
+    assert row[11].endswith("gid=100&range=A2:N2")
 
 
 @pytest.mark.asyncio
@@ -841,8 +902,89 @@ async def test_concurrent_bulk_registration_is_idempotent(tmp_path):
         for request in update["body"]["requests"]
         if "addDimensionGroup" in request
     ]
+    hide_requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+        if "updateDimensionProperties" in request
+    ]
     assert len(update_requests) == 1
     assert len(group_requests) == 1
+    assert (
+        group_requests[0]["addDimensionGroup"]["range"]["startIndex"],
+        group_requests[0]["addDimensionGroup"]["range"]["endIndex"],
+    ) == (3, 4)
+    assert all(
+        request["updateDimensionProperties"]["properties"]["hiddenByUser"] is False
+        for request in hide_requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_bulk_registrations_collapse_only_their_own_tails(tmp_path):
+    repository = DraftRepository(str(tmp_path / "parallel_batch_registration.db"))
+    await repository.init()
+    for batch_id, start_row, data_start_row in (
+        ("BATCH-PARALLEL1", 2, 4),
+        ("BATCH-PARALLEL2", 8, 10),
+    ):
+        await repository.save_bulk_batch(
+            batch_id=batch_id,
+            telegram_user_id=123,
+            spreadsheet_id=FL_SPREADSHEET,
+            direction=Direction.FL.value,
+            sheet_name=BULK_SHEET,
+            sheet_id=100,
+            start_row=start_row,
+            data_start_row=data_start_row,
+            reserved_rows=3,
+        )
+
+    row = [AnswerType.ROLLOUT.value, "intent", "", "", "", "", ChangeType.ADD.value]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
+        rows={
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N6"): [row],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A9:N9"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A10:N12"): [row],
+        },
+    )
+    registrar = BulkApplicationRegistrar(
+        repository=repository,
+        spreadsheet_id=FL_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    first, second = await asyncio.gather(
+        registrar.register_batch("BATCH-PARALLEL1", 123),
+        registrar.register_batch("BATCH-PARALLEL2", 123),
+    )
+
+    assert first.success is True
+    assert second.success is True
+    hidden_ranges = {
+        (
+            request["updateDimensionProperties"]["range"]["startIndex"],
+            request["updateDimensionProperties"]["range"]["endIndex"],
+        )
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+        if "updateDimensionProperties" in request
+        and request["updateDimensionProperties"]["properties"]["hiddenByUser"] is True
+    }
+    assert hidden_ranges == {(4, 6), (10, 12)}
+    grouped_ranges = {
+        (
+            request["addDimensionGroup"]["range"]["startIndex"],
+            request["addDimensionGroup"]["range"]["endIndex"],
+        )
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+        if "addDimensionGroup" in request
+    }
+    assert grouped_ranges == {(3, 4), (9, 10)}
 
 
 @pytest.mark.asyncio

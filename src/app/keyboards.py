@@ -14,6 +14,7 @@ from app.models import (
 
 class CallbackData:
     NEW = "app:new"
+    NOTIFICATION_NEW = "app:notification:new"
     SINGLE = "app:single"
     BULK_UPLOAD = "app:bulk_upload"
     BULK_TEMPLATE = "app:bulk_template"
@@ -62,8 +63,13 @@ class CallbackData:
     def bulk_ready(batch_id: str) -> str:
         return f"app:bulk_ready:{batch_id}"
 
+    @staticmethod
+    def bulk_direction(idempotency_key: str, direction: str) -> str:
+        return f"app:bulk_direction:{idempotency_key}:{direction}"
+
 
 def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyboardMarkup | None:
+    """Построить клавиатуру по состоянию flow и callback payload."""
     match kind:
         case KeyboardKind.START:
             return InlineKeyboardMarkup(
@@ -295,6 +301,10 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                     [InlineKeyboardButton(text="Назад", callback_data=CallbackData.NEW)],
                 ]
             )
+        case KeyboardKind.BULK_DIRECTION:
+            if not payload:
+                return build_keyboard(KeyboardKind.BULK_MENU)
+            return _bulk_direction_keyboard(payload)
         case KeyboardKind.BULK_CREATED:
             if not payload:
                 return build_keyboard(KeyboardKind.BULK_MENU)
@@ -362,6 +372,50 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                     ],
                 ]
             )
+        case KeyboardKind.NOTIFICATION:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Главное меню",
+                            callback_data=CallbackData.NOTIFICATION_NEW,
+                        )
+                    ]
+                ]
+            )
+        case KeyboardKind.NOTIFICATION_BULK_BACK:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Назад к заявке",
+                            callback_data=CallbackData.NOTIFICATION_NEW,
+                        )
+                    ]
+                ]
+            )
+        case KeyboardKind.NOTIFICATION_SINGLE_BACK:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Назад к заведению заявки",
+                            callback_data=CallbackData.NOTIFICATION_NEW,
+                        )
+                    ]
+                ]
+            )
+        case KeyboardKind.BULK_COMPLETED:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Главное меню",
+                            callback_data=CallbackData.NEW,
+                        )
+                    ]
+                ]
+            )
         case _:
             return None
 
@@ -409,3 +463,40 @@ def _direction_keyboard(*, include_default: bool) -> InlineKeyboardMarkup:
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _bulk_direction_keyboard(idempotency_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=direction_display_label(direction.value),
+                    callback_data=CallbackData.bulk_direction(
+                        idempotency_key,
+                        direction.value,
+                    ),
+                )
+                for direction in (Direction.FL, Direction.SME)
+            ],
+            [
+                InlineKeyboardButton(
+                    text=direction_display_label(direction.value),
+                    callback_data=CallbackData.bulk_direction(
+                        idempotency_key,
+                        direction.value,
+                    ),
+                )
+                for direction in (Direction.AI, Direction.VOICEBOT)
+            ],
+            [
+                InlineKeyboardButton(
+                    text=direction_display_label(Direction.COLLECTION.value),
+                    callback_data=CallbackData.bulk_direction(
+                        idempotency_key,
+                        Direction.COLLECTION.value,
+                    ),
+                )
+            ],
+            [InlineKeyboardButton(text="Отменить", callback_data=CallbackData.BULK_UPLOAD)],
+        ]
+    )

@@ -39,6 +39,7 @@ def execute_with_retry(
     sleep: Callable[[float], None] = time.sleep,
     random_value: Callable[[], float] = random.random,
 ) -> T:
+    """Выполнить Google API операцию с backoff только для временных ошибок."""
     for attempt in range(1, config.max_attempts + 1):
         try:
             return operation()
@@ -67,6 +68,7 @@ def execute_with_retry(
 
 
 def is_retryable_google_error(exc: Exception) -> bool:
+    """Отделить временные сетевые и серверные сбои от постоянных ошибок запроса."""
     status = _http_status(exc)
     if status is not None:
         return status in RETRYABLE_HTTP_STATUSES

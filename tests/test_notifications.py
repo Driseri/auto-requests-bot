@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from googleapiclient.errors import HttpError
 
@@ -8,6 +10,7 @@ from app.bulk import (
     CURRENT_BULK_STAGING_HEADERS,
     LEGACY_BULK_STAGING_HEADERS,
 )
+from app.keyboards import build_keyboard
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -17,6 +20,7 @@ from app.models import (
     BulkBatchStatus,
     Direction,
     FieldName,
+    KeyboardKind,
     Step,
     SubmittedApplication,
 )
@@ -26,12 +30,12 @@ from app.notifications import (
     SheetApplicationStatus,
     SheetBulkBatchStatus,
     StatusNotificationService,
+    _split_html_message,
     _working_data_rows,
 )
 from app.repository import DraftRepository
 from app.submission import (
     DirectionSpreadsheetConfig,
-    CURRENT_WORKSHEET_HEADERS,
     LEGACY_WORKSHEET_HEADERS,
     SHEET_HEADERS,
 )
@@ -40,6 +44,32 @@ from app.submission import (
 FL_SPREADSHEET = "fl-spreadsheet"
 SME_SPREADSHEET = "sme-spreadsheet"
 WEEK_SHEET = "01.06"
+
+
+def test_long_notification_is_split_between_complete_html_blocks():
+    first = '<a href="https://example.test/1">Первая заявка</a>'
+    second = '<blockquote expandable>Подробный ответ</blockquote>'
+
+    chunks = _split_html_message(f"{first}\n{second}\n{first}\n{second}", 100)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 100 for chunk in chunks)
+    assert all(chunk.count("<a ") == chunk.count("</a>") for chunk in chunks)
+    assert all(
+        chunk.count("<blockquote") == chunk.count("</blockquote>")
+        for chunk in chunks
+    )
+
+
+def test_oversized_link_block_keeps_link_and_fits_limit():
+    block = f'<a href="https://example.test/sheet">{"Текст" * 100}</a>'
+
+    chunks = _split_html_message(block, 120)
+
+    assert len(chunks) == 1
+    assert len(chunks[0]) <= 120
+    assert 'href="https://example.test/sheet"' in chunks[0]
+    assert chunks[0].endswith("</a>")
 
 
 def test_working_data_rows_reads_all_rollout_sections():
@@ -161,6 +191,17 @@ class FakeStatusReaderWithBatches(FakeStatusReader):
         }
 
 
+class FakeBulkRowsStatusReader(FakeStatusReaderWithBatches):
+    def __init__(self, bulk_statuses, batch_statuses=None) -> None:
+        super().__init__({}, batch_statuses or {})
+        self.bulk_statuses = bulk_statuses
+        self.bulk_application_calls = []
+
+    async def read_bulk_application_statuses(self, batches):
+        self.bulk_application_calls.append([batch.batch_id for batch in batches])
+        return self.bulk_statuses
+
+
 class FakeNotifier:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
@@ -191,14 +232,11 @@ class FakeDashboardSync:
     def __init__(self) -> None:
         self.upserts = []
 
-    def upsert_tracked_application(self, *, tracked, current, row_link):
-        self.upserts.append(
-            {
-                "tracked": tracked,
-                "current": current,
-                "row_link": row_link,
-            }
-        )
+    def sync_projections(self, items):
+        self.upserts.extend(items)
+
+    def reset_client(self):
+        return None
 
 
 class SelectiveFailNotifier(FakeNotifier):
@@ -711,9 +749,11 @@ async def test_notification_service_updates_dashboard_for_tracked_change(tmp_pat
     await service.run_once()
 
     assert len(dashboard_sync.upserts) == 1
-    assert dashboard_sync.upserts[0]["tracked"].application_id == "A1B2C3D4"
-    assert dashboard_sync.upserts[0]["current"].status == ApplicationStatus.IN_PROGRESS.value
-    assert dashboard_sync.upserts[0]["row_link"].endswith("range=A5:W5")
+    item = dashboard_sync.upserts[0]
+    row = json.loads(item.snapshot_json)["row"]
+    assert item.entity_id == "A1B2C3D4"
+    assert row[8] == ApplicationStatus.IN_PROGRESS.value
+    assert row[11].endswith("range=A5:W5")
 
 
 @pytest.mark.asyncio
@@ -1040,7 +1080,7 @@ async def test_single_final_answer_waits_for_final_answer_ready_status(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_notification_service_does_not_update_tracking_if_send_fails(tmp_path):
+async def test_notification_service_persists_event_if_send_fails(tmp_path):
     repository = DraftRepository(str(tmp_path / "send_failure.db"))
     await repository.init()
     await repository.save_submitted_application(
@@ -1074,12 +1114,16 @@ async def test_notification_service_does_not_update_tracking_if_send_fails(tmp_p
 
     tracked = await repository.get_submitted_application("A1B2C3D4")
     assert tracked is not None
-    assert tracked.last_known_status == ApplicationStatus.NEW.value
-    assert tracked.last_seen_row_number is None
+    assert tracked.last_known_status == ApplicationStatus.ACCEPTED.value
+    outbox = await repository.list_notification_outbox()
+    assert len(outbox) == 1
+    assert outbox[0].state == "PENDING"
+    assert outbox[0].attempts == 1
+    assert tracked.last_seen_row_number == 7
 
 
 @pytest.mark.asyncio
-async def test_notification_keyboard_matches_active_draft_step(tmp_path):
+async def test_notification_keyboard_returns_to_active_single_draft(tmp_path):
     repository = DraftRepository(str(tmp_path / "active_keyboard.db"))
     await repository.init()
     await repository.get_or_create(100)
@@ -1116,7 +1160,77 @@ async def test_notification_keyboard_matches_active_draft_step(tmp_path):
     await service.run_once()
 
     keyboard = notifier.messages[0]["reply_markup"].inline_keyboard
-    assert keyboard[0][0].callback_data == "app:answer_type:Раскатка"
+    assert keyboard[0][0].text == "Назад к заведению заявки"
+    assert keyboard[0][0].callback_data == "app:notification:new"
+
+
+@pytest.mark.asyncio
+async def test_notification_keyboard_returns_to_pending_bulk_creation(tmp_path):
+    repository = DraftRepository(str(tmp_path / "pending_bulk_keyboard.db"))
+    await repository.init()
+    await repository.save_user_setting(
+        100,
+        "pending_action",
+        "create_bulk_direction:idempotency-key",
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({}),
+        notifier=FakeNotifier(),
+    )
+
+    kind = await service._keyboard_kind_for_user(100)
+    keyboard = build_keyboard(kind)
+
+    assert kind == KeyboardKind.NOTIFICATION_BULK_BACK
+    assert keyboard is not None
+    assert keyboard.inline_keyboard[0][0].text == "Назад к заявке"
+    assert keyboard.inline_keyboard[0][0].callback_data == "app:notification:new"
+
+
+@pytest.mark.asyncio
+async def test_notification_keyboard_prefers_bulk_over_single_draft(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_priority_keyboard.db"))
+    await repository.init()
+    await repository.get_or_create(100)
+    await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=100,
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({}),
+        notifier=FakeNotifier(),
+    )
+
+    kind = await service._keyboard_kind_for_user(100)
+
+    assert kind == KeyboardKind.NOTIFICATION_BULK_BACK
+
+
+@pytest.mark.asyncio
+async def test_notification_keyboard_uses_main_menu_without_active_workflow(tmp_path):
+    repository = DraftRepository(str(tmp_path / "neutral_keyboard.db"))
+    await repository.init()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({}),
+        notifier=FakeNotifier(),
+    )
+
+    kind = await service._keyboard_kind_for_user(100)
+    keyboard = build_keyboard(kind)
+
+    assert kind == KeyboardKind.NOTIFICATION
+    assert keyboard is not None
+    assert keyboard.inline_keyboard[0][0].text == "Главное меню"
 
 
 @pytest.mark.asyncio
@@ -1288,7 +1402,10 @@ async def test_bulk_clarification_notification_retries_after_send_failure(tmp_pa
 
     saved = await repository.get_submitted_application("A1B2C3D4")
     assert saved is not None
-    assert saved.last_known_status == BulkApplicationStatus.NEW.value
+    assert saved.last_known_status == BulkApplicationStatus.NEEDS_CLARIFICATION.value
+    outbox = await repository.list_notification_outbox()
+    assert len(outbox) == 1
+    assert outbox[0].state == "PENDING"
 
 @pytest.mark.asyncio
 async def test_notification_service_sends_bulk_batch_status_change(tmp_path):
@@ -1378,7 +1495,10 @@ async def test_bulk_done_notification_retries_when_telegram_send_fails(tmp_path)
 
     saved = await repository.get_bulk_batch(batch.batch_id)
     assert saved is not None
-    assert saved.last_known_batch_status == BulkBatchStatus.NEW.value
+    assert saved.last_known_batch_status == BulkBatchStatus.DONE.value
+    outbox = await repository.list_notification_outbox()
+    assert len(outbox) == 1
+    assert outbox[0].state == "PENDING"
 
 
 @pytest.mark.asyncio
@@ -1420,8 +1540,12 @@ async def test_notification_failure_for_one_user_does_not_block_others(tmp_path)
     successful = await repository.get_submitted_application("B1C2D3E4")
     assert failed is not None
     assert successful is not None
-    assert failed.last_known_status == ApplicationStatus.NEW.value
+    assert failed.last_known_status == ApplicationStatus.ACCEPTED.value
     assert successful.last_known_status == ApplicationStatus.ACCEPTED.value
+    outbox = await repository.list_notification_outbox()
+    failed_outbox = [item for item in outbox if item.telegram_user_id == 100]
+    assert len(failed_outbox) == 1
+    assert failed_outbox[0].state == "PENDING"
     assert [message["chat_id"] for message in notifier.messages] == [200]
 
 
@@ -1467,6 +1591,99 @@ async def test_notification_service_does_not_notify_for_bulk_batch_in_progress(t
     saved = await repository.get_bulk_batch(batch.batch_id)
     assert saved is not None
     assert saved.last_known_batch_status == BulkBatchStatus.IN_PROGRESS.value
+
+
+@pytest.mark.asyncio
+async def test_bulk_dashboard_projection_aggregates_final_answers_and_editors(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_dashboard_aggregate.db"))
+    await repository.init()
+    batch = await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=3,
+    )
+    statuses = {
+        application_id: SheetApplicationStatus(
+            application_id=application_id,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_name=WEEK_SHEET,
+            sheet_id=300,
+            row_number=row_number,
+            status=ApplicationStatus.IN_PROGRESS.value,
+            editor_comment="",
+            final_answer=final_answer,
+            editor=editor,
+            batch_id=batch.batch_id,
+        )
+        for application_id, row_number, editor, final_answer in (
+            ("A1B2C3D4", 22, "редактор 1", ""),
+            ("B1C2D3E4", 23, "редактор 2", "Готовый ответ"),
+        )
+    }
+    dashboard_sync = FakeDashboardSync()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeBulkRowsStatusReader(statuses),
+        notifier=FakeNotifier(),
+        dashboard_sync=dashboard_sync,
+    )
+
+    await service.run_once()
+
+    assert len(dashboard_sync.upserts) == 1
+    row = json.loads(dashboard_sync.upserts[0].snapshot_json)["row"]
+    assert row[1] == batch.batch_id
+    assert row[9] == "Несколько редакторов"
+    assert row[10] == "Да"
+
+
+@pytest.mark.asyncio
+async def test_completed_bulk_batches_are_scanned_no_more_than_hourly(tmp_path):
+    repository = DraftRepository(str(tmp_path / "completed_bulk_archive.db"))
+    await repository.init()
+    batch = await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=3,
+    )
+    await repository.update_bulk_batch_status(
+        batch.batch_id,
+        batch_status=BulkBatchStatus.DONE.value,
+        last_known_batch_status=BulkBatchStatus.DONE.value,
+    )
+    reader = FakeBulkRowsStatusReader({})
+    now = [0.0]
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+        dashboard_sync=FakeDashboardSync(),
+        completed_bulk_dashboard_scan_interval_seconds=3600,
+        clock=lambda: now[0],
+    )
+
+    await service.run_once()
+    now[0] = 100
+    await service.run_once()
+    now[0] = 3601
+    await service.run_once()
+
+    assert reader.bulk_application_calls == [
+        [batch.batch_id],
+        [batch.batch_id],
+    ]
 
 
 def _sheet_name_from_range(range_name: str) -> str:

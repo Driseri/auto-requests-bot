@@ -25,6 +25,7 @@ class RolloutSchedule:
         wednesday_cutoff: str = DEFAULT_WEDNESDAY_CUTOFF,
         thursday_cutoff: str = DEFAULT_THURSDAY_CUTOFF,
     ) -> RolloutSchedule:
+        """Создать расписание раскатки и сразу проверить timezone и cutoffs."""
         normalized_timezone = timezone_name.strip() or DEFAULT_TIMEZONE
         try:
             ZoneInfo(normalized_timezone)
@@ -51,6 +52,7 @@ def rollout_sheet_name(
     submitted_at: datetime,
     schedule: RolloutSchedule,
 ) -> str:
+    """Выбрать лист среды/четверга по фактическому времени отправки заявки."""
     local_moment = _as_aware(submitted_at).astimezone(schedule.timezone)
     monday = local_moment.date() - timedelta(days=local_moment.weekday())
     wednesday_cutoff = datetime.combine(

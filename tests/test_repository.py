@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import aiosqlite
 
@@ -209,6 +211,54 @@ async def test_user_settings_do_not_mix_between_users(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_active_message_coordinates_are_saved_and_cleared_together(tmp_path):
+    repository = DraftRepository(str(tmp_path / "active_message.db"))
+    await repository.init()
+
+    saved = await repository.set_active_message(1, chat_id=100, message_id=200)
+    cleared = await repository.clear_active_message(1)
+
+    assert saved.active_chat_id == 100
+    assert saved.active_message_id == 200
+    assert cleared.active_chat_id is None
+    assert cleared.active_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_repository_migrates_old_user_settings_for_active_message(tmp_path):
+    db_path = str(tmp_path / "old_user_settings.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE user_settings (
+                telegram_user_id INTEGER PRIMARY KEY,
+                default_direction TEXT,
+                default_intent TEXT,
+                default_scriptwriter TEXT,
+                pending_action TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO user_settings (
+                telegram_user_id, created_at, updated_at
+            ) VALUES (1, '2026-06-01T10:00:00+00:00', '2026-06-01T10:00:00+00:00')
+            """
+        )
+        await db.commit()
+
+    repository = DraftRepository(db_path)
+    await repository.init()
+    settings = await repository.get_user_settings(1)
+
+    assert settings.active_chat_id is None
+    assert settings.active_message_id is None
+
+
+@pytest.mark.asyncio
 async def test_submitted_applications_are_saved_listed_and_updated(tmp_path):
     repository = DraftRepository(str(tmp_path / "submitted.db"))
     await repository.init()
@@ -218,6 +268,7 @@ async def test_submitted_applications_are_saved_listed_and_updated(tmp_path):
         telegram_user_id=100,
         sheet_name="Высокий",
         last_known_status=ApplicationStatus.NEW.value,
+        submitted_at="2026-06-15T10:30:00+00:00",
     )
     await repository.save_submitted_application(
         application_id="B1C2D3E4",
@@ -244,6 +295,7 @@ async def test_submitted_applications_are_saved_listed_and_updated(tmp_path):
     assert first.last_seen_row_number == 5
     assert first.last_seen_editor == "редактор 1"
     assert first.last_seen_editor_comment == "Можно использовать"
+    assert first.submitted_at == "2026-06-15T10:30:00+00:00"
     assert {item.application_id for item in tracked} == {"A1B2C3D4", "B1C2D3E4"}
 
 
@@ -279,6 +331,54 @@ async def test_repository_migration_adds_submitted_applications_table(tmp_path):
     await repository.init()
 
     assert await repository.list_submitted_applications() == []
+
+
+@pytest.mark.asyncio
+async def test_repository_migrates_submitted_at_column(tmp_path):
+    db_path = str(tmp_path / "old_submitted.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE submitted_applications (
+                application_id TEXT PRIMARY KEY,
+                telegram_user_id INTEGER NOT NULL,
+                spreadsheet_id TEXT,
+                sheet_id INTEGER,
+                sheet_name TEXT NOT NULL,
+                last_known_status TEXT NOT NULL,
+                direction TEXT,
+                answer_type TEXT,
+                application_type TEXT,
+                is_urgent INTEGER,
+                batch_id TEXT,
+                last_seen_row_number INTEGER,
+                last_seen_editor TEXT,
+                last_seen_editor_comment TEXT,
+                last_seen_final_answer TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO submitted_applications (
+                application_id, telegram_user_id, sheet_name, last_known_status,
+                created_at, updated_at
+            ) VALUES (
+                'A1B2C3D4', 100, '01.06', 'Новая',
+                '2026-06-01T10:00:00+00:00', '2026-06-01T10:00:00+00:00'
+            )
+            """
+        )
+        await db.commit()
+
+    repository = DraftRepository(db_path)
+    await repository.init()
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+
+    assert tracked is not None
+    assert tracked.submitted_at is None
 
 
 @pytest.mark.asyncio
@@ -341,3 +441,89 @@ async def test_repository_migrates_existing_bulk_batches_to_status_schema_v1(tmp
     assert batch.data_end_row == 7
     assert batch.registration_state == BulkRegistrationState.DRAFT.value
     assert batch.registered_count == 0
+
+
+@pytest.mark.asyncio
+async def test_notification_outbox_claims_chunks_in_insert_order(tmp_path):
+    repository = DraftRepository(str(tmp_path / "outbox_order.db"))
+    await repository.init()
+    await repository.enqueue_notification_event(
+        telegram_user_id=100,
+        event_type="status",
+        dedupe_key="event-one",
+        snapshot_json="{}",
+        chunks=["first", "second"],
+    )
+
+    first = await repository.claim_next_notification(stale_after_seconds=300)
+    assert first is not None
+    assert first.html == "first"
+    assert await repository.claim_next_notification(stale_after_seconds=300) is None
+
+    await repository.complete_notification(first.event_id, telegram_message_id=10)
+    second = await repository.claim_next_notification(stale_after_seconds=300)
+    assert second is not None
+    assert second.html == "second"
+
+
+@pytest.mark.asyncio
+async def test_notification_outbox_moves_to_failed_after_max_attempts(tmp_path):
+    repository = DraftRepository(str(tmp_path / "outbox_failed.db"))
+    await repository.init()
+    await repository.enqueue_notification_event(
+        telegram_user_id=100,
+        event_type="status",
+        dedupe_key="event-failed",
+        snapshot_json="{}",
+        chunks=["message"],
+    )
+    item = await repository.claim_next_notification(stale_after_seconds=300)
+    assert item is not None
+
+    for _ in range(10):
+        await repository.fail_notification(
+            item.event_id,
+            error="telegram unavailable",
+            max_attempts=10,
+            retry_base_seconds=30,
+        )
+
+    saved = (await repository.list_notification_outbox())[0]
+    assert saved.state == "FAILED"
+    assert saved.attempts == 10
+
+
+@pytest.mark.asyncio
+async def test_dashboard_outbox_coalesces_latest_projection_and_retries(tmp_path):
+    repository = DraftRepository(str(tmp_path / "dashboard_outbox.db"))
+    await repository.init()
+    await repository.upsert_dashboard_projection(
+        entity_type="APPLICATION",
+        entity_id="A1B2C3D4",
+        snapshot={"row": ["A1B2C3D4", "", "", "", "", "", "", "", "Новая"]},
+    )
+    await repository.upsert_dashboard_projection(
+        entity_type="APPLICATION",
+        entity_id="A1B2C3D4",
+        snapshot={"row": ["A1B2C3D4", "", "", "", "", "", "", "", "В работе"]},
+    )
+
+    saved = await repository.list_dashboard_outbox()
+    assert len(saved) == 1
+    assert json.loads(saved[0].snapshot_json)["row"][8] == "В работе"
+
+    claimed = await repository.claim_dashboard_projections(
+        stale_after_seconds=300
+    )
+    assert len(claimed) == 1
+    await repository.fail_dashboard_projections(
+        claimed,
+        error="dashboard unavailable",
+        retry_base_seconds=60,
+        retry_max_seconds=3600,
+    )
+
+    failed = (await repository.list_dashboard_outbox())[0]
+    assert failed.state == "PENDING"
+    assert failed.attempts == 1
+    assert failed.last_error == "dashboard unavailable"

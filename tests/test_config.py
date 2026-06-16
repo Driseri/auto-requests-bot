@@ -20,6 +20,11 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert settings.dashboard_sync_interval_seconds == 300
     assert settings.bulk_reserved_rows == 100
     assert settings.bulk_registration_stale_seconds == 600
+    assert settings.bulk_creation_stale_seconds == 600
+    assert settings.notification_max_attempts == 10
+    assert settings.notification_retry_base_seconds == 30
+    assert settings.notification_sending_stale_seconds == 300
+    assert settings.notification_message_max_chars == 3500
 
 
 def test_load_settings_uses_custom_dashboard_sync_interval(monkeypatch):
@@ -33,11 +38,13 @@ def test_load_settings_uses_custom_dashboard_sync_interval(monkeypatch):
 def test_load_settings_uses_custom_bulk_limits(monkeypatch):
     monkeypatch.setenv("BULK_RESERVED_ROWS", "75")
     monkeypatch.setenv("BULK_REGISTRATION_STALE_SECONDS", "900")
+    monkeypatch.setenv("BULK_CREATION_STALE_SECONDS", "700")
 
     settings = load_settings()
 
     assert settings.bulk_reserved_rows == 75
     assert settings.bulk_registration_stale_seconds == 900
+    assert settings.bulk_creation_stale_seconds == 700
 
 
 @pytest.mark.parametrize(
@@ -47,6 +54,11 @@ def test_load_settings_uses_custom_bulk_limits(monkeypatch):
         ("BULK_RESERVED_ROWS", "-1"),
         ("BULK_REGISTRATION_STALE_SECONDS", "0"),
         ("BULK_REGISTRATION_STALE_SECONDS", "-1"),
+        ("BULK_CREATION_STALE_SECONDS", "0"),
+        ("NOTIFICATION_MAX_ATTEMPTS", "0"),
+        ("NOTIFICATION_RETRY_BASE_SECONDS", "0"),
+        ("NOTIFICATION_SENDING_STALE_SECONDS", "0"),
+        ("NOTIFICATION_MESSAGE_MAX_CHARS", "0"),
     ],
 )
 def test_load_settings_rejects_invalid_bulk_limits(monkeypatch, name, value):

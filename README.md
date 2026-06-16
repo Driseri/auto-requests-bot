@@ -29,38 +29,246 @@ Telegram-бот для сбора заявок на изменение сцен�
 
 ## Конфигурация
 
-Создайте `.env` по примеру `.env.example`.
+Создайте `.env` по примеру `.env.example`. Для пилота на 5 пользователей рекомендуется
+сначала использовать значения ниже и менять их только при наличии конкретной причины:
 
 ```env
 TELEGRAM_BOT_TOKEN=123456:telegram-token
 TELEGRAM_PROXY_URL=
 TELEGRAM_REQUEST_TIMEOUT=60
 SQLITE_PATH=/data/app.db
+
 BOT_TIMEZONE=Europe/Moscow
 ROLLOUT_WEDNESDAY_CUTOFF=14:00
 ROLLOUT_THURSDAY_CUTOFF=14:00
 APPLICATION_EDITORS=редактор 1,редактор 2
 
 GOOGLE_CREDENTIALS_PATH=/run/secrets/google_credentials.json
-GOOGLE_DASHBOARD_SPREADSHEET_ID=dashboard-spreadsheet-id
 GOOGLE_FL_SPREADSHEET_ID=fl-spreadsheet-id
 GOOGLE_SME_SPREADSHEET_ID=sme-spreadsheet-id
 GOOGLE_AI_SPREADSHEET_ID=ai-spreadsheet-id
 GOOGLE_VOICE_COLLECTION_SPREADSHEET_ID=voice-collection-spreadsheet-id
+GOOGLE_DASHBOARD_SPREADSHEET_ID=dashboard-spreadsheet-id
 
 GIGACHAT_CREDENTIALS=gigachat-authorization-key
+GIGACHAT_BASE_URL=https://gigachat.devices.sberbank.ru/api/v1
+GIGACHAT_AUTH_URL=https://ngw.devices.sberbank.ru:9443/api/v2/oauth
 GIGACHAT_SCOPE=GIGACHAT_API_PERS
 GIGACHAT_MODEL=GigaChat
 GIGACHAT_VERIFY_SSL_CERTS=true
+GIGACHAT_CA_BUNDLE_FILE=
+GIGACHAT_TIMEOUT=60
+GIGACHAT_MAX_RETRIES=3
+GIGACHAT_RETRY_BACKOFF_FACTOR=1
+GIGACHAT_SYSTEM_PROMPT_PATH=prompts/gigachat_system.md
+GIGACHAT_USER_PROMPT_PATH=prompts/gigachat_user.md
+GIGACHAT_SHOW_RESPONSE_JSON=false
 
 STATUS_POLLING_ENABLED=true
 STATUS_POLLING_INTERVAL_SECONDS=30
+STATUS_POLLING_HEARTBEAT_PATH=/data/status-polling-heartbeat.json
+STATUS_POLLING_HEARTBEAT_MAX_AGE_SECONDS=180
+
+HEALTH_EXTERNAL_CHECK_INTERVAL_SECONDS=300
+HEALTH_EXTERNAL_FAILURE_THRESHOLD=2
+HEALTH_EXTERNAL_TIMEOUT_SECONDS=10
+HEALTH_EXTERNAL_CACHE_PATH=/data/external-health.json
+
 DASHBOARD_SYNC_INTERVAL_SECONDS=300
+COMPLETED_BULK_DASHBOARD_SCAN_INTERVAL_SECONDS=3600
+DASHBOARD_OUTBOX_RETRY_BASE_SECONDS=60
+DASHBOARD_OUTBOX_RETRY_MAX_SECONDS=3600
+DASHBOARD_OUTBOX_SENDING_STALE_SECONDS=300
+
+BULK_RESERVED_ROWS=100
+BULK_REGISTRATION_STALE_SECONDS=600
+BULK_CREATION_STALE_SECONDS=600
+
+NOTIFICATION_MAX_ATTEMPTS=10
+NOTIFICATION_RETRY_BASE_SECONDS=30
+NOTIFICATION_SENDING_STALE_SECONDS=300
+NOTIFICATION_MESSAGE_MAX_CHARS=3500
+
+GOOGLE_API_MAX_ATTEMPTS=4
+GOOGLE_API_RETRY_BASE_SECONDS=1
+GOOGLE_API_RETRY_MAX_SECONDS=8
+
+BACKUP_DIR=./backups
 ```
 
-Google-таблицы направлений и дашборд создаются администратором вручную. Боту нужны права редактора в этих таблицах через service account из `credentials.json`. Сам бот не создает новые spreadsheet-файлы, но создает вкладки внутри уже созданных таблиц.
+Значения `true` и `false` следует указывать без кавычек. После изменения `.env`
+пересоздайте контейнер командой:
 
-Старые переменные `GOOGLE_SPREADSHEET_ID`, `GOOGLE_HIGH_PRIORITY_SHEET_NAME`, `GOOGLE_LOW_PRIORITY_SHEET_NAME`, `GOOGLE_BULK_SHEET_NAME` оставлены только для временной совместимости `.env`; новая логика маршрутизации их не использует.
+```bash
+docker compose up -d --force-recreate bot
+```
+
+Пересборка образа для изменения только конфигурации не требуется.
+
+### Обязательные Переменные
+
+| Переменная | Как выставлять |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Токен рабочего Telegram-бота. Без него приложение не запускается. |
+| `GOOGLE_CREDENTIALS_PATH` | В Docker оставлять `/run/secrets/google_credentials.json`. Файл хоста `./credentials.json` монтируется туда через Compose. |
+| `GOOGLE_FL_SPREADSHEET_ID` | ID рабочей таблицы направления `ФЛ`. |
+| `GOOGLE_SME_SPREADSHEET_ID` | ID рабочей таблицы направления `SME`. |
+| `GOOGLE_AI_SPREADSHEET_ID` | ID рабочей таблицы направления `АИ`. |
+| `GOOGLE_VOICE_COLLECTION_SPREADSHEET_ID` | ID общей рабочей таблицы `VoiceBot` и `Collection`. |
+| `GIGACHAT_CREDENTIALS` | Авторизационные данные GigaChat для проверки полноты заявки. |
+
+Все четыре рабочие Google-таблицы считаются обязательными. Даже если во время пилота
+одно направление временно не используется, пустой ID приведет к состоянию `unhealthy`.
+Service account должен иметь права редактора во всех рабочих таблицах.
+
+`GOOGLE_DASHBOARD_SPREADSHEET_ID` формально необязателен. Если оставить его пустым,
+основные заявки и уведомления продолжат работать, но общий дашборд не будет
+синхронизироваться и healthcheck не станет проверять доступ к нему.
+
+Google-таблицы создаются администратором вручную. Бот не создает spreadsheet-файлы,
+но создает и форматирует необходимые вкладки внутри указанных таблиц.
+
+### Telegram И Локальные Данные
+
+| Переменная | Рекомендация и логика |
+|---|---|
+| `TELEGRAM_PROXY_URL` | Оставлять пустой, если сервер напрямую обращается к Telegram. Заполнять полным URL прокси только при сетевой необходимости. Этот же прокси используется healthcheck. |
+| `TELEGRAM_REQUEST_TIMEOUT` | `60` секунд. Уменьшать можно только при стабильной сети; слишком малое значение создаст ложные ошибки отправки. |
+| `SQLITE_PATH` | В Docker оставлять `/data/app.db`, потому что `/data` находится в постоянном volume. Не указывать путь внутри непостоянной файловой системы контейнера. |
+| `BOT_TIMEZONE` | IANA timezone, например `Europe/Moscow`. Она применяется к маршрутизации раскаток и новым датам Google Sheets. Изменение влияет только на новые записи. |
+| `APPLICATION_EDITORS` | Имена через запятую без пустых элементов. Они становятся значениями dropdown в новых строках и вкладках. |
+
+`ROLLOUT_WEDNESDAY_CUTOFF` и `ROLLOUT_THURSDAY_CUTOFF` задаются в формате `HH:MM`
+по `BOT_TIMEZONE`. Обычно их следует менять вместе с бизнес-регламентом. Дедлайн
+четверга должен идти после дедлайна среды в рамках недельной логики.
+
+### Google Sheets И Retry
+
+| Переменная | Рекомендация и логика |
+|---|---|
+| `GOOGLE_API_MAX_ATTEMPTS` | `4`: первоначальная попытка и до трех повторов временных ошибок. Постоянные `403`, ошибки прав и схемы не повторяются. |
+| `GOOGLE_API_RETRY_BASE_SECONDS` | `1`: начальная задержка exponential backoff. |
+| `GOOGLE_API_RETRY_MAX_SECONDS` | `8`: верхняя граница задержки одной операции. Должна быть не меньше `GOOGLE_API_RETRY_BASE_SECONDS`. |
+
+Увеличивать число попыток стоит только при нестабильной сети. Это повышает шанс
+успешного завершения, но также увеличивает время ответа пользователю. Для пилота
+`4 / 1 / 8` является сбалансированным профилем.
+
+### GigaChat
+
+| Переменная | Рекомендация и логика |
+|---|---|
+| `GIGACHAT_BASE_URL`, `GIGACHAT_AUTH_URL` | Оставлять стандартными, если провайдер не выдал другие адреса. |
+| `GIGACHAT_SCOPE` | Должен соответствовать выданным credentials. Для текущего пилота используется `GIGACHAT_API_PERS`. |
+| `GIGACHAT_MODEL` | Оставлять `GigaChat`, пока смена модели не проверена на текущем JSON-контракте. |
+| `GIGACHAT_VERIFY_SSL_CERTS` | В production оставлять `true`. |
+| `GIGACHAT_CA_BUNDLE_FILE` | Оставлять пустым при стандартном доверенном сертификате. Указывать путь только для корпоративного CA bundle. |
+| `GIGACHAT_TIMEOUT` | `60` секунд. Это предельное время одного запроса проверки. |
+| `GIGACHAT_MAX_RETRIES` | `3` для временных сетевых ошибок. |
+| `GIGACHAT_RETRY_BACKOFF_FACTOR` | `1`; увеличение замедляет повторы. |
+| `GIGACHAT_SYSTEM_PROMPT_PATH`, `GIGACHAT_USER_PROMPT_PATH` | Обычно не менять. Пути считаются относительно рабочей директории приложения. |
+| `GIGACHAT_SHOW_RESPONSE_JSON` | `false` в обычной работе. `true` использовать только для диагностики структуры ответа. |
+
+### Polling И Heartbeat
+
+| Переменная | Рекомендация и логика |
+|---|---|
+| `STATUS_POLLING_ENABLED` | Для production оставлять `true`. При `false` бот не отслеживает изменения статусов, не отправляет фоновые уведомления и не обновляет дашборд по изменениям таблиц. |
+| `STATUS_POLLING_INTERVAL_SECONDS` | `30` для пилота. Меньшее значение быстрее обнаруживает изменения, но чаще обращается к Google API. |
+| `STATUS_POLLING_HEARTBEAT_PATH` | В Docker оставлять `/data/status-polling-heartbeat.json`. |
+| `STATUS_POLLING_HEARTBEAT_MAX_AGE_SECONDS` | Рекомендуется не меньше `max(180, STATUS_POLLING_INTERVAL_SECONDS * 3)`. |
+
+Heartbeat обновляется только после полностью успешного polling-цикла. Поэтому слишком
+малый `STATUS_POLLING_HEARTBEAT_MAX_AGE_SECONDS` будет переводить контейнер в
+`unhealthy` при одном медленном цикле Google API.
+
+Для 5 пользователей рекомендуется интервал `30` секунд. Значения меньше `15` секунд
+обычно не дают заметного выигрыша для пользователя, но увеличивают расход квоты.
+
+### Healthcheck
+
+| Переменная | Рекомендация и логика |
+|---|---|
+| `HEALTH_EXTERNAL_CHECK_INTERVAL_SECONDS` | `300`: реальные `Telegram getMe` и Google probes выполняются не чаще раза в 5 минут. |
+| `HEALTH_EXTERNAL_FAILURE_THRESHOLD` | `2`: после ранее успешной проверки один внешний сбой допускается, второй подряд дает `unhealthy`. До первого успеха критичен первый сбой. |
+| `HEALTH_EXTERNAL_TIMEOUT_SECONDS` | `10`: timeout каждой внешней проверки. |
+| `HEALTH_EXTERNAL_CACHE_PATH` | В Docker оставлять `/data/external-health.json`, чтобы атомарный кэш переживал restart контейнера. |
+
+Не следует ставить внешний интервал равным Docker healthcheck interval `30s`: это
+создаст лишние запросы к Telegram и Google. Значение `300` оставляет локальные проверки
+частыми, а внешние проверки делает экономными.
+
+### Дашборд И Dashboard Outbox
+
+| Переменная | Рекомендация и логика |
+|---|---|
+| `DASHBOARD_SYNC_INTERVAL_SECONDS` | `300`: периодическая постановка актуальных проекций одиночных и активных массовых заявок. Изменения статуса также ставятся в outbox сразу при обнаружении. |
+| `COMPLETED_BULK_DASHBOARD_SCAN_INTERVAL_SECONDS` | `3600`: завершенные пачки проверяются раз в час для поздних итоговых ответов и смены редактора. |
+| `DASHBOARD_OUTBOX_RETRY_BASE_SECONDS` | `60`: задержка после первой неудачной пакетной записи. |
+| `DASHBOARD_OUTBOX_RETRY_MAX_SECONDS` | `3600`: максимальная задержка между повторами. Проекции повторяются бессрочно. |
+| `DASHBOARD_OUTBOX_SENDING_STALE_SECONDS` | `300`: зависшая запись `SENDING` возвращается в `PENDING` через 5 минут. |
+
+`DASHBOARD_OUTBOX_SENDING_STALE_SECONDS` должен быть больше ожидаемой длительности
+одного пакетного Google-запроса со всеми внутренними retry. Уменьшение этого значения
+может привести к повторному захвату еще выполняющейся операции.
+
+### Массовые Заявки
+
+| Переменная | Рекомендация и логика |
+|---|---|
+| `BULK_RESERVED_ROWS` | `100`: максимальное число строк одной пачки и текст лимита в Telegram. Изменение применяется только к новым пачкам. |
+| `BULK_REGISTRATION_STALE_SECONDS` | `600`: через сколько зависшая регистрация может быть безопасно повторена. |
+| `BULK_CREATION_STALE_SECONDS` | `600`: через сколько зависшее создание пачки может быть восстановлено. |
+
+Stale-интервалы должны быть больше максимального нормального времени соответствующей
+Google-операции. Для пилота не рекомендуется ставить их ниже `300` секунд. Увеличение
+`BULK_RESERVED_ROWS` повышает размер чтения Google Sheets и визуальный резерв каждой
+активной пачки.
+
+### Уведомления
+
+| Переменная | Рекомендация и логика |
+|---|---|
+| `NOTIFICATION_MAX_ATTEMPTS` | `10`: после десятой ошибки часть сообщения переходит в `FAILED`. |
+| `NOTIFICATION_RETRY_BASE_SECONDS` | `30`: база ограниченного exponential backoff. |
+| `NOTIFICATION_SENDING_STALE_SECONDS` | `300`: возврат зависшей доставки из `SENDING` в `PENDING`. |
+| `NOTIFICATION_MESSAGE_MAX_CHARS` | `3500`: безопасный лимит ниже ограничения Telegram `4096`, учитывающий HTML-разметку. |
+
+Не рекомендуется повышать `NOTIFICATION_MESSAGE_MAX_CHARS` выше `3500`. Уменьшение
+допустимо, но создаст больше отдельных Telegram-сообщений. Stale timeout должен быть
+больше `TELEGRAM_REQUEST_TIMEOUT`.
+
+### Production Image И Backup
+
+`APP_VERSION` нужен только для `docker-compose.prod.yml` и задает неизменяемый тег
+образа, например commit SHA:
+
+```env
+APP_VERSION=4f2c9ab
+BACKUP_DIR=./backups
+```
+
+Перед production-запуском образ с таким тегом уже должен существовать локально или в
+registry. Один и тот же `APP_VERSION` используется контейнерами `bot` и `backup`.
+
+`BACKUP_DIR` — каталог хоста, в который maintenance-контейнер записывает резервные
+копии. Относительный путь считается от каталога Compose-проекта. Для VPS можно
+использовать абсолютный путь, например `/opt/alfa-auto-requests/backups`.
+
+### Правила Изменения Конфигурации
+
+1. Сначала меняйте только одну группу параметров и фиксируйте причину изменения.
+2. После изменения интервала polling пересчитайте допустимый возраст heartbeat.
+3. После изменения сетевых timeout проверьте, что соответствующие stale timeout больше них.
+4. После изменения `BOT_TIMEZONE` или дедлайнов проверьте маршрутизацию новой тестовой заявки.
+5. После изменения списка редакторов создайте новую строку и проверьте dropdown; существующие validation rules автоматически не мигрируют.
+6. После изменения Google ID или credentials выполните `docker compose exec bot python -m app.health`.
+7. Не удаляйте Docker volume при обычном обновлении конфигурации: в нем находятся SQLite, heartbeat и health-кэш.
+
+Старые переменные `GOOGLE_SPREADSHEET_ID`, `GOOGLE_HIGH_PRIORITY_SHEET_NAME`,
+`GOOGLE_LOW_PRIORITY_SHEET_NAME`, `GOOGLE_BULK_SHEET_NAME` оставлены только для
+временной совместимости старых `.env`. Новая маршрутизация их не использует, поэтому
+для новой установки их следует оставить пустыми.
 
 ## Направления И Вкладки
 
@@ -166,7 +374,11 @@ Flow одиночной заявки:
 9. Финальная проверка.
 10. Отправка.
 
-GigaChat используется только для одиночных заявок и только для проверки полноты поля `Суть изменений`. Он не переписывает текст и не оценивает деловой стиль. Проверка определяет, сможет ли редактор выполнить изменение без догадок: понятно ли, что меняется, что нужно сделать и какой результат должен получиться.
+GigaChat используется только для одиночных заявок и проверяет, достаточно ли требований, чтобы редактор подготовил финальный текст ответа без догадок. После редакторской проверки согласованный текст внедряет сценарист. Проверка выполняется до ввода `Исходного текста`, поэтому его отсутствие не считается недостатком.
+
+Обязательны три критерия: однозначные объект и границы изменения; конкретные требования к содержанию будущего финального текста; явно раскрытые проблема, причинная связь и ожидаемый результат. Тип изменения остаётся контекстом заявки и не создаёт отдельных критериев. Сведения могут находиться в разных полях, поэтому повторять их в `Сути изменений` не требуется.
+
+Фразы вроде `пересмотр по результатам анализа`, `правка по комментариям качества` или `задача от заказчика` сами по себе считаются неинформативными: необходимо раскрыть конкретный вывод, требуемое изменение и ожидаемый эффект. GigaChat не составляет финальный текст, не оценивает деловой стиль и не придумывает отсутствующие требования или причинные связи. Краткость допустима, если задача выполнима без догадок.
 
 Если информации недостаточно, бот дает одну конкретную инструкцию по дополнению поля. Ответ сценариста добавляется ниже первоначальной сути изменений. После единственного уточнения сценарий продолжается; при сохраняющейся неоднозначности заявка получает статус `needs_attention`. Числовая `LLM оценка` больше не рассчитывается и остается пустой. Если GigaChat недоступен или ответ не удалось разобрать, заявка не блокируется: бот сохраняет пользовательский текст со статусом `error`.
 
@@ -187,7 +399,7 @@ Flow массовой заявки:
 
 GigaChat в массовом режиме не вызывается. Изменения статусов, комментариев и итоговых ответов отдельных строк не отправляются в Telegram.
 
-Размер блока задается через `BULK_RESERVED_ROWS` (`100` по умолчанию). Создание массовых заявок на одном листе и регистрация одной заявки защищены блокировками. Повторное нажатие `Заявка заполнена` после успеха не создает дубли. Зависшую регистрацию можно повторить после `BULK_REGISTRATION_STALE_SECONDS` (`600` секунд по умолчанию).
+Размер блока задается через `BULK_RESERVED_ROWS` (`100` по умолчанию). Создание массовых заявок на одном листе и все действия одного Telegram-пользователя защищены блокировками. Создание использует idempotency key и заранее назначенный `batch_id`: повторный callback и восстановление после `BULK_CREATION_STALE_SECONDS` не добавляют второй блок. Повторное нажатие `Заявка заполнена` после успеха не создает дубли. Зависшую регистрацию можно повторить после `BULK_REGISTRATION_STALE_SECONDS` (`600` секунд по умолчанию).
 
 ## Дашборд
 
@@ -210,11 +422,20 @@ GigaChat в массовом режиме не вызывается. Измен�
 11. `Итоговый ответ есть`
 12. `Ссылка на рабочую строку`
 
-Бот создает или обновляет строку дашборда по `ID заявки` для одиночной заявки и по `ID пачки` для массовой заявки. Ручные изменения в дашборде не считаются источником данных.
+Бот создает или обновляет строку дашборда по `ID заявки` для одиночной заявки и по `ID пачки` для массовой заявки. Требуемая проекция сначала сохраняется в SQLite `dashboard_outbox`, поэтому недоступность Google Sheets не меняет успешный результат создания или регистрации заявки. Несколько изменений одной сущности объединяются в последнюю версию.
+
+Один проход синхронизации читает лист `Заявки!A:L` один раз и применяет накопленные изменения одним `batchUpdate`. Дубли объединяются без потери даты, ссылки, статуса, редактора и признака итогового ответа, после чего лишние строки удаляются снизу вверх. Активные массовые пачки проверяются обычным polling, завершенные пачки дополнительно проверяются раз в `COMPLETED_BULK_DASHBOARD_SCAN_INTERVAL_SECONDS`, чтобы учитывать поздние итоговые ответы и смену редакторов.
 
 ## Уведомления
 
-Polling читает рабочие таблицы направлений каждые `STATUS_POLLING_INTERVAL_SECONDS` секунд. Новая заявка появляется в дашборде сразу после отправки, а последующие изменения статуса, редактора и итогового ответа переносятся туда не чаще чем раз в `DASHBOARD_SYNC_INTERVAL_SECONDS` секунд. Заявки отслеживаются по `ID заявки`, поэтому сортировка и перемещение строк не ломают уведомления.
+Polling читает рабочие таблицы направлений каждые `STATUS_POLLING_INTERVAL_SECONDS` секунд. Обнаруженное событие и новое tracking-состояние атомарно записываются в SQLite `notification_outbox`, а требуемое состояние дашборда — в отдельный `dashboard_outbox`. Telegram-доставка и запись дашборда выполняются независимо. Поэтому ошибка Telegram или дашборда не теряет уже замеченное событие и не откатывает tracking. Доставка имеет гарантию at-least-once; после аварии между ответом Telegram и SQLite commit возможен редкий дубль.
+
+Outbox повторяет отправку с ограниченным backoff, восстанавливает зависшие записи `SENDING` и сохраняет порядок сообщений каждого пользователя. Параметры: `NOTIFICATION_MAX_ATTEMPTS`, `NOTIFICATION_RETRY_BASE_SECONDS`, `NOTIFICATION_SENDING_STALE_SECONDS`, `NOTIFICATION_MESSAGE_MAX_CHARS`. Длинные сообщения делятся на HTML-безопасные части до `3500` символов. Фоновые уведомления содержат только нейтральную кнопку `Главное меню` и не сбрасывают активный черновик.
+
+Бот хранит `message_id` текущего навигационного сообщения пользователя. При переходе к
+новому шагу предыдущая inline-клавиатура отключается. Callback от старого сообщения не
+передается в workflow и получает ответ о том, что кнопка устарела. Исключения:
+`Заявка заполнена` для массовой пачки и `Главное меню` из фонового уведомления.
 
 Для одиночных заявок автор получает уведомление при переходе в:
 
@@ -278,9 +499,22 @@ docker compose run --rm bot pytest
 - Одиночная отправка идемпотентна по `application_id`: маршрут фиксируется до первой записи, а повтор сначала ищет существующую строку.
 - Для временных ошибок Google API (`429`, `5xx`, timeout, broken pipe, reset соединения) используется ограниченный exponential backoff с jitter.
 - SQLite работает с `WAL`, `synchronous=NORMAL`, `foreign_keys=ON` и `busy_timeout=10000`.
-- Healthcheck проверяет свежесть heartbeat успешного status polling и доступность SQLite.
+- Healthcheck проверяет свежесть heartbeat, целостность SQLite, обязательную конфигурацию,
+  Telegram `getMe` и доступ service account к рабочим Google-таблицам. Внешний результат
+  кэшируется на пять минут; после ранее успешной проверки один временный сбой допускается,
+  второй подряд переводит контейнер в `unhealthy`.
 - Docker-логи ограничены пятью файлами по 10 МБ.
 - Завершенные массовые заявки не читаются в каждом частом polling-цикле.
+
+Параметры внешней части healthcheck:
+
+- `HEALTH_EXTERNAL_CHECK_INTERVAL_SECONDS=300` — интервал реальных запросов к Telegram и Google;
+- `HEALTH_EXTERNAL_FAILURE_THRESHOLD=2` — число последовательных ошибок после первого успеха;
+- `HEALTH_EXTERNAL_TIMEOUT_SECONDS=10` — timeout одного внешнего запроса;
+- `HEALTH_EXTERNAL_CACHE_PATH=/data/external-health.json` — атомарный кэш результата.
+
+Четыре рабочие таблицы направлений обязательны для состояния `healthy`. Дашборд проверяется
+только при заполненном `GOOGLE_DASHBOARD_SPREADSHEET_ID`.
 
 Локальный backup с проверкой `integrity_check`:
 

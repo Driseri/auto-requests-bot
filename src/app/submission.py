@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 from pathlib import Path
 from threading import RLock
@@ -16,16 +17,19 @@ from app.models import (
     ApplicationType,
     BulkBatch,
     ChangeType,
+    DashboardOutboxItem,
     Direction,
     Draft,
     SubmittedApplication,
     SubmissionResult,
 )
 from app.scheduling import (
+    DEFAULT_TIMEZONE,
     DEFAULT_ROLLOUT_SCHEDULE,
     RolloutSchedule,
     rollout_sheet_name,
 )
+from app.sheet_dates import google_sheets_date_cell, utc_iso
 
 LOGGER = logging.getLogger(__name__)
 EDITOR_NOT_SELECTED = "Редактор не выбран"
@@ -135,6 +139,7 @@ class DirectionSpreadsheetConfig:
     voice_collection_spreadsheet_id: str
 
     def spreadsheet_id_for(self, direction: str | None) -> str:
+        """Вернуть рабочую таблицу, являющуюся source of truth направления."""
         if direction == Direction.FL.value:
             return self.fl_spreadsheet_id
         if direction == Direction.SME.value:
@@ -203,6 +208,8 @@ class SheetConfigurationError(RuntimeError):
 
 
 class GoogleSheetsSubmissionService:
+    """Идемпотентно записывает одиночные заявки в таблицы направлений."""
+
     def __init__(
         self,
         *,
@@ -211,6 +218,7 @@ class GoogleSheetsSubmissionService:
         credentials_path: str,
         sheets_api: Any | None = None,
         rollout_schedule: RolloutSchedule = DEFAULT_ROLLOUT_SCHEDULE,
+        timezone_name: str = DEFAULT_TIMEZONE,
         clock: Callable[[], datetime] | None = None,
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
         dashboard_sync: DashboardSyncService | None = None,
@@ -232,6 +240,7 @@ class GoogleSheetsSubmissionService:
         self._external_sheets_api = sheets_api is not None
         self.google_api_retry = google_api_retry
         self.rollout_schedule = rollout_schedule
+        self.timezone_name = timezone_name
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.application_editors = application_editors
         self._prepared_sheets: dict[tuple[str, str], str] = {}
@@ -241,6 +250,7 @@ class GoogleSheetsSubmissionService:
             credentials_path=credentials_path,
             sheets_api=sheets_api,
             application_editors=application_editors,
+            timezone_name=timezone_name,
         )
 
         if sheets_api is None and not Path(self.credentials_path).is_file():
@@ -249,20 +259,33 @@ class GoogleSheetsSubmissionService:
             )
 
     def resolve_target(self, application: Draft) -> tuple[str, str]:
+        """Определить таблицу и вкладку с учетом направления и окна раскатки."""
+        return self._resolve_target(application, submitted_at=self.clock())
+
+    def _resolve_target(
+        self,
+        application: Draft,
+        *,
+        submitted_at: datetime,
+    ) -> tuple[str, str]:
         spreadsheet_id = (
             application.submission_spreadsheet_id
             or self.direction_spreadsheets.spreadsheet_id_for(application.direction)
         )
         sheet_name = application.submission_sheet_name or target_sheet_name(
             application,
-            submitted_at=self.clock(),
+            submitted_at=submitted_at,
             rollout_schedule=self.rollout_schedule,
         )
         return spreadsheet_id, sheet_name
 
     async def submit(self, application: Draft) -> SubmissionResult:
+        """Записать заявку под блокировкой листа с retry временных Google-сбоев."""
         submitted_at = self.clock()
-        spreadsheet_id, sheet_name = self.resolve_target(application)
+        spreadsheet_id, sheet_name = self._resolve_target(
+            application,
+            submitted_at=submitted_at,
+        )
         lock = self._sheet_locks.setdefault(
             (spreadsheet_id, sheet_name),
             asyncio.Lock(),
@@ -271,7 +294,12 @@ class GoogleSheetsSubmissionService:
             async with lock:
                 result = await asyncio.to_thread(
                     execute_with_retry,
-                    lambda: self._submit_sync(application, submitted_at),
+                    lambda: self._submit_sync(
+                        application,
+                        submitted_at,
+                        spreadsheet_id=spreadsheet_id,
+                        sheet_name=sheet_name,
+                    ),
                     config=self.google_api_retry,
                     operation_id=f"submit:{application.application_id or 'unknown'}",
                     reset_client=self._reset_sheets_api,
@@ -293,8 +321,15 @@ class GoogleSheetsSubmissionService:
         if self._dashboard is not None:
             self._dashboard._sheets_api = None
 
-    def _submit_sync(self, application: Draft, submitted_at: datetime) -> SubmissionResult:
-        spreadsheet_id, sheet_name = self.resolve_target(application)
+    def _submit_sync(
+        self,
+        application: Draft,
+        submitted_at: datetime,
+        *,
+        spreadsheet_id: str,
+        sheet_name: str,
+    ) -> SubmissionResult:
+        """Сверить application_id и добавить строку только при его отсутствии."""
         if not spreadsheet_id:
             raise SheetConfigurationError(
                 "Для выбранного направления не задан ID Google-таблицы."
@@ -332,6 +367,8 @@ class GoogleSheetsSubmissionService:
             )
         row_data = _draft_to_row_data(
             application,
+            submitted_at=submitted_at,
+            timezone_name=self.timezone_name,
             application_editors=self.application_editors,
             schema=schema,
         )
@@ -370,16 +407,6 @@ class GoogleSheetsSubmissionService:
             end_column=_worksheet_schema_layout(schema)["end_column"],
         )
 
-        if self.dashboard_spreadsheet_id:
-            try:
-                self._dashboard.upsert_application(
-                    application=application,
-                    status=ApplicationStatus.NEW.value,
-                    row_link=row_link,
-                )
-            except SheetConfigurationError as exc:
-                LOGGER.warning("Dashboard sync skipped: %s", exc)
-
         return SubmissionResult(
             success=True,
             message="Заявка отправлена в таблицу.",
@@ -388,6 +415,7 @@ class GoogleSheetsSubmissionService:
             sheet_name=sheet_name,
             row_number=row_number,
             row_link=row_link,
+            submitted_at=utc_iso(submitted_at),
         )
 
     def _find_application_row(
@@ -435,6 +463,7 @@ class GoogleSheetsSubmissionService:
         *,
         use_sections: bool,
     ) -> tuple[int, str]:
+        """Создать или распознать поддерживаемую схему до записи данных."""
         cache_key = (spreadsheet_id, sheet_name)
         if cache_key in self._prepared_sheets:
             return (
@@ -666,6 +695,8 @@ class GoogleSheetsSubmissionService:
 
 
 class DashboardSyncService:
+    """Поддерживает read-only дашборд как проекцию рабочих таблиц."""
+
     def __init__(
         self,
         *,
@@ -673,14 +704,17 @@ class DashboardSyncService:
         credentials_path: str,
         sheets_api: Any | None = None,
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
+        timezone_name: str = DEFAULT_TIMEZONE,
     ) -> None:
         self.spreadsheet_id = spreadsheet_id
         self.credentials_path = credentials_path
         self._sheets_api = sheets_api
+        self._external_sheets_api = sheets_api is not None
         self._prepared_sheets: set[str] = set()
         self._prepared_sheet_ids: dict[str, int] = {}
         self._lock = RLock()
         self.application_editors = application_editors
+        self.timezone_name = timezone_name
 
     def upsert_application(
         self,
@@ -689,14 +723,126 @@ class DashboardSyncService:
         status: str,
         row_link: str,
         final_answer_present: bool = False,
+        submitted_at: datetime | str | None = None,
     ) -> None:
+        """Создать или обновить строку одиночной заявки по application_id."""
         with self._lock:
             self._upsert_application(
                 application=application,
                 status=status,
                 row_link=row_link,
                 final_answer_present=final_answer_present,
+                submitted_at=submitted_at,
             )
+
+    def sync_projections(self, items: list[DashboardOutboxItem]) -> None:
+        """Одним чтением и batchUpdate применить последние проекции outbox."""
+        if not items or not self.spreadsheet_id:
+            return
+        with self._lock:
+            self._sync_projections(items)
+
+    def reset_client(self) -> None:
+        if self._external_sheets_api:
+            return
+        with self._lock:
+            self._sheets_api = None
+            self._prepared_sheets.clear()
+            self._prepared_sheet_ids.clear()
+
+    def _sync_projections(self, items: list[DashboardOutboxItem]) -> None:
+        api = self._get_sheets_api()
+        sheet_id = self._ensure_dashboard_sheet(
+            api,
+            DASHBOARD_SHEET_NAME,
+            DASHBOARD_HEADERS,
+        )
+        rows = self._read_rows(api, DASHBOARD_SHEET_NAME, "A:L")
+        groups = _dashboard_row_groups(rows)
+        requests: list[dict[str, Any]] = []
+        projected_keys: set[tuple[str, str]] = set()
+
+        for item in items:
+            snapshot = json.loads(item.snapshot_json)
+            projected = list(snapshot["row"])
+            projected.extend([""] * (len(DASHBOARD_HEADERS) - len(projected)))
+            key = _dashboard_entity_key(projected)
+            if key is None:
+                key = (
+                    "batch" if item.entity_type == "BULK_BATCH" else "application",
+                    item.entity_id,
+                )
+            projected_keys.add(key)
+            matches = groups.get(key, [])
+            if matches:
+                canonical_row_number, canonical = matches[0]
+                merged = _merge_dashboard_rows([row for _, row in matches])
+                row = _apply_dashboard_projection(merged, projected)
+                requests.append(
+                    _dashboard_update_row_request(
+                        sheet_id,
+                        canonical_row_number,
+                        row,
+                        timezone_name=self.timezone_name,
+                    )
+                )
+            else:
+                requests.append(
+                    {
+                        "appendCells": {
+                            "sheetId": sheet_id,
+                            "rows": [
+                                {
+                                    "values": _dashboard_row_cells(
+                                        projected,
+                                        date_value=projected[2] or None,
+                                        timezone_name=self.timezone_name,
+                                    )
+                                }
+                            ],
+                            "fields": (
+                                "userEnteredValue,"
+                                "userEnteredFormat.numberFormat"
+                            ),
+                        }
+                    }
+                )
+
+        duplicate_rows: list[int] = []
+        for key, matches in groups.items():
+            if len(matches) < 2:
+                continue
+            canonical_row_number, _ = matches[0]
+            if key not in projected_keys:
+                merged = _merge_dashboard_rows([row for _, row in matches])
+                requests.append(
+                    _dashboard_update_row_request(
+                        sheet_id,
+                        canonical_row_number,
+                        merged,
+                        timezone_name=self.timezone_name,
+                    )
+                )
+            duplicate_rows.extend(row_number for row_number, _ in matches[1:])
+
+        requests.extend(
+            {
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_number - 1,
+                        "endIndex": row_number,
+                    }
+                }
+            }
+            for row_number in sorted(duplicate_rows, reverse=True)
+        )
+        if requests:
+            api.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={"requests": requests},
+            ).execute()
 
     def _upsert_application(
         self,
@@ -705,13 +851,21 @@ class DashboardSyncService:
         status: str,
         row_link: str,
         final_answer_present: bool = False,
+        submitted_at: datetime | str | None = None,
     ) -> None:
         if not self.spreadsheet_id:
             return
         api = self._get_sheets_api()
         sheet_id = self._ensure_dashboard_sheet(api, DASHBOARD_SHEET_NAME, DASHBOARD_HEADERS)
         rows = self._read_dashboard_rows(api, sheet_id)
-        row = dashboard_row(application, status, final_answer_present, row_link)
+        date_value = submitted_at or application.created_at
+        row = dashboard_row(
+            application,
+            status,
+            final_answer_present,
+            row_link,
+            submitted_at=date_value,
+        )
         row_number = _find_row_by_id(rows, application.application_id or "")
         if row_number is None:
             api.spreadsheets().batchUpdate(
@@ -721,8 +875,19 @@ class DashboardSyncService:
                         {
                             "appendCells": {
                                 "sheetId": sheet_id,
-                                "rows": [{"values": [_cell_data(value) for value in row]}],
-                                "fields": "userEnteredValue",
+                                "rows": [
+                                    {
+                                        "values": _dashboard_row_cells(
+                                            row,
+                                            date_value=date_value,
+                                            timezone_name=self.timezone_name,
+                                        )
+                                    }
+                                ],
+                                "fields": (
+                                    "userEnteredValue,"
+                                    "userEnteredFormat.numberFormat"
+                                ),
                             }
                         }
                     ]
@@ -771,6 +936,7 @@ class DashboardSyncService:
             existing_row=existing_row,
         )
         if row_number is None:
+            date_value = tracked.submitted_at or tracked.created_at
             api.spreadsheets().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={
@@ -778,8 +944,19 @@ class DashboardSyncService:
                         {
                             "appendCells": {
                                 "sheetId": sheet_id,
-                                "rows": [{"values": [_cell_data(value) for value in row]}],
-                                "fields": "userEnteredValue",
+                                "rows": [
+                                    {
+                                        "values": _dashboard_row_cells(
+                                            row,
+                                            date_value=date_value,
+                                            timezone_name=self.timezone_name,
+                                        )
+                                    }
+                                ],
+                                "fields": (
+                                    "userEnteredValue,"
+                                    "userEnteredFormat.numberFormat"
+                                ),
                             }
                         }
                     ]
@@ -802,6 +979,7 @@ class DashboardSyncService:
         final_answer_present: bool = False,
         editors: tuple[str, ...] = (),
     ) -> None:
+        """Создать или обновить единственную строку пачки по batch_id."""
         with self._lock:
             self._upsert_bulk_batch(
                 batch=batch,
@@ -836,6 +1014,7 @@ class DashboardSyncService:
             existing_row=existing_row,
         )
         if row_number is None:
+            date_value = batch.created_at
             api.spreadsheets().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={
@@ -843,8 +1022,19 @@ class DashboardSyncService:
                         {
                             "appendCells": {
                                 "sheetId": sheet_id,
-                                "rows": [{"values": [_cell_data(value) for value in row]}],
-                                "fields": "userEnteredValue",
+                                "rows": [
+                                    {
+                                        "values": _dashboard_row_cells(
+                                            row,
+                                            date_value=date_value,
+                                            timezone_name=self.timezone_name,
+                                        )
+                                    }
+                                ],
+                                "fields": (
+                                    "userEnteredValue,"
+                                    "userEnteredFormat.numberFormat"
+                                ),
                             }
                         }
                     ]
@@ -956,37 +1146,11 @@ class DashboardSyncService:
             spreadsheetId=self.spreadsheet_id,
             range=f"{quote_sheet_name(sheet_name)}!{range_suffix}",
             majorDimension="ROWS",
+            valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
         return result.get("values", [])
 
     def _read_dashboard_rows(self, api: Any, sheet_id: int) -> list[list[Any]]:
-        rows = self._read_rows(api, DASHBOARD_SHEET_NAME, "A:L")
-        duplicate_row_numbers = _dashboard_duplicate_row_numbers(rows)
-        if not duplicate_row_numbers:
-            return rows
-        LOGGER.warning(
-            "Removing duplicate dashboard rows: spreadsheet_id=%s rows=%s",
-            self.spreadsheet_id,
-            duplicate_row_numbers,
-        )
-        api.spreadsheets().batchUpdate(
-            spreadsheetId=self.spreadsheet_id,
-            body={
-                "requests": [
-                    {
-                        "deleteDimension": {
-                            "range": {
-                                "sheetId": sheet_id,
-                                "dimension": "ROWS",
-                                "startIndex": row_number - 1,
-                                "endIndex": row_number,
-                            }
-                        }
-                    }
-                    for row_number in sorted(duplicate_row_numbers, reverse=True)
-                ]
-            },
-        ).execute()
         return self._read_rows(api, DASHBOARD_SHEET_NAME, "A:L")
 
     def _get_sheets_api(self) -> Any:
@@ -1009,6 +1173,7 @@ def target_sheet_name(
     submitted_at: datetime | None = None,
     rollout_schedule: RolloutSchedule = DEFAULT_ROLLOUT_SCHEDULE,
 ) -> str:
+    """Выбрать вкладку по типу ответа, срочности, времени и направлению."""
     direction = draft.direction or ""
     if draft.answer_type == AnswerType.INTEGRATION.value:
         if direction in {Direction.VOICEBOT.value, Direction.COLLECTION.value}:
@@ -1041,7 +1206,12 @@ def week_sheet_name(created_at: str | None = None) -> str:
     return monday.strftime("%d.%m")
 
 
-def draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
+def draft_to_sheet_row(
+    draft: Draft,
+    *,
+    batch_id: str = "",
+    submitted_at: datetime | str | None = None,
+) -> list[Any]:
     return [
         draft.scriptwriter or "",
         draft.intent or "",
@@ -1057,7 +1227,7 @@ def draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
         draft.application_id or "",
         batch_id,
         draft.application_type or ApplicationType.SINGLE.value,
-        draft.created_at,
+        submitted_at or draft.created_at,
         draft.direction or "",
         draft.answer_type or "",
         bool_to_sheet_value(draft.is_urgent),
@@ -1070,12 +1240,17 @@ def draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
     ]
 
 
-def _current_draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
+def _current_draft_to_sheet_row(
+    draft: Draft,
+    *,
+    batch_id: str = "",
+    submitted_at: datetime | str | None = None,
+) -> list[Any]:
     return [
         draft.application_id or "",
         batch_id,
         draft.application_type or ApplicationType.SINGLE.value,
-        draft.created_at,
+        submitted_at or draft.created_at,
         draft.direction or "",
         draft.answer_type or "",
         bool_to_sheet_value(draft.is_urgent),
@@ -1098,8 +1273,17 @@ def _current_draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any
     ]
 
 
-def _legacy_draft_to_sheet_row(draft: Draft, *, batch_id: str = "") -> list[Any]:
-    row = _current_draft_to_sheet_row(draft, batch_id=batch_id)
+def _legacy_draft_to_sheet_row(
+    draft: Draft,
+    *,
+    batch_id: str = "",
+    submitted_at: datetime | str | None = None,
+) -> list[Any]:
+    row = _current_draft_to_sheet_row(
+        draft,
+        batch_id=batch_id,
+        submitted_at=submitted_at,
+    )
     del row[10]
     return row
 
@@ -1109,11 +1293,13 @@ def dashboard_row(
     status: str,
     final_answer_present: bool,
     row_link: str,
+    *,
+    submitted_at: datetime | str | None = None,
 ) -> list[Any]:
     return [
         draft.application_id or "",
         "",
-        draft.created_at,
+        submitted_at or draft.created_at,
         draft.direction or "",
         draft.application_type or ApplicationType.SINGLE.value,
         draft.answer_type or "",
@@ -1139,7 +1325,7 @@ def dashboard_tracked_row(
     return [
         tracked.application_id,
         current.batch_id or tracked.batch_id or existing[1],
-        existing[2] or tracked.created_at,
+        existing[2] or tracked.submitted_at or tracked.created_at,
         current.direction or tracked.direction or existing[3],
         tracked.application_type or existing[4],
         current.answer_type or tracked.answer_type or existing[5],
@@ -1204,35 +1390,63 @@ def _sheet_value_is_yes(value: Any) -> bool:
 
 def _repair_sheet_bool(value: Any) -> str:
     text = str(value or "").strip()
-    yes = "\u0414\u0430"
-    no = "\u041d\u0435\u0442"
-    if text in {yes, "??", "????", "????", "?????????", "??", "????"}:
-        return yes
-    if text in {no, "???", "??????", "??????", "?????????????", "???", "??????"}:
-        return no
+    normalized_candidates = {
+        candidate.casefold()
+        for candidate in _mojibake_candidates(text)
+    }
+    if normalized_candidates & {"да", "yes", "true", "1"} or text == "??":
+        return "Да"
+    if normalized_candidates & {"нет", "no", "false", "0"} or text == "???":
+        return "Нет"
     return text
 
 
 def _repair_dashboard_headers(values: list[Any]) -> list[str]:
-    return [_repair_mojibake_text(value) for value in values]
+    if len(values) != len(DASHBOARD_HEADERS):
+        return [str(value or "").strip() for value in values]
+
+    repaired: list[str] = []
+    for value, expected in zip(values, DASHBOARD_HEADERS, strict=True):
+        text = str(value or "").strip()
+        if expected in _mojibake_candidates(text) or _is_question_mark_fingerprint(text, expected):
+            repaired.append(expected)
+        else:
+            repaired.append(text)
+    return repaired
 
 
-def _repair_mojibake_text(value: Any) -> str:
-    text = str(value or "").strip()
-    replacements = {
-        "ID ????????????": "ID ??????",
-        "ID ??????????": "ID ?????",
-        "???????? ????????????": "???? ??????",
-        "??????????????????????": "???????????",
-        "?????? ????????????": "??? ??????",
-        "?????? ????????????": "??? ??????",
-        "??????????????": "???????",
-        "?????????? ????????????": "????? ??????",
-        "????????????": "??????",
-        "???????????????? ?????????? ????????": "???????? ????? ????",
-        "???????????? ???? ?????????????? ????????????": "?????? ?? ??????? ??????",
-    }
-    return replacements.get(text, text)
+def _mojibake_candidates(text: str) -> set[str]:
+    candidates = {text}
+    frontier = {text}
+    for _ in range(2):
+        next_frontier: set[str] = set()
+        for candidate in frontier:
+            for encoding in ("cp1251", "latin1"):
+                try:
+                    repaired = candidate.encode(encoding).decode("utf-8")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    continue
+                if repaired not in candidates:
+                    candidates.add(repaired)
+                    next_frontier.add(repaired)
+        frontier = next_frontier
+        if not frontier:
+            break
+    return candidates
+
+
+def _is_question_mark_fingerprint(value: str, expected: str) -> bool:
+    if "?" not in value:
+        return False
+    if any(character not in {"?", " ", "/", "I", "D", "L", "M"} for character in value):
+        return False
+    if len(value) != len(expected):
+        return False
+    return all(
+        actual == wanted
+        or (actual == "?" and wanted.isalpha())
+        for actual, wanted in zip(value, expected, strict=True)
+    )
 
 
 def _draft_to_row_data(
@@ -1241,18 +1455,39 @@ def _draft_to_row_data(
     batch_id: str = "",
     application_editors: tuple[str, ...] = (),
     schema: str = "new",
+    submitted_at: datetime | str | None = None,
+    timezone_name: str = DEFAULT_TIMEZONE,
 ) -> dict[str, Any]:
     layout = _worksheet_schema_layout(schema)
     if schema == "new":
-        row = draft_to_sheet_row(draft, batch_id=batch_id)
+        row = draft_to_sheet_row(
+            draft,
+            batch_id=batch_id,
+            submitted_at=submitted_at,
+        )
     elif schema == "current":
-        row = _current_draft_to_sheet_row(draft, batch_id=batch_id)
+        row = _current_draft_to_sheet_row(
+            draft,
+            batch_id=batch_id,
+            submitted_at=submitted_at,
+        )
     else:
-        row = _legacy_draft_to_sheet_row(draft, batch_id=batch_id)
+        row = _legacy_draft_to_sheet_row(
+            draft,
+            batch_id=batch_id,
+            submitted_at=submitted_at,
+        )
     cells: list[dict[str, Any]] = []
     for index, value in enumerate(row):
         if index == layout["telegram_id"]:
             cells.append(_number_cell_data(value))
+        elif index == layout["date"]:
+            cells.append(
+                google_sheets_date_cell(
+                    value,
+                    timezone_name=timezone_name,
+                )
+            )
         elif index == layout["status"]:
             cells.append(_status_cell_data(ApplicationStatus.NEW.value))
         elif index == layout["source_text"]:
@@ -1269,6 +1504,7 @@ def _draft_to_row_data(
 def _worksheet_schema_layout(schema: str) -> dict[str, Any]:
     layouts = {
         "new": {
+            "date": 14,
             "status": 9,
             "editor": 10,
             "source_text": 4,
@@ -1277,6 +1513,7 @@ def _worksheet_schema_layout(schema: str) -> dict[str, Any]:
             "end_column": "X",
         },
         "current": {
+            "date": 3,
             "status": 9,
             "editor": 10,
             "source_text": 16,
@@ -1285,6 +1522,7 @@ def _worksheet_schema_layout(schema: str) -> dict[str, Any]:
             "end_column": "W",
         },
         "legacy": {
+            "date": 3,
             "status": 9,
             "editor": -1,
             "source_text": 15,
@@ -1335,6 +1573,120 @@ def _cell_data(value: Any) -> dict[str, Any]:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return _number_cell_data(value)
     return {"userEnteredValue": {"stringValue": str(value)}}
+
+
+def _dashboard_row_cells(
+    row: list[Any],
+    *,
+    date_value: datetime | str | None,
+    timezone_name: str,
+) -> list[dict[str, Any]]:
+    cells = [_cell_data(value) for value in row]
+    if isinstance(date_value, (int, float)):
+        cells[2] = {
+            "userEnteredValue": {"numberValue": date_value},
+            "userEnteredFormat": {
+                "numberFormat": {
+                    "type": "DATE_TIME",
+                    "pattern": "dd.MM.yyyy hh:mm",
+                }
+            },
+        }
+    elif date_value:
+        cells[2] = google_sheets_date_cell(date_value, timezone_name=timezone_name)
+    return cells
+
+
+def dashboard_projection(row: list[Any]) -> dict[str, Any]:
+    return {"row": list(row[: len(DASHBOARD_HEADERS)])}
+
+
+def _dashboard_entity_key(row: list[Any]) -> tuple[str, str] | None:
+    application_id = _cell(row, 0).strip()
+    batch_id = _cell(row, 1).strip()
+    if batch_id and application_id in {"", "Пачка"}:
+        return "batch", batch_id
+    if application_id:
+        return "application", application_id
+    return None
+
+
+def _dashboard_row_groups(
+    rows: list[list[Any]],
+) -> dict[tuple[str, str], list[tuple[int, list[Any]]]]:
+    groups: dict[tuple[str, str], list[tuple[int, list[Any]]]] = {}
+    for row_number, row in enumerate(rows[1:], start=2):
+        key = _dashboard_entity_key(row)
+        if key is not None:
+            groups.setdefault(key, []).append((row_number, list(row)))
+    return groups
+
+
+def _merge_dashboard_rows(rows: list[list[Any]]) -> list[Any]:
+    normalized = [list(row) + [""] * (len(DASHBOARD_HEADERS) - len(row)) for row in rows]
+    merged = ["" for _ in DASHBOARD_HEADERS]
+    for index in (0, 1, 2, 3, 4, 5, 6, 7, 11):
+        merged[index] = next(
+            (row[index] for row in normalized if str(row[index]).strip()),
+            "",
+        )
+    for index in (8, 9):
+        merged[index] = next(
+            (row[index] for row in reversed(normalized) if str(row[index]).strip()),
+            "",
+        )
+    merged[10] = (
+        "Да"
+        if any(_sheet_value_is_yes(row[10]) for row in normalized)
+        else next(
+            (row[10] for row in reversed(normalized) if str(row[10]).strip()),
+            "Нет",
+        )
+    )
+    return merged
+
+
+def _apply_dashboard_projection(existing: list[Any], projected: list[Any]) -> list[Any]:
+    result = list(existing) + [""] * (len(DASHBOARD_HEADERS) - len(existing))
+    for index, value in enumerate(projected[: len(DASHBOARD_HEADERS)]):
+        if index == 10:
+            result[index] = bool_to_sheet_value(
+                _sheet_value_is_yes(result[index]) or _sheet_value_is_yes(value)
+            )
+            continue
+        if value not in (None, "") or index in {8, 9, 10, 11}:
+            result[index] = value
+    return result
+
+
+def _dashboard_update_row_request(
+    sheet_id: int,
+    row_number: int,
+    row: list[Any],
+    *,
+    timezone_name: str,
+) -> dict[str, Any]:
+    return {
+        "updateCells": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": row_number - 1,
+                "endRowIndex": row_number,
+                "startColumnIndex": 0,
+                "endColumnIndex": len(DASHBOARD_HEADERS),
+            },
+            "rows": [
+                {
+                    "values": _dashboard_row_cells(
+                        row,
+                        date_value=row[2] or None,
+                        timezone_name=timezone_name,
+                    )
+                }
+            ],
+            "fields": "userEnteredValue,userEnteredFormat.numberFormat",
+        }
+    }
 
 
 def _number_cell_data(value: Any) -> dict[str, Any]:

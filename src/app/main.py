@@ -26,6 +26,7 @@ from app.submission import (
 
 
 async def main() -> None:
+    """Собрать зависимости и запустить Telegram и status polling."""
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
     if not settings.telegram_bot_token:
@@ -89,6 +90,7 @@ async def main() -> None:
             spreadsheet_id=settings.google_dashboard_spreadsheet_id,
             credentials_path=settings.google_credentials_path,
             application_editors=settings.application_editors,
+            timezone_name=settings.rollout_schedule.timezone_name,
         )
         if settings.google_dashboard_spreadsheet_id
         else None
@@ -125,6 +127,7 @@ async def main() -> None:
             dashboard_spreadsheet_id=settings.google_dashboard_spreadsheet_id,
             credentials_path=settings.google_credentials_path,
             rollout_schedule=settings.rollout_schedule,
+            timezone_name=settings.rollout_schedule.timezone_name,
             application_editors=settings.application_editors,
             dashboard_sync=dashboard_sync,
             google_api_retry=settings.google_api_retry,
@@ -136,8 +139,12 @@ async def main() -> None:
             application_editors=settings.application_editors,
             reserved_rows=settings.bulk_reserved_rows,
             google_api_retry=settings.google_api_retry,
+            timezone_name=settings.rollout_schedule.timezone_name,
         ),
         bulk_registrar=bulk_registrar,
+        bulk_reserved_rows=settings.bulk_reserved_rows,
+        bulk_creation_stale_seconds=settings.bulk_creation_stale_seconds,
+        dashboard_enabled=bool(settings.google_dashboard_spreadsheet_id),
     )
 
     session = AiohttpSession(
@@ -163,8 +170,31 @@ async def main() -> None:
                     dashboard_sync_interval_seconds=(
                         settings.dashboard_sync_interval_seconds
                     ),
+                    completed_bulk_dashboard_scan_interval_seconds=(
+                        settings.completed_bulk_dashboard_scan_interval_seconds
+                    ),
+                    dashboard_outbox_retry_base_seconds=(
+                        settings.dashboard_outbox_retry_base_seconds
+                    ),
+                    dashboard_outbox_retry_max_seconds=(
+                        settings.dashboard_outbox_retry_max_seconds
+                    ),
+                    dashboard_outbox_sending_stale_seconds=(
+                        settings.dashboard_outbox_sending_stale_seconds
+                    ),
+                    google_api_retry=settings.google_api_retry,
                     notifier=bot,
                     fallback_spreadsheet_id=settings.google_dashboard_spreadsheet_id,
+                    notification_max_attempts=settings.notification_max_attempts,
+                    notification_retry_base_seconds=(
+                        settings.notification_retry_base_seconds
+                    ),
+                    notification_sending_stale_seconds=(
+                        settings.notification_sending_stale_seconds
+                    ),
+                    notification_message_max_chars=(
+                        settings.notification_message_max_chars
+                    ),
                 ),
                 interval_seconds=settings.status_polling_interval_seconds,
                 heartbeat_path=settings.status_polling_heartbeat_path,
