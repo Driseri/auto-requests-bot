@@ -296,7 +296,65 @@ async def test_submitted_applications_are_saved_listed_and_updated(tmp_path):
     assert first.last_seen_editor == "редактор 1"
     assert first.last_seen_editor_comment == "Можно использовать"
     assert first.submitted_at == "2026-06-15T10:30:00+00:00"
+    assert first.polling_state == "ACTIVE"
+    assert first.not_found_count == 0
     assert {item.application_id for item in tracked} == {"A1B2C3D4", "B1C2D3E4"}
+
+
+@pytest.mark.asyncio
+async def test_submitted_application_not_found_is_deferred_and_reset(tmp_path):
+    repository = DraftRepository(str(tmp_path / "submitted_not_found.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        sheet_name="Высокий",
+        last_known_status=ApplicationStatus.NEW.value,
+    )
+
+    await repository.mark_submitted_application_not_found(
+        "A1B2C3D4",
+        threshold=2,
+        recheck_seconds=3600,
+    )
+    first = await repository.get_submitted_application("A1B2C3D4")
+    assert first is not None
+    assert first.polling_state == "ACTIVE"
+    assert first.not_found_count == 1
+    assert first.next_status_check_at is None
+
+    await repository.mark_submitted_application_not_found(
+        "A1B2C3D4",
+        threshold=2,
+        recheck_seconds=3600,
+    )
+    deferred = await repository.get_submitted_application("A1B2C3D4")
+    listed = await repository.list_submitted_applications()
+    listed_with_deferred = await repository.list_submitted_applications(
+        include_deferred=True
+    )
+
+    assert deferred is not None
+    assert deferred.polling_state == "NOT_FOUND"
+    assert deferred.not_found_count == 2
+    assert deferred.next_status_check_at is not None
+    assert listed == []
+    assert [item.application_id for item in listed_with_deferred] == ["A1B2C3D4"]
+
+    await repository.update_submitted_application_status(
+        "A1B2C3D4",
+        sheet_name="Высокий",
+        last_known_status=ApplicationStatus.ACCEPTED.value,
+        last_seen_row_number=5,
+    )
+    reset = await repository.get_submitted_application("A1B2C3D4")
+    listed_after_reset = await repository.list_submitted_applications()
+
+    assert reset is not None
+    assert reset.polling_state == "ACTIVE"
+    assert reset.not_found_count == 0
+    assert reset.next_status_check_at is None
+    assert [item.application_id for item in listed_after_reset] == ["A1B2C3D4"]
 
 
 @pytest.mark.asyncio

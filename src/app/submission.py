@@ -10,7 +10,7 @@ from threading import RLock
 from typing import Any, Callable, Protocol
 
 from app.formatting import build_text_format_runs, deserialize_formatting_spans
-from app.google_api import GoogleApiRetryConfig, execute_with_retry
+from app.google_api import GoogleApiRetryConfig, execute_with_retry_async
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -292,8 +292,7 @@ class GoogleSheetsSubmissionService:
         )
         try:
             async with lock:
-                result = await asyncio.to_thread(
-                    execute_with_retry,
+                result = await execute_with_retry_async(
                     lambda: self._submit_sync(
                         application,
                         submitted_at,

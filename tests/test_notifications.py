@@ -382,13 +382,91 @@ async def test_status_reader_reads_only_tracked_application_sheets():
                 sheet_id=100,
                 sheet_name=WEEK_SHEET,
                 last_known_status=ApplicationStatus.NEW.value,
+                last_seen_row_number=2,
             )
         ]
     )
 
     assert set(statuses) == {"A1B2C3D4"}
-    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A:X"]
+    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A1:X2"]
     assert api.metadata_get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_status_reader_does_not_accept_mismatched_expected_row():
+    api = FakeSheetsApi(
+        rows={
+            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A4:X5"): [
+                SHEET_HEADERS,
+                app_row("OTHER001", status=ApplicationStatus.ACCEPTED.value),
+            ],
+            (FL_SPREADSHEET, WEEK_SHEET): [
+                SHEET_HEADERS,
+                app_row("A1B2C3D4", status=ApplicationStatus.ACCEPTED.value),
+            ],
+        }
+    )
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    tracked = [
+        SubmittedApplication(
+            application_id="A1B2C3D4",
+            telegram_user_id=100,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_id=100,
+            sheet_name=WEEK_SHEET,
+            last_known_status=ApplicationStatus.NEW.value,
+            last_seen_row_number=5,
+        )
+    ]
+
+    statuses = await reader.read_statuses_for(tracked)
+
+    assert statuses == {}
+    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A4:X5"]
+
+
+@pytest.mark.asyncio
+async def test_status_reader_uses_full_sheet_only_for_fallback():
+    api = FakeSheetsApi(
+        rows={
+            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A4:X5"): [
+                SHEET_HEADERS,
+                app_row("OTHER001", status=ApplicationStatus.ACCEPTED.value),
+            ],
+            (FL_SPREADSHEET, WEEK_SHEET): [
+                SHEET_HEADERS,
+                app_row("A1B2C3D4", status=ApplicationStatus.ACCEPTED.value),
+            ],
+        }
+    )
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    tracked = [
+        SubmittedApplication(
+            application_id="A1B2C3D4",
+            telegram_user_id=100,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_id=100,
+            sheet_name=WEEK_SHEET,
+            last_known_status=ApplicationStatus.NEW.value,
+            last_seen_row_number=5,
+        )
+    ]
+
+    statuses = await reader.read_statuses_for(tracked, fallback_full_scan=True)
+
+    assert set(statuses) == {"A1B2C3D4"}
+    assert [call["range"] for call in api.value_get_calls] == [
+        f"'{WEEK_SHEET}'!A4:X5",
+        f"'{WEEK_SHEET}'!A:X",
+    ]
 
 
 @pytest.mark.asyncio
@@ -711,6 +789,42 @@ async def test_notification_service_updates_non_important_status_without_message
     assert tracked is not None
     assert tracked.last_known_status == ApplicationStatus.IN_PROGRESS.value
     assert tracked.last_seen_row_number == 5
+
+
+@pytest.mark.asyncio
+async def test_notification_service_defers_repeatedly_missing_tracking(tmp_path):
+    repository = DraftRepository(str(tmp_path / "missing_tracking.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=2,
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({}),
+        notifier=FakeNotifier(),
+        status_not_found_threshold=2,
+        status_not_found_recheck_seconds=3600,
+    )
+
+    await service.run_once()
+    await service.run_once()
+
+    deferred = await repository.get_submitted_application("A1B2C3D4")
+    due = await repository.list_submitted_applications()
+    all_tracked = await repository.list_submitted_applications(include_deferred=True)
+
+    assert deferred is not None
+    assert deferred.polling_state == "NOT_FOUND"
+    assert deferred.not_found_count == 2
+    assert deferred.next_status_check_at is not None
+    assert due == []
+    assert [item.application_id for item in all_tracked] == ["A1B2C3D4"]
 
 
 @pytest.mark.asyncio

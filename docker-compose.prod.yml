@@ -10,6 +10,7 @@ services:
       SQLITE_PATH: /data/app.db
       GOOGLE_CREDENTIALS_PATH: /run/secrets/google_credentials.json
       STATUS_POLLING_HEARTBEAT_PATH: /data/status-polling-heartbeat.json
+      MALLOC_ARENA_MAX: "2"
       TZ: ${BOT_TIMEZONE:-Europe/Moscow}
     volumes:
       - bot-data:/data

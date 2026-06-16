@@ -13,7 +13,7 @@ from typing import Any, Callable, Protocol
 from aiogram.types import LinkPreviewOptions
 from googleapiclient.errors import HttpError
 
-from app.google_api import GoogleApiRetryConfig, execute_with_retry
+from app.google_api import GoogleApiRetryConfig, execute_with_retry_async
 from app.keyboards import build_keyboard
 from app.health import write_heartbeat
 from app.bulk import (
@@ -192,8 +192,7 @@ class GoogleSheetsStatusReader:
         )
 
     async def _run_with_retry(self, operation: Callable[[], Any], operation_id: str) -> Any:
-        return await asyncio.to_thread(
-            execute_with_retry,
+        return await execute_with_retry_async(
             operation,
             config=self.google_api_retry,
             operation_id=operation_id,
@@ -257,28 +256,16 @@ class GoogleSheetsStatusReader:
             sheet_id = next((item.sheet_id for item in group if item.sheet_id is not None), None)
             if sheet_id is None:
                 sheet_id = self._read_sheet_ids(api, spreadsheet_id).get(sheet_name)
-            rows = self._read_sheet_rows(api, spreadsheet_id, sheet_name)
-            wanted_ids = {item.application_id for item in group}
-            for index, row, layout in _working_data_rows(rows):
-                application_id = _cell(row, layout["application_id"]).strip()
-                if application_id not in wanted_ids:
-                    continue
-                result[application_id] = SheetApplicationStatus(
-                    application_id=application_id,
+            for application in group:
+                current = self._read_expected_application_status(
+                    api,
+                    application,
                     spreadsheet_id=spreadsheet_id,
-                    batch_id=_cell(row, layout["batch_id"]).strip() or None,
                     sheet_name=sheet_name,
                     sheet_id=sheet_id or 0,
-                    row_number=index,
-                    direction=_cell(row, layout["direction"]).strip() or None,
-                    answer_type=_cell(row, layout["answer_type"]).strip() or None,
-                    is_urgent=_sheet_bool(_cell(row, layout["is_urgent"])),
-                    status=_cell(row, layout["status"]).strip(),
-                    editor=_cell(row, layout["editor"]).strip(),
-                    editor_comment=_cell(row, layout["comment"]).strip(),
-                    final_answer=_cell(row, layout["final_answer"]).strip(),
-                    end_column=layout["end_column"],
                 )
+                if current is not None:
+                    result[current.application_id] = current
 
         missing_ids = {
             item.application_id
@@ -290,12 +277,64 @@ class GoogleSheetsStatusReader:
                 "Running fallback full scan for missing applications: count=%s",
                 len(missing_ids),
             )
-            full_scan = self._read_statuses_sync()
-            for application_id in missing_ids:
-                current = full_scan.get(application_id)
-                if current is not None:
-                    result[application_id] = current
+            for (spreadsheet_id, sheet_name), group in grouped.items():
+                wanted_ids = {item.application_id for item in group} & missing_ids
+                if not wanted_ids:
+                    continue
+                sheet_id = next(
+                    (item.sheet_id for item in group if item.sheet_id is not None),
+                    None,
+                )
+                if sheet_id is None:
+                    sheet_id = self._read_sheet_ids(api, spreadsheet_id).get(sheet_name)
+                rows = self._read_sheet_rows(api, spreadsheet_id, sheet_name)
+                for index, row, layout in _working_data_rows(rows):
+                    application_id = _cell(row, layout["application_id"]).strip()
+                    if application_id not in wanted_ids:
+                        continue
+                    result[application_id] = _status_from_working_row(
+                        application_id=application_id,
+                        spreadsheet_id=spreadsheet_id,
+                        sheet_name=sheet_name,
+                        sheet_id=sheet_id or 0,
+                        row_number=index,
+                        row=row,
+                        layout=layout,
+                    )
         return result
+
+    def _read_expected_application_status(
+        self,
+        api: Any,
+        application: SubmittedApplication,
+        *,
+        spreadsheet_id: str,
+        sheet_name: str,
+        sheet_id: int,
+    ) -> SheetApplicationStatus | None:
+        row_number = application.last_seen_row_number
+        if row_number is None or row_number <= 1:
+            return None
+        rows = self._read_sheet_range(
+            api,
+            spreadsheet_id,
+            sheet_name,
+            f"A{row_number - 1}:X{row_number}",
+        )
+        for index, row, layout in _working_data_rows(rows, start_row=row_number - 1):
+            application_id = _cell(row, layout["application_id"]).strip()
+            if application_id != application.application_id:
+                continue
+            return _status_from_working_row(
+                application_id=application_id,
+                spreadsheet_id=spreadsheet_id,
+                sheet_name=sheet_name,
+                sheet_id=sheet_id,
+                row_number=index,
+                row=row,
+                layout=layout,
+            )
+        return None
 
     def _read_bulk_application_statuses_sync(
         self,
@@ -541,9 +580,18 @@ class GoogleSheetsStatusReader:
         return result
 
     def _read_sheet_rows(self, api: Any, spreadsheet_id: str, sheet_name: str) -> list[list[Any]]:
+        return self._read_sheet_range(api, spreadsheet_id, sheet_name, "A:X")
+
+    @staticmethod
+    def _read_sheet_range(
+        api: Any,
+        spreadsheet_id: str,
+        sheet_name: str,
+        range_suffix: str,
+    ) -> list[list[Any]]:
         response = api.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!A:X",
+            range=f"{quote_sheet_name(sheet_name)}!{range_suffix}",
             majorDimension="ROWS",
         ).execute()
         return response.get("values", [])
@@ -581,6 +629,8 @@ class StatusNotificationService:
         notification_retry_base_seconds: int = 30,
         notification_sending_stale_seconds: int = 300,
         notification_message_max_chars: int = 3500,
+        status_not_found_threshold: int = 20,
+        status_not_found_recheck_seconds: int = 3600,
         clock: Callable[[], float] = monotonic,
     ) -> None:
         self.repository = repository
@@ -602,6 +652,8 @@ class StatusNotificationService:
         self.notification_retry_base_seconds = notification_retry_base_seconds
         self.notification_sending_stale_seconds = notification_sending_stale_seconds
         self.notification_message_max_chars = notification_message_max_chars
+        self.status_not_found_threshold = status_not_found_threshold
+        self.status_not_found_recheck_seconds = status_not_found_recheck_seconds
         self.clock = clock
         self._last_dashboard_sync_at: float | None = None
         self._last_completed_bulk_scan_at: float | None = None
@@ -656,10 +708,20 @@ class StatusNotificationService:
         for application in tracked:
             current = statuses.get(application.application_id)
             if current is None:
-                LOGGER.info(
-                    "Tracked application not found in direction sheets: application_id=%s",
+                await self.repository.mark_submitted_application_not_found(
                     application.application_id,
+                    threshold=self.status_not_found_threshold,
+                    recheck_seconds=self.status_not_found_recheck_seconds,
                 )
+                next_count = application.not_found_count + 1
+                if next_count <= self.status_not_found_threshold:
+                    LOGGER.info(
+                        "Tracked application not found in direction sheets: "
+                        "application_id=%s not_found_count=%s threshold=%s",
+                        application.application_id,
+                        next_count,
+                        self.status_not_found_threshold,
+                    )
                 continue
 
             status_changed = bool(current.status) and current.status != application.last_known_status
@@ -934,8 +996,7 @@ class StatusNotificationService:
         if not items:
             return
         try:
-            await asyncio.to_thread(
-                execute_with_retry,
+            await execute_with_retry_async(
                 lambda: self.dashboard_sync.sync_projections(items),
                 config=self.google_api_retry,
                 operation_id="dashboard-outbox-batch",
@@ -1356,6 +1417,34 @@ def _fit_html_block(block: str, max_chars: int) -> str:
     return f"{shortened}{suffix}"
 
 
+def _status_from_working_row(
+    *,
+    application_id: str,
+    spreadsheet_id: str,
+    sheet_name: str,
+    sheet_id: int,
+    row_number: int,
+    row: list[Any],
+    layout: dict[str, Any],
+) -> SheetApplicationStatus:
+    return SheetApplicationStatus(
+        application_id=application_id,
+        spreadsheet_id=spreadsheet_id,
+        batch_id=_cell(row, layout["batch_id"]).strip() or None,
+        sheet_name=sheet_name,
+        sheet_id=sheet_id,
+        row_number=row_number,
+        direction=_cell(row, layout["direction"]).strip() or None,
+        answer_type=_cell(row, layout["answer_type"]).strip() or None,
+        is_urgent=_sheet_bool(_cell(row, layout["is_urgent"])),
+        status=_cell(row, layout["status"]).strip(),
+        editor=_cell(row, layout["editor"]).strip(),
+        editor_comment=_cell(row, layout["comment"]).strip(),
+        final_answer=_cell(row, layout["final_answer"]).strip(),
+        end_column=layout["end_column"],
+    )
+
+
 def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
     headers = [str(value).strip() for value in header_row]
     if headers[: len(WORKSHEET_HEADERS)] == WORKSHEET_HEADERS:
@@ -1405,10 +1494,12 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
 
 def _working_data_rows(
     rows: list[list[Any]],
+    *,
+    start_row: int = 1,
 ) -> list[tuple[int, list[Any], dict[str, Any]]]:
     result: list[tuple[int, list[Any], dict[str, Any]]] = []
     active_layout: dict[str, Any] | None = None
-    for row_number, row in enumerate(rows, start=1):
+    for row_number, row in enumerate(rows, start=start_row):
         row_layout = _working_row_layout(row)
         if row_layout is not None:
             active_layout = row_layout

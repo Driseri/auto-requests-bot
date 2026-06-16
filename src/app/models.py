@@ -187,6 +187,11 @@ class DashboardEntityType(StrEnum):
     BULK_BATCH = "BULK_BATCH"
 
 
+class StatusPollingState(StrEnum):
+    ACTIVE = "ACTIVE"
+    NOT_FOUND = "NOT_FOUND"
+
+
 class BulkCreationState(StrEnum):
     AWAITING_DIRECTION = "AWAITING_DIRECTION"
     BULK_CREATING = "BULK_CREATING"
@@ -333,6 +338,10 @@ class SubmittedApplication:
     last_seen_editor_comment: str | None = None
     last_seen_final_answer: str | None = None
     submitted_at: str | None = None
+    polling_state: str = StatusPollingState.ACTIVE.value
+    not_found_count: int = 0
+    last_not_found_at: str | None = None
+    next_status_check_at: str | None = None
     created_at: str = ""
     updated_at: str = ""
 

@@ -67,6 +67,8 @@ GIGACHAT_SHOW_RESPONSE_JSON=false
 STATUS_POLLING_ENABLED=true
 STATUS_POLLING_INTERVAL_SECONDS=30
 STATUS_POLLING_HEARTBEAT_PATH=/data/status-polling-heartbeat.json
+STATUS_NOT_FOUND_THRESHOLD=20
+STATUS_NOT_FOUND_RECHECK_SECONDS=3600
 STATUS_POLLING_HEARTBEAT_MAX_AGE_SECONDS=180
 
 HEALTH_EXTERNAL_CHECK_INTERVAL_SECONDS=300
@@ -104,6 +106,10 @@ docker compose up -d --force-recreate bot
 ```
 
 Пересборка образа для изменения только конфигурации не требуется.
+
+`MALLOC_ARENA_MAX=2` задается в Compose для основного контейнера `bot`.
+Это ограничивает рост аллокатора памяти при фоновых Google API запросах и не
+требует отдельной настройки в `.env`.
 
 ### Обязательные Переменные
 
@@ -176,6 +182,8 @@ Google-таблицы создаются администратором вруч
 | `STATUS_POLLING_ENABLED` | Для production оставлять `true`. При `false` бот не отслеживает изменения статусов, не отправляет фоновые уведомления и не обновляет дашборд по изменениям таблиц. |
 | `STATUS_POLLING_INTERVAL_SECONDS` | `30` для пилота. Меньшее значение быстрее обнаруживает изменения, но чаще обращается к Google API. |
 | `STATUS_POLLING_HEARTBEAT_PATH` | В Docker оставлять `/data/status-polling-heartbeat.json`. |
+| `STATUS_NOT_FOUND_THRESHOLD` | `20`: сколько последовательных polling-циклов заявка может не находиться в Google Sheets, прежде чем она уйдет в редкую перепроверку. |
+| `STATUS_NOT_FOUND_RECHECK_SECONDS` | `3600`: как часто повторно проверять долго не найденные заявки. Это снижает нагрузку и шум в логах, но сохраняет восстановление, если строка появится снова. |
 | `STATUS_POLLING_HEARTBEAT_MAX_AGE_SECONDS` | Рекомендуется не меньше `max(180, STATUS_POLLING_INTERVAL_SECONDS * 3)`. |
 
 Heartbeat обновляется только после полностью успешного polling-цикла. Поэтому слишком

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from app.google_api import GoogleApiRetryConfig, execute_with_retry
+from app.google_api import GoogleApiRetryConfig, execute_with_retry_async
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -212,8 +212,7 @@ class GoogleSheetsBulkBatchService:
                 existing_batches = await self.repository.list_bulk_batches()
                 batch_id = batch_id or generate_batch_id()
                 created_at = self.clock()
-                batch, insert_url = await asyncio.to_thread(
-                    execute_with_retry,
+                batch, insert_url = await execute_with_retry_async(
                     lambda: self._create_batch_sync(
                         telegram_user_id,
                         direction,
@@ -681,8 +680,7 @@ class BulkApplicationRegistrar:
         )
 
     async def _run_google(self, operation, operation_id: str):
-        return await asyncio.to_thread(
-            execute_with_retry,
+        return await execute_with_retry_async(
             operation,
             config=self.google_api_retry,
             operation_id=operation_id,
@@ -690,7 +688,9 @@ class BulkApplicationRegistrar:
         )
 
     async def _batch_editors(self, batch_id: str) -> tuple[str, ...]:
-        applications = await self.repository.list_submitted_applications()
+        applications = await self.repository.list_submitted_applications(
+            include_deferred=True
+        )
         return tuple(
             application.last_seen_editor or EDITOR_NOT_SELECTED
             for application in applications

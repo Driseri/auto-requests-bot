@@ -19,6 +19,7 @@ from app.models import (
     Draft,
     NotificationOutboxItem,
     NotificationOutboxState,
+    StatusPollingState,
     Step,
     SubmissionState,
     SubmittedApplication,
@@ -129,6 +130,10 @@ class DraftRepository:
                     last_seen_editor_comment TEXT,
                     last_seen_final_answer TEXT,
                     submitted_at TEXT,
+                    polling_state TEXT NOT NULL DEFAULT 'ACTIVE',
+                    not_found_count INTEGER NOT NULL DEFAULT 0,
+                    last_not_found_at TEXT,
+                    next_status_check_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -144,6 +149,18 @@ class DraftRepository:
             await self._ensure_submitted_applications_column(db, "last_seen_final_answer", "TEXT")
             await self._ensure_submitted_applications_column(db, "last_seen_editor", "TEXT")
             await self._ensure_submitted_applications_column(db, "submitted_at", "TEXT")
+            await self._ensure_submitted_applications_column(
+                db,
+                "polling_state",
+                "TEXT NOT NULL DEFAULT 'ACTIVE'",
+            )
+            await self._ensure_submitted_applications_column(
+                db,
+                "not_found_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            await self._ensure_submitted_applications_column(db, "last_not_found_at", "TEXT")
+            await self._ensure_submitted_applications_column(db, "next_status_check_at", "TEXT")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bulk_batches (
@@ -552,6 +569,10 @@ class DraftRepository:
                         excluded.last_seen_row_number,
                         submitted_applications.last_seen_row_number
                     ),
+                    polling_state = ?,
+                    not_found_count = 0,
+                    last_not_found_at = NULL,
+                    next_status_check_at = NULL,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -569,6 +590,7 @@ class DraftRepository:
                     submitted_at,
                     now,
                     now,
+                    StatusPollingState.ACTIVE.value,
                 ),
             )
             await db.execute(
@@ -739,6 +761,10 @@ class DraftRepository:
                         submitted_applications.submitted_at,
                         excluded.submitted_at
                     ),
+                    polling_state = ?,
+                    not_found_count = 0,
+                    last_not_found_at = NULL,
+                    next_status_check_at = NULL,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -760,6 +786,7 @@ class DraftRepository:
                     submitted_at,
                     now,
                     now,
+                    StatusPollingState.ACTIVE.value,
                 ),
             )
             await db.commit()
@@ -782,12 +809,29 @@ class DraftRepository:
             await cursor.close()
         return self._submitted_from_row(row) if row is not None else None
 
-    async def list_submitted_applications(self) -> list[SubmittedApplication]:
+    async def list_submitted_applications(
+        self,
+        *,
+        include_deferred: bool = False,
+    ) -> list[SubmittedApplication]:
         async with self._connection() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM submitted_applications ORDER BY created_at ASC"
-            )
+            if include_deferred:
+                cursor = await db.execute(
+                    "SELECT * FROM submitted_applications ORDER BY created_at ASC"
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT *
+                    FROM submitted_applications
+                    WHERE next_status_check_at IS NULL
+                       OR next_status_check_at = ''
+                       OR next_status_check_at <= ?
+                    ORDER BY created_at ASC
+                    """,
+                    (utc_now_iso(),),
+                )
             rows = await cursor.fetchall()
             await cursor.close()
         return [self._submitted_from_row(row) for row in rows]
@@ -817,6 +861,10 @@ class DraftRepository:
                     last_seen_editor = ?,
                     last_seen_editor_comment = ?,
                     last_seen_final_answer = ?,
+                    polling_state = ?,
+                    not_found_count = 0,
+                    last_not_found_at = NULL,
+                    next_status_check_at = NULL,
                     updated_at = ?
                 WHERE application_id = ?
                 """,
@@ -829,7 +877,63 @@ class DraftRepository:
                     last_seen_editor,
                     last_seen_editor_comment,
                     last_seen_final_answer,
+                    StatusPollingState.ACTIVE.value,
                     utc_now_iso(),
+                    application_id,
+                ),
+            )
+            await db.commit()
+
+    async def mark_submitted_application_not_found(
+        self,
+        application_id: str,
+        *,
+        threshold: int,
+        recheck_seconds: int,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT not_found_count
+                FROM submitted_applications
+                WHERE application_id = ?
+                """,
+                (application_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.commit()
+                return
+            count = int(row["not_found_count"] or 0) + 1
+            next_check_at = (
+                (now + timedelta(seconds=recheck_seconds)).isoformat()
+                if count >= threshold
+                else None
+            )
+            await db.execute(
+                """
+                UPDATE submitted_applications
+                SET polling_state = ?,
+                    not_found_count = ?,
+                    last_not_found_at = ?,
+                    next_status_check_at = ?,
+                    updated_at = ?
+                WHERE application_id = ?
+                """,
+                (
+                    (
+                        StatusPollingState.NOT_FOUND.value
+                        if count >= threshold
+                        else StatusPollingState.ACTIVE.value
+                    ),
+                    count,
+                    now.isoformat(),
+                    next_check_at,
+                    now.isoformat(),
                     application_id,
                 ),
             )
@@ -1696,6 +1800,10 @@ class DraftRepository:
                 last_seen_editor = ?,
                 last_seen_editor_comment = ?,
                 last_seen_final_answer = ?,
+                polling_state = ?,
+                not_found_count = 0,
+                last_not_found_at = NULL,
+                next_status_check_at = NULL,
                 updated_at = ?
             WHERE application_id = ?
             """,
@@ -1708,6 +1816,7 @@ class DraftRepository:
                 update.get("last_seen_editor"),
                 update.get("last_seen_editor_comment"),
                 update.get("last_seen_final_answer"),
+                StatusPollingState.ACTIVE.value,
                 now,
                 update["application_id"],
             ),
@@ -1791,6 +1900,10 @@ class DraftRepository:
             last_seen_editor_comment=row["last_seen_editor_comment"],
             last_seen_final_answer=row["last_seen_final_answer"],
             submitted_at=row["submitted_at"],
+            polling_state=row["polling_state"] or StatusPollingState.ACTIVE.value,
+            not_found_count=row["not_found_count"] or 0,
+            last_not_found_at=row["last_not_found_at"],
+            next_status_check_at=row["next_status_check_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

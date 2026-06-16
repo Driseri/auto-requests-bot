@@ -9,7 +9,8 @@ import sqlite3
 import pytest
 
 from app.flow import ApplicationFlow
-from app.google_api import GoogleApiRetryConfig, execute_with_retry
+import app.google_api as google_api
+from app.google_api import GoogleApiRetryConfig, execute_with_retry, execute_with_retry_async
 from app.health import ExternalProbeError, check_health, write_heartbeat
 from app.maintenance import create_backup, restore_backup, verify_database
 from app.models import (
@@ -179,6 +180,27 @@ def test_google_retry_does_not_retry_permanent_errors(error):
             operation_id="test",
         )
     assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_google_retry_async_uses_shared_executor(monkeypatch):
+    calls = []
+
+    class FakeLoop:
+        async def run_in_executor(self, executor, call):
+            calls.append(executor)
+            return call()
+
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: FakeLoop())
+
+    result = await execute_with_retry_async(
+        lambda: "ok",
+        config=GoogleApiRetryConfig(max_attempts=1),
+        operation_id="async-test",
+    )
+
+    assert result == "ok"
+    assert calls == [google_api._GOOGLE_API_EXECUTOR]
 
 
 @pytest.mark.asyncio

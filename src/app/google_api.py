@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 import logging
 import random
 import socket
@@ -11,6 +14,10 @@ from typing import Callable, TypeVar
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
 RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+_GOOGLE_API_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="google-api",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +72,24 @@ def execute_with_retry(
             )
             sleep(delay)
     raise AssertionError("unreachable")
+
+
+async def execute_with_retry_async(
+    operation: Callable[[], T],
+    *,
+    config: GoogleApiRetryConfig,
+    operation_id: str,
+    reset_client: Callable[[], None] | None = None,
+) -> T:
+    loop = asyncio.get_running_loop()
+    call = partial(
+        execute_with_retry,
+        operation,
+        config=config,
+        operation_id=operation_id,
+        reset_client=reset_client,
+    )
+    return await loop.run_in_executor(_GOOGLE_API_EXECUTOR, call)
 
 
 def is_retryable_google_error(exc: Exception) -> bool:

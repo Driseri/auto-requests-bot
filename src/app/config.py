@@ -47,6 +47,8 @@ class Settings:
     gigachat_show_response_json: bool
     status_polling_enabled: bool
     status_polling_interval_seconds: float
+    status_not_found_threshold: int
+    status_not_found_recheck_seconds: int
     dashboard_sync_interval_seconds: float
     completed_bulk_dashboard_scan_interval_seconds: float
     dashboard_outbox_retry_base_seconds: int
@@ -75,6 +77,12 @@ def load_settings() -> Settings:
     status_polling_interval_seconds = float(
         os.getenv("STATUS_POLLING_INTERVAL_SECONDS", "30").strip() or "30"
     )
+    status_not_found_threshold = int(
+        os.getenv("STATUS_NOT_FOUND_THRESHOLD", "20").strip() or "20"
+    )
+    status_not_found_recheck_seconds = int(
+        os.getenv("STATUS_NOT_FOUND_RECHECK_SECONDS", "3600").strip() or "3600"
+    )
     dashboard_sync_interval_seconds = float(
         os.getenv("DASHBOARD_SYNC_INTERVAL_SECONDS", "300").strip() or "300"
     )
@@ -96,6 +104,10 @@ def load_settings() -> Settings:
     )
     if status_polling_interval_seconds <= 0:
         raise ValueError("STATUS_POLLING_INTERVAL_SECONDS must be greater than 0")
+    if status_not_found_threshold <= 0:
+        raise ValueError("STATUS_NOT_FOUND_THRESHOLD must be greater than 0")
+    if status_not_found_recheck_seconds <= 0:
+        raise ValueError("STATUS_NOT_FOUND_RECHECK_SECONDS must be greater than 0")
     if dashboard_sync_interval_seconds <= 0:
         raise ValueError("DASHBOARD_SYNC_INTERVAL_SECONDS must be greater than 0")
     if completed_bulk_dashboard_scan_interval_seconds <= 0:
@@ -135,6 +147,8 @@ def load_settings() -> Settings:
         "DASHBOARD_OUTBOX_SENDING_STALE_SECONDS": (
             dashboard_outbox_sending_stale_seconds
         ),
+        "STATUS_NOT_FOUND_THRESHOLD": status_not_found_threshold,
+        "STATUS_NOT_FOUND_RECHECK_SECONDS": status_not_found_recheck_seconds,
     }
     for name, value in positive_values.items():
         if value <= 0:
@@ -211,6 +225,8 @@ def load_settings() -> Settings:
         gigachat_show_response_json=_env_bool("GIGACHAT_SHOW_RESPONSE_JSON", default=False),
         status_polling_enabled=_env_bool("STATUS_POLLING_ENABLED", default=True),
         status_polling_interval_seconds=status_polling_interval_seconds,
+        status_not_found_threshold=status_not_found_threshold,
+        status_not_found_recheck_seconds=status_not_found_recheck_seconds,
         dashboard_sync_interval_seconds=dashboard_sync_interval_seconds,
         completed_bulk_dashboard_scan_interval_seconds=(
             completed_bulk_dashboard_scan_interval_seconds

@@ -18,6 +18,8 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert cutoff_to_string(settings.rollout_schedule.thursday_cutoff) == "14:00"
     assert settings.application_editors == ("редактор 1", "редактор 2")
     assert settings.dashboard_sync_interval_seconds == 300
+    assert settings.status_not_found_threshold == 20
+    assert settings.status_not_found_recheck_seconds == 3600
     assert settings.bulk_reserved_rows == 100
     assert settings.bulk_registration_stale_seconds == 600
     assert settings.bulk_creation_stale_seconds == 600
@@ -59,6 +61,8 @@ def test_load_settings_uses_custom_bulk_limits(monkeypatch):
         ("NOTIFICATION_RETRY_BASE_SECONDS", "0"),
         ("NOTIFICATION_SENDING_STALE_SECONDS", "0"),
         ("NOTIFICATION_MESSAGE_MAX_CHARS", "0"),
+        ("STATUS_NOT_FOUND_THRESHOLD", "0"),
+        ("STATUS_NOT_FOUND_RECHECK_SECONDS", "0"),
     ],
 )
 def test_load_settings_rejects_invalid_bulk_limits(monkeypatch, name, value):

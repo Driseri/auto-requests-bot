@@ -170,6 +170,10 @@ async def main() -> None:
                     dashboard_sync_interval_seconds=(
                         settings.dashboard_sync_interval_seconds
                     ),
+                    status_not_found_threshold=settings.status_not_found_threshold,
+                    status_not_found_recheck_seconds=(
+                        settings.status_not_found_recheck_seconds
+                    ),
                     completed_bulk_dashboard_scan_interval_seconds=(
                         settings.completed_bulk_dashboard_scan_interval_seconds
                     ),
