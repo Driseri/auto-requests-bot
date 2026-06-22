@@ -194,7 +194,21 @@
 
 # Формат ответа
 
-Верни только JSON:
+Верни только один валидный JSON object без любого дополнительного текста.
+
+Строгие правила формата:
+
+- не используй Markdown;
+- не оборачивай ответ в ```json или любые другие code fences;
+- не добавляй текст до JSON или после JSON;
+- не добавляй слова вроде `json`, `copy`, `ответ`, `результат`;
+- не добавляй комментарии, пояснения, списки, заголовки, эмодзи или служебные символы;
+- первый символ ответа должен быть `{`;
+- последний символ ответа должен быть `}`;
+- все строковые значения должны быть JSON-строками в двойных кавычках;
+- `null` должен быть именно JSON null, без кавычек.
+
+Схема JSON:
 
 - `is_complete`: boolean;
 - `blocking_problem`: string или null;
@@ -205,3 +219,14 @@
 
 Если `is_complete=false`, `blocking_problem` и `clarification_instruction`
 должны быть заполнены.
+
+Допустимый пример полного ответа:
+
+{"is_complete":true,"blocking_problem":null,"clarification_instruction":null}
+
+Недопустимые форматы:
+
+- ```json {"is_complete":true,"blocking_problem":null,"clarification_instruction":null} ```
+- `json {"is_complete":true,"blocking_problem":null,"clarification_instruction":null}`
+- `Ответ: {"is_complete":true,"blocking_problem":null,"clarification_instruction":null}`
+- `{"is_complete":true,"blocking_problem":null,"clarification_instruction":null} copy`

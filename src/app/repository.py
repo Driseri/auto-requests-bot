@@ -12,6 +12,7 @@ from app.models import (
     BulkCreationRequest,
     BulkCreationState,
     BulkBatch,
+    BulkBatchLocationState,
     BulkBatchStatus,
     BulkRegistrationState,
     DashboardOutboxItem,
@@ -65,6 +66,12 @@ class DraftRepository:
                     formatted_change_description TEXT,
                     source_text TEXT,
                     source_text_formatting_json TEXT,
+                    chip_text_before TEXT,
+                    chip_text_before_formatting_json TEXT,
+                    chip_text TEXT,
+                    chip_text_formatting_json TEXT,
+                    chip_text_after TEXT,
+                    chip_text_after_formatting_json TEXT,
                     priority TEXT,
                     llm_check_status TEXT NOT NULL DEFAULT 'not_checked',
                     llm_score REAL,
@@ -81,6 +88,12 @@ class DraftRepository:
                 """
             )
             await self._ensure_column(db, "source_text_formatting_json", "TEXT")
+            await self._ensure_column(db, "chip_text_before", "TEXT")
+            await self._ensure_column(db, "chip_text_before_formatting_json", "TEXT")
+            await self._ensure_column(db, "chip_text", "TEXT")
+            await self._ensure_column(db, "chip_text_formatting_json", "TEXT")
+            await self._ensure_column(db, "chip_text_after", "TEXT")
+            await self._ensure_column(db, "chip_text_after_formatting_json", "TEXT")
             await self._ensure_column(db, "application_id", "TEXT")
             await self._ensure_column(db, "direction", "TEXT")
             await self._ensure_column(db, "answer_type", "TEXT")
@@ -123,6 +136,7 @@ class DraftRepository:
                     direction TEXT,
                     answer_type TEXT,
                     application_type TEXT,
+                    change_type TEXT,
                     is_urgent INTEGER,
                     batch_id TEXT,
                     last_seen_row_number INTEGER,
@@ -145,6 +159,7 @@ class DraftRepository:
             await self._ensure_submitted_applications_column(db, "direction", "TEXT")
             await self._ensure_submitted_applications_column(db, "answer_type", "TEXT")
             await self._ensure_submitted_applications_column(db, "application_type", "TEXT")
+            await self._ensure_submitted_applications_column(db, "change_type", "TEXT")
             await self._ensure_submitted_applications_column(db, "is_urgent", "INTEGER")
             await self._ensure_submitted_applications_column(db, "last_seen_final_answer", "TEXT")
             await self._ensure_submitted_applications_column(db, "last_seen_editor", "TEXT")
@@ -181,6 +196,11 @@ class DraftRepository:
                     batch_status TEXT,
                     last_known_batch_status TEXT,
                     last_seen_final_answers_digest_at TEXT,
+                    location_state TEXT NOT NULL DEFAULT 'KNOWN',
+                    location_miss_count INTEGER NOT NULL DEFAULT 0,
+                    last_location_search_at TEXT,
+                    next_location_search_at TEXT,
+                    last_location_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -246,6 +266,19 @@ class DraftRepository:
             await self._ensure_bulk_batches_column(db, "batch_status", "TEXT")
             await self._ensure_bulk_batches_column(db, "last_known_batch_status", "TEXT")
             await self._ensure_bulk_batches_column(db, "last_seen_final_answers_digest_at", "TEXT")
+            await self._ensure_bulk_batches_column(
+                db,
+                "location_state",
+                "TEXT NOT NULL DEFAULT 'KNOWN'",
+            )
+            await self._ensure_bulk_batches_column(
+                db,
+                "location_miss_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            await self._ensure_bulk_batches_column(db, "last_location_search_at", "TEXT")
+            await self._ensure_bulk_batches_column(db, "next_location_search_at", "TEXT")
+            await self._ensure_bulk_batches_column(db, "last_location_error", "TEXT")
             await self._ensure_bulk_batches_column(
                 db,
                 "status_schema_version",
@@ -543,8 +576,10 @@ class DraftRepository:
         answer_type: str | None,
         application_type: str | None,
         is_urgent: bool | None,
+        change_type: str | None = None,
         submitted_at: str | None = None,
         dashboard_projection: dict[str, Any] | None = None,
+        notification_event: dict[str, Any] | None = None,
     ) -> Draft:
         """Одной транзакцией сохранить tracking и отметить черновик отправленным."""
         now = utc_now_iso()
@@ -554,13 +589,14 @@ class DraftRepository:
                 """
                 INSERT INTO submitted_applications (
                     application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
-                    last_known_status, direction, answer_type, application_type, is_urgent,
+                    last_known_status, direction, answer_type, application_type, change_type, is_urgent,
                     last_seen_row_number, submitted_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(application_id) DO UPDATE SET
                     spreadsheet_id = excluded.spreadsheet_id,
                     sheet_id = excluded.sheet_id,
                     sheet_name = excluded.sheet_name,
+                    change_type = excluded.change_type,
                     submitted_at = COALESCE(
                         submitted_applications.submitted_at,
                         excluded.submitted_at
@@ -585,6 +621,7 @@ class DraftRepository:
                     direction,
                     answer_type,
                     application_type,
+                    change_type,
                     1 if is_urgent else 0 if is_urgent is not None else None,
                     row_number,
                     submitted_at,
@@ -623,6 +660,16 @@ class DraftRepository:
                     entity_type="APPLICATION",
                     entity_id=application_id,
                     snapshot=dashboard_projection,
+                    now=now,
+                )
+            if notification_event is not None:
+                await self._insert_notification_event_in_connection(
+                    db,
+                    telegram_user_id=notification_event["telegram_user_id"],
+                    event_type=notification_event["event_type"],
+                    dedupe_key=notification_event["dedupe_key"],
+                    snapshot_json=notification_event["snapshot_json"],
+                    chunks=notification_event["chunks"],
                     now=now,
                 )
             await db.commit()
@@ -723,6 +770,7 @@ class DraftRepository:
         direction: str | None = None,
         answer_type: str | None = None,
         application_type: str | None = None,
+        change_type: str | None = None,
         is_urgent: bool | None = None,
         batch_id: str | None = None,
         last_seen_row_number: int | None = None,
@@ -737,11 +785,11 @@ class DraftRepository:
                 """
                 INSERT INTO submitted_applications (
                     application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
-                    last_known_status, direction, answer_type, application_type, is_urgent,
+                    last_known_status, direction, answer_type, application_type, change_type, is_urgent,
                     batch_id, last_seen_row_number, last_seen_editor,
                     last_seen_editor_comment, last_seen_final_answer, submitted_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(application_id) DO UPDATE SET
                     telegram_user_id = excluded.telegram_user_id,
                     spreadsheet_id = excluded.spreadsheet_id,
@@ -751,6 +799,7 @@ class DraftRepository:
                     direction = excluded.direction,
                     answer_type = excluded.answer_type,
                     application_type = excluded.application_type,
+                    change_type = excluded.change_type,
                     is_urgent = excluded.is_urgent,
                     batch_id = excluded.batch_id,
                     last_seen_row_number = excluded.last_seen_row_number,
@@ -777,6 +826,7 @@ class DraftRepository:
                     direction,
                     answer_type,
                     application_type,
+                    change_type,
                     None if is_urgent is None else (1 if is_urgent else 0),
                     batch_id,
                     last_seen_row_number,
@@ -939,6 +989,54 @@ class DraftRepository:
             )
             await db.commit()
 
+    async def mark_bulk_batch_applications_not_found(
+        self,
+        batch_id: str,
+        *,
+        threshold: int,
+        recheck_seconds: int,
+    ) -> int:
+        """Count one confirmed missing-source check for every tracked row in a batch."""
+        now = datetime.now(timezone.utc)
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT application_id, not_found_count FROM submitted_applications WHERE batch_id = ?",
+                (batch_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                count = int(row["not_found_count"] or 0) + 1
+                next_check_at = (
+                    (now + timedelta(seconds=recheck_seconds)).isoformat()
+                    if count >= threshold
+                    else None
+                )
+                await db.execute(
+                    """
+                    UPDATE submitted_applications
+                    SET polling_state = ?, not_found_count = ?,
+                        last_not_found_at = ?, next_status_check_at = ?, updated_at = ?
+                    WHERE application_id = ?
+                    """,
+                    (
+                        (
+                            StatusPollingState.NOT_FOUND.value
+                            if count >= threshold
+                            else StatusPollingState.ACTIVE.value
+                        ),
+                        count,
+                        now.isoformat(),
+                        next_check_at,
+                        now.isoformat(),
+                        row["application_id"],
+                    ),
+                )
+            await db.commit()
+        return len(rows)
+
     async def save_bulk_batch(
         self,
         *,
@@ -1098,6 +1196,133 @@ class DraftRepository:
                     snapshot=dashboard_projection,
                     now=now,
                 )
+            await db.commit()
+
+    async def restore_bulk_batch_location(
+        self,
+        batch_id: str,
+        *,
+        spreadsheet_id: str,
+        sheet_name: str,
+        sheet_id: int,
+        start_row: int,
+    ) -> BulkBatch | None:
+        """Atomically move a batch and all tracked child rows to verified coordinates."""
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM bulk_batches WHERE batch_id = ?",
+                (batch_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.rollback()
+                return None
+
+            old_start_row = int(row["start_row"])
+            row_delta = start_row - old_start_row
+            data_start_row = start_row + 2
+            old_data_end_row = row["data_end_row"]
+            data_end_row = (
+                int(old_data_end_row) + row_delta
+                if old_data_end_row is not None
+                else None
+            )
+            now = utc_now_iso()
+            await db.execute(
+                """
+                UPDATE bulk_batches
+                SET spreadsheet_id = ?, sheet_name = ?, sheet_id = ?,
+                    start_row = ?, data_start_row = ?, data_end_row = ?,
+                    location_state = ?, location_miss_count = 0,
+                    last_location_search_at = ?, next_location_search_at = NULL,
+                    last_location_error = NULL, updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (
+                    spreadsheet_id,
+                    sheet_name,
+                    sheet_id,
+                    start_row,
+                    data_start_row,
+                    data_end_row,
+                    BulkBatchLocationState.KNOWN.value,
+                    now,
+                    now,
+                    batch_id,
+                ),
+            )
+            await db.execute(
+                """
+                UPDATE submitted_applications
+                SET spreadsheet_id = ?, sheet_name = ?, sheet_id = ?,
+                    last_seen_row_number = CASE
+                        WHEN last_seen_row_number IS NULL THEN NULL
+                        ELSE last_seen_row_number + ?
+                    END,
+                    polling_state = ?, not_found_count = 0,
+                    last_not_found_at = NULL, next_status_check_at = NULL,
+                    updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (
+                    spreadsheet_id,
+                    sheet_name,
+                    sheet_id,
+                    row_delta,
+                    StatusPollingState.ACTIVE.value,
+                    now,
+                    batch_id,
+                ),
+            )
+            insert_url = (
+                f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+                f"#gid={sheet_id}&range=A{data_start_row}:G{data_start_row}"
+            )
+            await db.execute(
+                """
+                UPDATE bulk_creation_requests
+                SET insert_url = ?, updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (insert_url, now, batch_id),
+            )
+            await db.commit()
+        return await self.get_bulk_batch(batch_id)
+
+    async def record_bulk_batch_location_problem(
+        self,
+        batch_id: str,
+        *,
+        state: str,
+        error: str,
+        recheck_seconds: int,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        next_check = now + timedelta(seconds=recheck_seconds)
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE bulk_batches
+                SET location_state = ?,
+                    location_miss_count = location_miss_count + CASE WHEN ? = ? THEN 1 ELSE 0 END,
+                    last_location_search_at = ?, next_location_search_at = ?,
+                    last_location_error = ?, updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (
+                    state,
+                    state,
+                    BulkBatchLocationState.MISSING.value,
+                    now.isoformat(),
+                    next_check.isoformat(),
+                    error[:500],
+                    now.isoformat(),
+                    batch_id,
+                ),
+            )
             await db.commit()
 
     async def update_bulk_batch_reserved_rows(
@@ -1416,41 +1641,18 @@ class DraftRepository:
         now = utc_now_iso()
         async with self._connection() as db:
             await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute(
-                "SELECT 1 FROM notification_outbox WHERE dedupe_key LIKE ? LIMIT 1",
-                (f"{dedupe_key}:%",),
+            inserted = await self._insert_notification_event_in_connection(
+                db,
+                telegram_user_id=telegram_user_id,
+                event_type=event_type,
+                dedupe_key=dedupe_key,
+                snapshot_json=snapshot_json,
+                chunks=chunks,
+                now=now,
             )
-            exists = await cursor.fetchone()
-            await cursor.close()
-            if exists is not None:
+            if not inserted:
                 await db.commit()
                 return False
-
-            chunk_count = len(chunks)
-            for chunk_index, html in enumerate(chunks):
-                await db.execute(
-                    """
-                    INSERT INTO notification_outbox (
-                        event_id, dedupe_key, telegram_user_id, event_type,
-                        snapshot_json, html, chunk_index, chunk_count,
-                        state, next_attempt_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        generate_application_id(),
-                        f"{dedupe_key}:{chunk_index}",
-                        telegram_user_id,
-                        event_type,
-                        snapshot_json,
-                        html,
-                        chunk_index,
-                        chunk_count,
-                        NotificationOutboxState.PENDING.value,
-                        now,
-                        now,
-                        now,
-                    ),
-                )
 
             for update in application_updates or []:
                 await self._update_submitted_application_in_connection(db, update, now)
@@ -1477,6 +1679,53 @@ class DraftRepository:
                     now=now,
                 )
             await db.commit()
+        return True
+
+    async def _insert_notification_event_in_connection(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        telegram_user_id: int,
+        event_type: str,
+        dedupe_key: str,
+        snapshot_json: str,
+        chunks: list[str],
+        now: str,
+    ) -> bool:
+        cursor = await db.execute(
+            "SELECT 1 FROM notification_outbox WHERE dedupe_key LIKE ? LIMIT 1",
+            (f"{dedupe_key}:%",),
+        )
+        exists = await cursor.fetchone()
+        await cursor.close()
+        if exists is not None:
+            return False
+
+        chunk_count = len(chunks)
+        for chunk_index, html in enumerate(chunks):
+            await db.execute(
+                """
+                INSERT INTO notification_outbox (
+                    event_id, dedupe_key, telegram_user_id, event_type,
+                    snapshot_json, html, chunk_index, chunk_count,
+                    state, next_attempt_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    generate_application_id(),
+                    f"{dedupe_key}:{chunk_index}",
+                    telegram_user_id,
+                    event_type,
+                    snapshot_json,
+                    html,
+                    chunk_index,
+                    chunk_count,
+                    NotificationOutboxState.PENDING.value,
+                    now,
+                    now,
+                    now,
+                ),
+            )
         return True
 
     async def update_application_tracking_batch(
@@ -1800,6 +2049,7 @@ class DraftRepository:
                 last_seen_editor = ?,
                 last_seen_editor_comment = ?,
                 last_seen_final_answer = ?,
+                change_type = COALESCE(?, change_type),
                 polling_state = ?,
                 not_found_count = 0,
                 last_not_found_at = NULL,
@@ -1816,6 +2066,7 @@ class DraftRepository:
                 update.get("last_seen_editor"),
                 update.get("last_seen_editor_comment"),
                 update.get("last_seen_final_answer"),
+                update.get("change_type"),
                 StatusPollingState.ACTIVE.value,
                 now,
                 update["application_id"],
@@ -1853,6 +2104,12 @@ class DraftRepository:
             formatted_change_description=row["formatted_change_description"],
             source_text=row["source_text"],
             source_text_formatting_json=row["source_text_formatting_json"],
+            chip_text_before=row["chip_text_before"],
+            chip_text_before_formatting_json=row["chip_text_before_formatting_json"],
+            chip_text=row["chip_text"],
+            chip_text_formatting_json=row["chip_text_formatting_json"],
+            chip_text_after=row["chip_text_after"],
+            chip_text_after_formatting_json=row["chip_text_after_formatting_json"],
             priority=row["priority"],
             llm_check_status=row["llm_check_status"],
             llm_score=row["llm_score"],
@@ -1893,6 +2150,7 @@ class DraftRepository:
             direction=row["direction"],
             answer_type=row["answer_type"],
             application_type=row["application_type"],
+            change_type=row["change_type"],
             is_urgent=_row_bool(row["is_urgent"]),
             batch_id=row["batch_id"],
             last_seen_row_number=row["last_seen_row_number"],
@@ -1930,6 +2188,11 @@ class DraftRepository:
             batch_status=row["batch_status"] or "Новая пачка",
             last_known_batch_status=row["last_known_batch_status"] or "Новая пачка",
             last_seen_final_answers_digest_at=row["last_seen_final_answers_digest_at"],
+            location_state=row["location_state"] or BulkBatchLocationState.KNOWN.value,
+            location_miss_count=row["location_miss_count"] or 0,
+            last_location_search_at=row["last_location_search_at"],
+            next_location_search_at=row["next_location_search_at"],
+            last_location_error=row["last_location_error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

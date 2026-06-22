@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 
 import pytest
 from googleapiclient.errors import HttpError
@@ -18,6 +20,7 @@ from app.models import (
     BulkApplicationStatus,
     BulkBatch,
     BulkBatchStatus,
+    ChangeType,
     Direction,
     FieldName,
     KeyboardKind,
@@ -25,6 +28,8 @@ from app.models import (
     SubmittedApplication,
 )
 from app.notifications import (
+    BulkBatchLocation,
+    BulkBatchLocationScan,
     BulkEditorComment,
     GoogleSheetsStatusReader,
     SheetApplicationStatus,
@@ -33,8 +38,10 @@ from app.notifications import (
     _split_html_message,
     _working_data_rows,
 )
+import app.notifications as notifications_module
 from app.repository import DraftRepository
 from app.submission import (
+    CHIPS_WORKSHEET_HEADERS,
     DirectionSpreadsheetConfig,
     LEGACY_WORKSHEET_HEADERS,
     SHEET_HEADERS,
@@ -97,6 +104,54 @@ def test_working_data_rows_reads_all_rollout_sections():
     ]
 
 
+def test_working_data_rows_reads_chips_v2_layout():
+    chips_row = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    chips_row[7] = "Editor comment"
+    chips_row[9] = ApplicationStatus.NEEDS_CLARIFICATION.value
+    chips_row[10] = "Editor"
+    chips_row[11] = "CHIPSV20"
+    chips_row[20] = ChangeType.CHIPS.value
+    rows = [["CHIPS V2"], CHIPS_WORKSHEET_HEADERS, chips_row]
+
+    found = _working_data_rows(rows)
+
+    assert len(found) == 1
+    row_number, _, layout = found[0]
+    assert row_number == 3
+    assert layout["status"] == 9
+    assert layout["editor"] == 10
+    assert layout["comment"] == 7
+    assert layout["final_answer"] == -1
+
+
+def test_working_data_rows_reads_mixed_urgent_sheet():
+    urgent_add = app_row("URGADD01")
+    urgent_chips = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    urgent_chips[7] = "Need details"
+    urgent_chips[9] = ApplicationStatus.NEEDS_CLARIFICATION.value
+    urgent_chips[10] = "Editor"
+    urgent_chips[11] = "URGCHIP1"
+    urgent_chips[13] = ApplicationType.SINGLE.value
+    urgent_chips[16] = AnswerType.URGENT.value
+    urgent_chips[17] = "Да"
+    urgent_chips[20] = ChangeType.CHIPS.value
+    rows = [
+        SHEET_HEADERS,
+        urgent_add,
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+        urgent_chips,
+    ]
+
+    found = _working_data_rows(rows)
+
+    assert [(row_number, row[layout["application_id"]]) for row_number, row, layout in found] == [
+        (2, "URGADD01"),
+        (5, "URGCHIP1"),
+    ]
+    assert found[1][2]["final_answer"] == -1
+
+
 class FakeRequest:
     def __init__(self, result):
         self.result = result
@@ -151,6 +206,37 @@ class FakeSheetsApi:
         return FakeSpreadsheetsResource(self)
 
 
+class FakeBatchGetValuesResource(FakeValuesResource):
+    def batchGet(self, **kwargs):
+        self.api.batch_get_calls.append(kwargs)
+        spreadsheet_id = kwargs["spreadsheetId"]
+        value_ranges = []
+        for range_name in kwargs["ranges"]:
+            sheet_name = _sheet_name_from_range(range_name)
+            stored = self.api.rows.get(
+                (spreadsheet_id, range_name),
+                self.api.rows.get((spreadsheet_id, sheet_name), []),
+            )
+            if isinstance(stored, BaseException):
+                return FakeRequest(stored)
+            value_ranges.append({"range": range_name, "values": stored})
+        return FakeRequest({"valueRanges": value_ranges})
+
+
+class FakeBatchGetSpreadsheetsResource(FakeSpreadsheetsResource):
+    def values(self):
+        return FakeBatchGetValuesResource(self.api)
+
+
+class FakeBatchGetSheetsApi(FakeSheetsApi):
+    def __init__(self, *, rows):
+        super().__init__(rows=rows)
+        self.batch_get_calls = []
+
+    def spreadsheets(self):
+        return FakeBatchGetSpreadsheetsResource(self)
+
+
 class FakeStatusReader:
     def __init__(self, statuses: dict[str, SheetApplicationStatus]) -> None:
         self.statuses = statuses
@@ -200,6 +286,20 @@ class FakeBulkRowsStatusReader(FakeStatusReaderWithBatches):
     async def read_bulk_application_statuses(self, batches):
         self.bulk_application_calls.append([batch.batch_id for batch in batches])
         return self.bulk_statuses
+
+
+class FakeRelocatingBulkReader(FakeBulkRowsStatusReader):
+    def __init__(self, bulk_statuses, location_scan, batch_statuses=None) -> None:
+        super().__init__(bulk_statuses, batch_statuses)
+        self.location_scan = location_scan
+        self.location_calls = []
+
+    async def resolve_bulk_batch_locations(self, batches, *, search_batch_ids):
+        self.location_calls.append((
+            [batch.batch_id for batch in batches],
+            set(search_batch_ids),
+        ))
+        return self.location_scan
 
 
 class FakeNotifier:
@@ -396,7 +496,7 @@ async def test_status_reader_reads_only_tracked_application_sheets():
 async def test_status_reader_does_not_accept_mismatched_expected_row():
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A4:X5"): [
+            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A1:X5"): [
                 SHEET_HEADERS,
                 app_row("OTHER001", status=ApplicationStatus.ACCEPTED.value),
             ],
@@ -426,14 +526,110 @@ async def test_status_reader_does_not_accept_mismatched_expected_row():
     statuses = await reader.read_statuses_for(tracked)
 
     assert statuses == {}
-    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A4:X5"]
+    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A1:X5"]
+
+
+@pytest.mark.asyncio
+async def test_status_reader_skips_single_source_when_sheet_range_is_missing():
+    missing_range_error = HttpError(
+        FakeResponse(status=400, reason="Bad Request"),
+        "{\"error\":{\"message\":\"Unable to parse range: '15.06 ср'!A1:X152\"}}".encode(
+            "utf-8"
+        ),
+    )
+    sheet_name = "15.06 ср"
+    api = FakeSheetsApi(
+        rows={
+            (FL_SPREADSHEET, f"'{sheet_name}'!A1:X152"): missing_range_error,
+        }
+    )
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    tracked = [
+        SubmittedApplication(
+            application_id="A1B2C3D4",
+            telegram_user_id=100,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_id=100,
+            sheet_name=sheet_name,
+            last_known_status=ApplicationStatus.NEW.value,
+            last_seen_row_number=152,
+        )
+    ]
+
+    statuses = await reader.read_statuses_for(tracked)
+
+    assert statuses == {}
+    assert reader.unavailable_single_sources == {(FL_SPREADSHEET, sheet_name)}
+
+
+@pytest.mark.asyncio
+async def test_status_reader_finds_multiple_single_rows_under_same_header():
+    api = FakeSheetsApi(
+        rows={
+            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A1:X5"): [
+                ["ADD"],
+                SHEET_HEADERS,
+                app_row("APPROW03", status=ApplicationStatus.ACCEPTED.value),
+                app_row(
+                    "APPROW04",
+                    status=ApplicationStatus.FINAL_ANSWER_READY.value,
+                    final_answer="РС‚РѕРі 4",
+                ),
+                app_row(
+                    "APPROW05",
+                    status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+                    comment="РљРѕРјРјРµРЅС‚Р°СЂРёР№",
+                ),
+            ]
+        }
+    )
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    tracked = [
+        SubmittedApplication(
+            application_id="APPROW04",
+            telegram_user_id=100,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_id=100,
+            sheet_name=WEEK_SHEET,
+            last_known_status=ApplicationStatus.NEW.value,
+            last_seen_row_number=4,
+        ),
+        SubmittedApplication(
+            application_id="APPROW05",
+            telegram_user_id=100,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_id=100,
+            sheet_name=WEEK_SHEET,
+            last_known_status=ApplicationStatus.NEW.value,
+            last_seen_row_number=5,
+        ),
+    ]
+
+    statuses = await reader.read_statuses_for(tracked)
+
+    assert set(statuses) == {"APPROW04", "APPROW05"}
+    assert statuses["APPROW04"].row_number == 4
+    assert statuses["APPROW04"].status == ApplicationStatus.FINAL_ANSWER_READY.value
+    assert statuses["APPROW04"].final_answer == "РС‚РѕРі 4"
+    assert statuses["APPROW05"].row_number == 5
+    assert statuses["APPROW05"].status == ApplicationStatus.NEEDS_CLARIFICATION.value
+    assert statuses["APPROW05"].editor_comment == "РљРѕРјРјРµРЅС‚Р°СЂРёР№"
+    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A1:X5"]
 
 
 @pytest.mark.asyncio
 async def test_status_reader_uses_full_sheet_only_for_fallback():
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A4:X5"): [
+            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A1:X5"): [
                 SHEET_HEADERS,
                 app_row("OTHER001", status=ApplicationStatus.ACCEPTED.value),
             ],
@@ -464,9 +660,45 @@ async def test_status_reader_uses_full_sheet_only_for_fallback():
 
     assert set(statuses) == {"A1B2C3D4"}
     assert [call["range"] for call in api.value_get_calls] == [
-        f"'{WEEK_SHEET}'!A4:X5",
+        f"'{WEEK_SHEET}'!A1:X5",
         f"'{WEEK_SHEET}'!A:X",
     ]
+
+
+@pytest.mark.asyncio
+async def test_status_reader_uses_fallback_when_tracked_row_is_unknown():
+    api = FakeSheetsApi(
+        rows={
+            (FL_SPREADSHEET, WEEK_SHEET): [
+                ["ADD"],
+                SHEET_HEADERS,
+                app_row("A1B2C3D4", status=ApplicationStatus.ACCEPTED.value),
+            ],
+        }
+    )
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    tracked = [
+        SubmittedApplication(
+            application_id="A1B2C3D4",
+            telegram_user_id=100,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_id=100,
+            sheet_name=WEEK_SHEET,
+            last_known_status=ApplicationStatus.NEW.value,
+            last_seen_row_number=None,
+        )
+    ]
+
+    fast_statuses = await reader.read_statuses_for(tracked)
+    fallback_statuses = await reader.read_statuses_for(tracked, fallback_full_scan=True)
+
+    assert fast_statuses == {}
+    assert set(fallback_statuses) == {"A1B2C3D4"}
+    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A:X"]
 
 
 @pytest.mark.asyncio
@@ -554,6 +786,163 @@ async def test_status_reader_reads_bulk_rows_from_batch_sheet():
     assert current.editor_comment == "Комментарий редактора"
     assert current.final_answer == "Итоговый ответ"
     assert current.end_column == "M"
+
+
+@pytest.mark.asyncio
+async def test_status_reader_finds_moved_bulk_batch_on_renamed_source_sheet():
+    sheet_name = "Renamed mass input"
+    batch_id = "BATCH-ABC12345"
+    full_rows = [[], [], [], []]
+    full_rows.append(["Batch", batch_id])
+    full_rows.append(BULK_STAGING_HEADERS)
+    api = FakeBatchGetSheetsApi(
+        rows={(FL_SPREADSHEET, f"'{sheet_name}'!A:N"): full_rows}
+    )
+    api.sheets_by_spreadsheet[FL_SPREADSHEET] = [
+        {"properties": {"sheetId": 300, "title": sheet_name}}
+    ]
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    batch = BulkBatch(
+        batch_id=batch_id,
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name="Old mass input",
+        sheet_id=300,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=100,
+    )
+
+    scan = await reader.resolve_bulk_batch_locations(
+        [batch],
+        search_batch_ids={batch_id},
+    )
+
+    assert scan.locations[batch_id].sheet_name == sheet_name
+    assert scan.locations[batch_id].start_row == 5
+    assert scan.confirmed_missing_ids == set()
+    assert api.batch_get_calls[0]["ranges"] == [f"'{sheet_name}'!A2:N3"]
+
+
+@pytest.mark.asyncio
+async def test_status_reader_uses_one_full_read_for_multiple_missing_batches():
+    sheet_name = "Mass input"
+    first_id = "BATCH-ABC12345"
+    second_id = "BATCH-DEF67890"
+    full_rows = [[], [], [], []]
+    full_rows.extend([["Batch", first_id], BULK_STAGING_HEADERS])
+    full_rows.extend([[] for _ in range(12)])
+    full_rows.extend([["Batch", second_id], BULK_STAGING_HEADERS])
+    api = FakeBatchGetSheetsApi(
+        rows={(FL_SPREADSHEET, f"'{sheet_name}'!A:N"): full_rows}
+    )
+    api.sheets_by_spreadsheet[FL_SPREADSHEET] = [
+        {"properties": {"sheetId": 300, "title": sheet_name}}
+    ]
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    batches = [
+        BulkBatch(
+            batch_id=batch_id,
+            telegram_user_id=100,
+            spreadsheet_id=FL_SPREADSHEET,
+            direction=Direction.FL.value,
+            sheet_name=sheet_name,
+            sheet_id=300,
+            start_row=start_row,
+            data_start_row=start_row + 2,
+            reserved_rows=100,
+        )
+        for batch_id, start_row in ((first_id, 2), (second_id, 110))
+    ]
+
+    scan = await reader.resolve_bulk_batch_locations(
+        batches,
+        search_batch_ids={first_id, second_id},
+    )
+
+    assert scan.locations[first_id].start_row == 5
+    assert scan.locations[second_id].start_row == 19
+    full_reads = [call for call in api.value_get_calls if call["range"].endswith("!A:N")]
+    assert len(full_reads) == 1
+
+
+@pytest.mark.asyncio
+async def test_status_reader_does_not_rebind_duplicate_bulk_batch_id():
+    sheet_name = "Mass input"
+    batch_id = "BATCH-ABC12345"
+    full_rows = [["Batch", batch_id], BULK_STAGING_HEADERS, []]
+    full_rows.extend([["Batch", batch_id], BULK_STAGING_HEADERS])
+    api = FakeBatchGetSheetsApi(
+        rows={(FL_SPREADSHEET, f"'{sheet_name}'!A:N"): full_rows}
+    )
+    api.sheets_by_spreadsheet[FL_SPREADSHEET] = [
+        {"properties": {"sheetId": 300, "title": sheet_name}}
+    ]
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    batch = BulkBatch(
+        batch_id=batch_id,
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=sheet_name,
+        sheet_id=300,
+        start_row=10,
+        data_start_row=12,
+        reserved_rows=100,
+    )
+
+    scan = await reader.resolve_bulk_batch_locations(
+        [batch],
+        search_batch_ids={batch_id},
+    )
+
+    assert batch_id not in scan.locations
+    assert scan.ambiguous_rows[batch_id] == (1, 4)
+
+
+@pytest.mark.asyncio
+async def test_status_reader_defers_full_bulk_search_until_due():
+    sheet_name = "Mass input"
+    batch_id = "BATCH-ABC12345"
+    api = FakeBatchGetSheetsApi(rows={})
+    api.sheets_by_spreadsheet[FL_SPREADSHEET] = [
+        {"properties": {"sheetId": 300, "title": sheet_name}}
+    ]
+    reader = GoogleSheetsStatusReader(
+        direction_spreadsheets=direction_config(),
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    batch = BulkBatch(
+        batch_id=batch_id,
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=sheet_name,
+        sheet_id=300,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=100,
+    )
+
+    scan = await reader.resolve_bulk_batch_locations([batch], search_batch_ids=set())
+
+    assert scan.deferred_ids == {batch_id}
+    assert scan.confirmed_missing_ids == set()
+    assert not [call for call in api.value_get_calls if call["range"].endswith("!A:N")]
 
 
 @pytest.mark.asyncio
@@ -828,6 +1217,38 @@ async def test_notification_service_defers_repeatedly_missing_tracking(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_notification_service_does_not_mark_unavailable_single_source_missing(tmp_path):
+    repository = DraftRepository(str(tmp_path / "unavailable_single_source.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name="15.06 ср",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=152,
+    )
+    reader = FakeStatusReader({})
+    reader.unavailable_single_sources = {(FL_SPREADSHEET, "15.06 ср")}
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+        status_not_found_threshold=2,
+        status_not_found_recheck_seconds=3600,
+    )
+
+    await service.run_once()
+
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert tracked is not None
+    assert tracked.polling_state == "ACTIVE"
+    assert tracked.not_found_count == 0
+    assert tracked.next_status_check_at is None
+
+
+@pytest.mark.asyncio
 async def test_notification_service_updates_dashboard_for_tracked_change(tmp_path):
     repository = DraftRepository(str(tmp_path / "dashboard_updates.db"))
     await repository.init()
@@ -1048,6 +1469,47 @@ async def test_notification_service_sends_status_and_final_answer(tmp_path):
     assert tracked is not None
     assert tracked.last_known_status == ApplicationStatus.FINAL_ANSWER_READY.value
     assert tracked.last_seen_final_answer == "Можно использовать финальный текст"
+
+
+@pytest.mark.asyncio
+async def test_chips_notifies_status_but_never_renders_final_answer(tmp_path):
+    repository = DraftRepository(str(tmp_path / "chips-status.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="CHIPS001",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        change_type=ChangeType.CHIPS.value,
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "CHIPS001": SheetApplicationStatus(
+                    application_id="CHIPS001",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name=WEEK_SHEET,
+                    sheet_id=100,
+                    row_number=7,
+                    change_type=ChangeType.CHIPS.value,
+                    status=ApplicationStatus.FINAL_ANSWER_READY.value,
+                    editor_comment="",
+                    final_answer="Legacy final answer must be ignored",
+                )
+            }
+        ),
+        notifier=notifier,
+    )
+
+    await service.run_once()
+
+    assert len(notifier.messages) == 1
+    assert "Legacy final answer must be ignored" not in notifier.messages[0]["text"]
+    assert "CHIPS001" in notifier.messages[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -1276,6 +1738,37 @@ async def test_notification_keyboard_returns_to_active_single_draft(tmp_path):
     keyboard = notifier.messages[0]["reply_markup"].inline_keyboard
     assert keyboard[0][0].text == "Назад к заведению заявки"
     assert keyboard[0][0].callback_data == "app:notification:new"
+
+
+@pytest.mark.asyncio
+async def test_urgent_editor_notification_is_sent_without_keyboard(tmp_path):
+    repository = DraftRepository(str(tmp_path / "urgent_editor_notification.db"))
+    await repository.init()
+    await repository.enqueue_notification_event(
+        telegram_user_id=-100123456,
+        event_type="urgent-editor-application-created",
+        dedupe_key="urgent-editor-application-created:A1B2C3D4",
+        snapshot_json='{"application_id":"A1B2C3D4"}',
+        chunks=[
+            '🚨 <b>Новая срочная заявка</b>\n\n'
+            '<a href="https://docs.google.com/">Открыть заявку</a>'
+        ],
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({}),
+        notifier=notifier,
+    )
+
+    await service.run_once()
+
+    assert len(notifier.messages) == 1
+    assert notifier.messages[0]["chat_id"] == -100123456
+    assert notifier.messages[0]["reply_markup"] is None
+    assert notifier.messages[0]["parse_mode"] == "HTML"
+    outbox = await repository.list_notification_outbox()
+    assert outbox[0].state == "SENT"
 
 
 @pytest.mark.asyncio
@@ -1692,10 +2185,12 @@ async def test_notification_service_does_not_notify_for_bulk_batch_in_progress(t
         },
     )
     notifier = FakeNotifier()
+    dashboard_sync = FakeDashboardSync()
     service = StatusNotificationService(
         repository=repository,
         status_reader=reader,
         notifier=notifier,
+        dashboard_sync=dashboard_sync,
     )
 
     await service.run_once()
@@ -1705,6 +2200,10 @@ async def test_notification_service_does_not_notify_for_bulk_batch_in_progress(t
     saved = await repository.get_bulk_batch(batch.batch_id)
     assert saved is not None
     assert saved.last_known_batch_status == BulkBatchStatus.IN_PROGRESS.value
+    assert len(dashboard_sync.upserts) == 1
+    snapshot = json.loads(dashboard_sync.upserts[0].snapshot_json)
+    assert set(snapshot) == {"row"}
+    assert snapshot["row"][1] == batch.batch_id
 
 
 @pytest.mark.asyncio
@@ -1798,6 +2297,411 @@ async def test_completed_bulk_batches_are_scanned_no_more_than_hourly(tmp_path):
         [batch.batch_id],
         [batch.batch_id],
     ]
+
+
+@pytest.mark.asyncio
+async def test_completed_bulk_application_not_marked_missing_when_batch_not_scanned(tmp_path):
+    repository = DraftRepository(str(tmp_path / "completed_bulk_not_scanned.db"))
+    await repository.init()
+    batch = await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=3,
+    )
+    await repository.update_bulk_batch_status(
+        batch.batch_id,
+        batch_status=BulkBatchStatus.DONE.value,
+        last_known_batch_status=BulkBatchStatus.DONE.value,
+    )
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=300,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
+        batch_id=batch.batch_id,
+        last_seen_row_number=22,
+    )
+    now = [100.0]
+    reader = FakeBulkRowsStatusReader({})
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+        dashboard_sync=FakeDashboardSync(),
+        completed_bulk_dashboard_scan_interval_seconds=3600,
+        clock=lambda: now[0],
+    )
+    service._last_completed_bulk_scan_at = 0.0
+
+    await service.run_once()
+
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert reader.bulk_application_calls == []
+    assert tracked is not None
+    assert tracked.polling_state == "ACTIVE"
+    assert tracked.not_found_count == 0
+    assert tracked.next_status_check_at is None
+
+
+@pytest.mark.asyncio
+async def test_completed_bulk_application_marked_missing_when_archive_batch_scanned(tmp_path):
+    repository = DraftRepository(str(tmp_path / "completed_bulk_missing.db"))
+    await repository.init()
+    batch = await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=3,
+    )
+    await repository.update_bulk_batch_status(
+        batch.batch_id,
+        batch_status=BulkBatchStatus.DONE.value,
+        last_known_batch_status=BulkBatchStatus.DONE.value,
+    )
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=300,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
+        batch_id=batch.batch_id,
+        last_seen_row_number=22,
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeBulkRowsStatusReader({}),
+        notifier=FakeNotifier(),
+        dashboard_sync=FakeDashboardSync(),
+        status_not_found_threshold=2,
+        status_not_found_recheck_seconds=3600,
+    )
+
+    await service.run_once()
+
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert tracked is not None
+    assert tracked.polling_state == "ACTIVE"
+    assert tracked.not_found_count == 1
+
+
+@pytest.mark.asyncio
+async def test_active_bulk_application_marked_missing_when_batch_scanned(tmp_path):
+    repository = DraftRepository(str(tmp_path / "active_bulk_missing.db"))
+    await repository.init()
+    batch = await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=3,
+    )
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=300,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
+        batch_id=batch.batch_id,
+        last_seen_row_number=22,
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeBulkRowsStatusReader({}),
+        notifier=FakeNotifier(),
+        status_not_found_threshold=2,
+        status_not_found_recheck_seconds=3600,
+    )
+
+    await service.run_once()
+
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert tracked is not None
+    assert tracked.not_found_count == 1
+
+
+@pytest.mark.asyncio
+async def test_found_bulk_application_resets_not_found_state(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_found_resets_missing.db"))
+    await repository.init()
+    batch = await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=3,
+    )
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=300,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
+        batch_id=batch.batch_id,
+        last_seen_row_number=22,
+    )
+    await repository.mark_submitted_application_not_found(
+        "A1B2C3D4",
+        threshold=2,
+        recheck_seconds=3600,
+    )
+    status = SheetApplicationStatus(
+        application_id="A1B2C3D4",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        row_number=22,
+        status=ApplicationStatus.FINAL_ANSWER_READY.value,
+        editor_comment="",
+        final_answer="Р“РѕС‚РѕРІС‹Р№ РѕС‚РІРµС‚",
+        editor="Р РµРґР°РєС‚РѕСЂ",
+        batch_id=batch.batch_id,
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeBulkRowsStatusReader({"A1B2C3D4": status}),
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert tracked is not None
+    assert tracked.polling_state == "ACTIVE"
+    assert tracked.not_found_count == 0
+    assert tracked.next_status_check_at is None
+    assert tracked.last_known_status == ApplicationStatus.FINAL_ANSWER_READY.value
+
+
+@pytest.mark.asyncio
+async def test_notification_service_restores_moved_bulk_batch_and_dashboard_link(tmp_path):
+    repository = DraftRepository(str(tmp_path / "relocated-bulk.db"))
+    await repository.init()
+    batch = await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name="Old mass input",
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=100,
+        data_end_row=24,
+    )
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=300,
+        sheet_name="Old mass input",
+        last_known_status=ApplicationStatus.NEW.value,
+        application_type=ApplicationType.BULK.value,
+        batch_id=batch.batch_id,
+        last_seen_row_number=22,
+    )
+    await repository.mark_submitted_application_not_found(
+        "A1B2C3D4",
+        threshold=1,
+        recheck_seconds=3600,
+    )
+    current = SheetApplicationStatus(
+        application_id="A1B2C3D4",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name="Renamed mass input",
+        sheet_id=300,
+        row_number=42,
+        status=ApplicationStatus.NEW.value,
+        editor_comment="",
+        final_answer="",
+        batch_id=batch.batch_id,
+    )
+    reader = FakeRelocatingBulkReader(
+        {current.application_id: current},
+        BulkBatchLocationScan(
+            locations={
+                batch.batch_id: BulkBatchLocation(
+                    batch_id=batch.batch_id,
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name="Renamed mass input",
+                    sheet_id=300,
+                    start_row=40,
+                )
+            },
+            confirmed_missing_ids=set(),
+            ambiguous_rows={},
+            unavailable_ids=set(),
+            deferred_ids=set(),
+        ),
+    )
+    dashboard_sync = FakeDashboardSync()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+        dashboard_sync=dashboard_sync,
+    )
+
+    await service.run_once()
+
+    restored = await repository.get_bulk_batch(batch.batch_id)
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert restored is not None
+    assert restored.start_row == 40
+    assert restored.data_start_row == 42
+    assert restored.data_end_row == 44
+    assert restored.sheet_name == "Renamed mass input"
+    assert tracked is not None
+    assert tracked.last_seen_row_number == 42
+    assert tracked.polling_state == "ACTIVE"
+    assert tracked.not_found_count == 0
+    assert dashboard_sync.upserts
+    dashboard_snapshot = json.loads(dashboard_sync.upserts[-1].snapshot_json)
+    assert "range=A40:N40" in dashboard_snapshot["row"][11]
+
+
+@pytest.mark.asyncio
+async def test_notification_service_counts_missing_bulk_rows_only_after_full_search(tmp_path):
+    repository = DraftRepository(str(tmp_path / "missing-bulk-location.db"))
+    await repository.init()
+    batch = await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=WEEK_SHEET,
+        sheet_id=300,
+        start_row=20,
+        data_start_row=22,
+        reserved_rows=100,
+    )
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=300,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        batch_id=batch.batch_id,
+        last_seen_row_number=22,
+    )
+    reader = FakeRelocatingBulkReader(
+        {},
+        BulkBatchLocationScan(
+            locations={},
+            confirmed_missing_ids={batch.batch_id},
+            ambiguous_rows={},
+            unavailable_ids=set(),
+            deferred_ids=set(),
+        ),
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+        dashboard_sync=FakeDashboardSync(),
+        status_not_found_threshold=20,
+    )
+
+    await service.run_once()
+
+    saved_batch = await repository.get_bulk_batch(batch.batch_id)
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert saved_batch is not None
+    assert saved_batch.location_state == "MISSING"
+    assert saved_batch.location_miss_count == 1
+    assert saved_batch.next_location_search_at is not None
+    assert tracked is not None
+    assert tracked.not_found_count == 1
+    assert reader.bulk_application_calls == []
+
+
+def test_status_polling_memory_maintenance_collects_and_trims(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(notifications_module.gc, "collect", lambda: calls.append("gc"))
+    monkeypatch.setattr(
+        notifications_module,
+        "_malloc_trim",
+        lambda: calls.append("trim"),
+    )
+
+    notifications_module._run_memory_maintenance()
+
+    assert calls == ["gc", "trim"]
+
+
+@pytest.mark.asyncio
+async def test_status_polling_memory_log_uses_configured_interval(monkeypatch, caplog):
+    class FakePollingService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run_once(self) -> None:
+            self.calls += 1
+
+    service = FakePollingService()
+    maintenance_calls = []
+    snapshots = [(100.0, 200.0), (115.0, 220.0)]
+    sleep_calls = 0
+
+    async def fake_sleep(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        notifications_module,
+        "_run_memory_maintenance",
+        lambda: maintenance_calls.append("cleanup"),
+    )
+    monkeypatch.setattr(
+        notifications_module,
+        "_process_memory_snapshot_mb",
+        lambda: snapshots.pop(0),
+    )
+    monkeypatch.setattr(notifications_module.asyncio, "sleep", fake_sleep)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(asyncio.CancelledError):
+            await notifications_module.run_status_polling_loop(
+                service=service,
+                interval_seconds=30,
+                memory_log_interval=2,
+            )
+
+    assert service.calls == 3
+    assert maintenance_calls == ["cleanup", "cleanup", "cleanup"]
+    memory_logs = [
+        record.message for record in caplog.records if "Status polling memory" in record.message
+    ]
+    assert len(memory_logs) == 1
+    assert "iteration=2" in memory_logs[0]
+    assert "rss_mb=100.0" in memory_logs[0]
 
 
 def _sheet_name_from_range(range_name: str) -> str:

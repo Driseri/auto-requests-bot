@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+StatusLevel = Literal["OK", "DEGRADED", "ACTION_REQUIRED", "CRITICAL", "UNKNOWN"]
+
+
+class CollectionState(BaseModel):
+    """Local timestamps that decide which remote sections are due."""
+
+    last_fast_at: str | None = None
+    last_logs_at: str | None = None
+    last_heavy_at: str | None = None
+    last_success_at: str | None = None
+    last_error_at: str | None = None
+    last_error: str | None = None
+
+
+class Summary(BaseModel):
+    """Operator-facing status summary."""
+
+    status: StatusLevel = "UNKNOWN"
+    recommendations: list[str] = Field(default_factory=list)
+    problems: list[str] = Field(default_factory=list)
+
+
+class Snapshot(BaseModel):
+    """Normalized dashboard snapshot stored as JSON and served to the frontend."""
+
+    collected_at: str
+    source_host: str
+    collection_status: Literal["ok", "failed"]
+    collection_errors: list[str] = Field(default_factory=list)
+    sections_collected: dict[str, bool] = Field(default_factory=dict)
+    summary: Summary = Field(default_factory=Summary)
+    container: dict[str, Any] = Field(default_factory=dict)
+    vps: dict[str, Any] = Field(default_factory=dict)
+    polling: dict[str, Any] = Field(default_factory=dict)
+    external_health: dict[str, Any] = Field(default_factory=dict)
+    sqlite_metrics: dict[str, Any] = Field(default_factory=dict)
+    queues: dict[str, Any] = Field(default_factory=dict)
+    applications: dict[str, Any] = Field(default_factory=dict)
+    bulk: dict[str, Any] = Field(default_factory=dict)
+    urgent: dict[str, Any] = Field(default_factory=dict)
+    business: dict[str, Any] = Field(default_factory=dict)
+    drafts: dict[str, Any] = Field(default_factory=dict)
+    log_events: dict[str, Any] = Field(default_factory=dict)
+    thresholds: dict[str, Any] = Field(default_factory=dict)
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class CollectResponse(BaseModel):
+    """Response returned by manual collection endpoint."""
+
+    skipped: bool = False
+    reason: str | None = None
+    snapshot: Snapshot | None = None

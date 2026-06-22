@@ -15,6 +15,7 @@ from app.bulk import (
     LEGACY_BULK_STAGING_HEADERS,
     BulkApplicationRegistrar,
     GoogleSheetsBulkBatchService,
+    _bulk_schema_layout,
 )
 from app.models import (
     AnswerType,
@@ -28,6 +29,19 @@ from app.models import (
 )
 from app.repository import DraftRepository
 from app.submission import DirectionSpreadsheetConfig
+
+
+def test_new_bulk_sheet_uses_client_case_header():
+    assert "Кейс или сообщения клиента" in BULK_STAGING_HEADERS
+    assert "Причина изменений" not in BULK_STAGING_HEADERS
+    assert _bulk_schema_layout(BULK_STAGING_HEADERS)["schema"] == "new"
+
+
+def test_old_bulk_sheet_headers_remain_supported():
+    assert "Причина изменений" in CURRENT_BULK_STAGING_HEADERS
+    assert "Причина изменений" in LEGACY_BULK_STAGING_HEADERS
+    assert _bulk_schema_layout(CURRENT_BULK_STAGING_HEADERS)["schema"] == "current"
+    assert _bulk_schema_layout(LEGACY_BULK_STAGING_HEADERS)["schema"] == "legacy"
 
 
 FL_SPREADSHEET = "fl-spreadsheet"
@@ -787,7 +801,7 @@ async def test_first_batch_registration_stops_before_next_batch_header(tmp_path)
                 CURRENT_BULK_STAGING_HEADERS,
                 second_row,
             ],
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A11:N"): [],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A11:N17"): [],
         },
     )
     registrar = BulkApplicationRegistrar(
@@ -832,7 +846,7 @@ async def test_bulk_registration_rejects_data_after_allocated_boundary(tmp_path)
         rows={
             (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
             (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N4"): [valid_row],
-            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A5:N"): [overflow_row],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A5:N5"): [overflow_row],
         },
     )
     registrar = BulkApplicationRegistrar(
@@ -850,6 +864,110 @@ async def test_bulk_registration_rejects_data_after_allocated_boundary(tmp_path)
     saved = await repository.get_bulk_batch("BATCH-OVERFLOW")
     assert saved is not None
     assert saved.registration_state == BulkRegistrationState.DRAFT.value
+
+
+@pytest.mark.asyncio
+async def test_bulk_registration_overflow_check_stops_before_known_next_batch(tmp_path):
+    repository = DraftRepository(str(tmp_path / "overflow_next.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-CURRENT1",
+        telegram_user_id=123,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=7,
+        data_end_row=10,
+    )
+    await repository.save_bulk_batch(
+        batch_id="BATCH-NEXT2222",
+        telegram_user_id=456,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=13,
+        data_start_row=15,
+        reserved_rows=7,
+        data_end_row=21,
+    )
+    valid_row = [AnswerType.ROLLOUT.value, "inside", "", "", "", "", ChangeType.ADD.value]
+    overflow_row = [AnswerType.ROLLOUT.value, "outside", "", "", "", "", ChangeType.ADD.value]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
+        rows={
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N10"): [valid_row],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A11:N12"): [overflow_row],
+        },
+    )
+    registrar = BulkApplicationRegistrar(
+        repository=repository,
+        spreadsheet_id=FL_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    result = await registrar.register_batch("BATCH-CURRENT1", 123)
+
+    assert result.success is False
+    assert any(
+        call["range"] == f"'{BULK_SHEET}'!A11:N12"
+        for call in api.value_get_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_registration_skips_overflow_read_when_next_batch_is_adjacent(tmp_path):
+    repository = DraftRepository(str(tmp_path / "overflow_adjacent.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-CURRENT1",
+        telegram_user_id=123,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=2,
+        data_start_row=4,
+        reserved_rows=7,
+        data_end_row=10,
+    )
+    await repository.save_bulk_batch(
+        batch_id="BATCH-NEXT2222",
+        telegram_user_id=456,
+        spreadsheet_id=FL_SPREADSHEET,
+        direction=Direction.FL.value,
+        sheet_name=BULK_SHEET,
+        sheet_id=100,
+        start_row=11,
+        data_start_row=13,
+        reserved_rows=7,
+        data_end_row=19,
+    )
+    row = [AnswerType.ROLLOUT.value, "inside", "", "", "", "", ChangeType.ADD.value]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {BULK_SHEET: 100}},
+        rows={
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A3:N3"): [CURRENT_BULK_STAGING_HEADERS],
+            (FL_SPREADSHEET, f"'{BULK_SHEET}'!A4:N10"): [row],
+        },
+    )
+    registrar = BulkApplicationRegistrar(
+        repository=repository,
+        spreadsheet_id=FL_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    result = await registrar.register_batch("BATCH-CURRENT1", 123)
+
+    assert result.success is True
+    assert all(call["range"] != f"'{BULK_SHEET}'!A11:N10" for call in api.value_get_calls)
+    assert all(call["range"] != f"'{BULK_SHEET}'!A11:N11" for call in api.value_get_calls)
 
 
 @pytest.mark.asyncio

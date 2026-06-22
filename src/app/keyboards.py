@@ -222,7 +222,7 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                     ],
                 ]
             )
-        case KeyboardKind.EDIT_MENU | KeyboardKind.EDIT_MENU_ROLLOUT:
+        case KeyboardKind.EDIT_MENU | KeyboardKind.EDIT_MENU_ROLLOUT | KeyboardKind.EDIT_MENU_CHIPS:
             change_type_rows = (
                 [
                     [
@@ -232,8 +232,45 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                         )
                     ]
                 ]
-                if kind == KeyboardKind.EDIT_MENU_ROLLOUT
+                if kind in {KeyboardKind.EDIT_MENU_ROLLOUT, KeyboardKind.EDIT_MENU_CHIPS}
                 else []
+            )
+            content_rows = (
+                [
+                    [
+                        InlineKeyboardButton(
+                            text="Текст до чипса",
+                            callback_data=CallbackData.edit_field(FieldName.CHIP_TEXT_BEFORE),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Текст чипса",
+                            callback_data=CallbackData.edit_field(FieldName.CHIP_TEXT),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Текст после чипса",
+                            callback_data=CallbackData.edit_field(FieldName.CHIP_TEXT_AFTER),
+                        )
+                    ],
+                ]
+                if kind == KeyboardKind.EDIT_MENU_CHIPS
+                else [
+                    [
+                        InlineKeyboardButton(
+                            text="Суть изменений",
+                            callback_data=CallbackData.edit_field(FieldName.CHANGE_DESCRIPTION),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Исходный текст",
+                            callback_data=CallbackData.edit_field(FieldName.SOURCE_TEXT),
+                        )
+                    ],
+                ]
             )
             return InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -264,22 +301,11 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                     ],
                     [
                         InlineKeyboardButton(
-                            text="Причина",
+                            text=("Причина" if kind == KeyboardKind.EDIT_MENU_CHIPS else "Кейс/сообщения"),
                             callback_data=CallbackData.edit_field(FieldName.REASON),
                         )
                     ],
-                    [
-                        InlineKeyboardButton(
-                            text="Суть изменений",
-                            callback_data=CallbackData.edit_field(FieldName.CHANGE_DESCRIPTION),
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="Исходный текст",
-                            callback_data=CallbackData.edit_field(FieldName.SOURCE_TEXT),
-                        )
-                    ],
+                    *content_rows,
                     [
                         InlineKeyboardButton(
                             text="Срочная",

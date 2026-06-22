@@ -16,6 +16,9 @@ class Step(StrEnum):
     CHANGE_DESCRIPTION = "change_description"
     CHANGE_DESCRIPTION_CLARIFICATION = "change_description_clarification"
     SOURCE_TEXT = "source_text"
+    CHIP_TEXT_BEFORE = "chip_text_before"
+    CHIP_TEXT = "chip_text"
+    CHIP_TEXT_AFTER = "chip_text_after"
     URGENCY = "urgency"
     PRIORITY = "priority"
     REVIEW = "review"
@@ -28,6 +31,9 @@ class Step(StrEnum):
     EDIT_REASON = "edit_reason"
     EDIT_CHANGE_DESCRIPTION = "edit_change_description"
     EDIT_SOURCE_TEXT = "edit_source_text"
+    EDIT_CHIP_TEXT_BEFORE = "edit_chip_text_before"
+    EDIT_CHIP_TEXT = "edit_chip_text"
+    EDIT_CHIP_TEXT_AFTER = "edit_chip_text_after"
     EDIT_URGENCY = "edit_urgency"
     EDIT_PRIORITY = "edit_priority"
 
@@ -113,6 +119,12 @@ class BulkRegistrationState(StrEnum):
     REGISTERED = "REGISTERED"
 
 
+class BulkBatchLocationState(StrEnum):
+    KNOWN = "KNOWN"
+    MISSING = "MISSING"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
 class SubmissionState(StrEnum):
     DRAFT = "DRAFT"
     PENDING = "PENDING"
@@ -140,6 +152,7 @@ class LlmCheckStatus(StrEnum):
     ERROR = "error"
     STUB_COMPLETE = "stub_complete"
     NEEDS_ATTENTION = "needs_attention"
+    SKIPPED = "skipped"
 
 
 class KeyboardKind(StrEnum):
@@ -158,6 +171,7 @@ class KeyboardKind(StrEnum):
     REVIEW = "review"
     EDIT_MENU = "edit_menu"
     EDIT_MENU_ROLLOUT = "edit_menu_rollout"
+    EDIT_MENU_CHIPS = "edit_menu_chips"
     BULK_MENU = "bulk_menu"
     BULK_DIRECTION = "bulk_direction"
     BULK_CREATED = "bulk_created"
@@ -208,6 +222,9 @@ class FieldName(StrEnum):
     REASON = "reason"
     CHANGE_DESCRIPTION = "change_description"
     SOURCE_TEXT = "source_text"
+    CHIP_TEXT_BEFORE = "chip_text_before"
+    CHIP_TEXT = "chip_text"
+    CHIP_TEXT_AFTER = "chip_text_after"
     URGENCY = "is_urgent"
     PRIORITY = "priority"
 
@@ -222,6 +239,12 @@ TEXT_FIELDS = {
     "formatted_change_description",
     FieldName.SOURCE_TEXT.value,
     "source_text_formatting_json",
+    FieldName.CHIP_TEXT_BEFORE.value,
+    "chip_text_before_formatting_json",
+    FieldName.CHIP_TEXT.value,
+    "chip_text_formatting_json",
+    FieldName.CHIP_TEXT_AFTER.value,
+    "chip_text_after_formatting_json",
     "application_type",
     "change_type",
     "author_name",
@@ -258,6 +281,12 @@ class Draft:
     formatted_change_description: str | None = None
     source_text: str | None = None
     source_text_formatting_json: str | None = None
+    chip_text_before: str | None = None
+    chip_text_before_formatting_json: str | None = None
+    chip_text: str | None = None
+    chip_text_formatting_json: str | None = None
+    chip_text_after: str | None = None
+    chip_text_after_formatting_json: str | None = None
     priority: str | None = None
     llm_check_status: str = LlmCheckStatus.NOT_CHECKED.value
     llm_score: float | None = None
@@ -331,6 +360,7 @@ class SubmittedApplication:
     direction: str | None = None
     answer_type: str | None = None
     application_type: str | None = None
+    change_type: str | None = None
     is_urgent: bool | None = None
     batch_id: str | None = None
     last_seen_row_number: int | None = None
@@ -365,6 +395,11 @@ class BulkBatch:
     batch_status: str = BulkBatchStatus.NEW.value
     last_known_batch_status: str = BulkBatchStatus.NEW.value
     last_seen_final_answers_digest_at: str | None = None
+    location_state: str = BulkBatchLocationState.KNOWN.value
+    location_miss_count: int = 0
+    last_location_search_at: str | None = None
+    next_location_search_at: str | None = None
+    last_location_error: str | None = None
     created_at: str = ""
     updated_at: str = ""
 

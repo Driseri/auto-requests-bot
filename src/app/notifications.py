@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import gc
 import hashlib
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from time import monotonic
 from dataclasses import dataclass
 from html import escape
@@ -27,13 +30,16 @@ from app.models import (
     ApplicationType,
     BulkApplicationStatus,
     BulkBatch,
+    BulkBatchLocationState,
     BulkBatchStatus,
+    ChangeType,
     DashboardEntityType,
     KeyboardKind,
     SubmittedApplication,
 )
 from app.repository import DraftRepository
 from app.submission import (
+    CHIPS_WORKSHEET_HEADERS,
     CURRENT_WORKSHEET_HEADERS,
     DashboardSyncService,
     DirectionSpreadsheetConfig,
@@ -49,6 +55,7 @@ from app.submission import (
 
 
 LOGGER = logging.getLogger(__name__)
+URGENT_EDITOR_NOTIFICATION_EVENT_TYPE = "urgent-editor-application-created"
 SINGLE_IMPORTANT_STATUSES = {
     ApplicationStatus.NEEDS_CLARIFICATION.value,
     ApplicationStatus.FINAL_ANSWER_READY.value,
@@ -96,6 +103,7 @@ class SheetApplicationStatus:
     direction: str | None = None
     answer_type: str | None = None
     is_urgent: bool | None = None
+    change_type: str | None = None
     end_column: str = "W"
 
 
@@ -119,6 +127,24 @@ class BulkEditorComment:
     row_number: int
     comment: str
     end_column: str = "L"
+
+
+@dataclass(frozen=True, slots=True)
+class BulkBatchLocation:
+    batch_id: str
+    spreadsheet_id: str
+    sheet_name: str
+    sheet_id: int
+    start_row: int
+
+
+@dataclass(slots=True)
+class BulkBatchLocationScan:
+    locations: dict[str, BulkBatchLocation]
+    confirmed_missing_ids: set[str]
+    ambiguous_rows: dict[str, tuple[int, ...]]
+    unavailable_ids: set[str]
+    deferred_ids: set[str]
 
 
 @dataclass(slots=True)
@@ -147,6 +173,7 @@ class GoogleSheetsStatusReader:
         self._external_sheets_api = sheets_api is not None
         self.google_api_retry = google_api_retry
         self._sheet_ids_cache: dict[str, dict[str, int]] = {}
+        self.unavailable_single_sources: set[tuple[str, str]] = set()
 
     async def read_statuses(self) -> dict[str, SheetApplicationStatus]:
         return await self._run_with_retry(self._read_statuses_sync, "status-full-scan")
@@ -180,6 +207,17 @@ class GoogleSheetsStatusReader:
         return await self._run_with_retry(
             lambda: self._read_batch_statuses_sync(batches),
             "status-bulk-batches",
+        )
+
+    async def resolve_bulk_batch_locations(
+        self,
+        batches: list[BulkBatch],
+        *,
+        search_batch_ids: set[str],
+    ) -> BulkBatchLocationScan:
+        return await self._run_with_retry(
+            lambda: self._resolve_bulk_batch_locations_sync(batches, search_batch_ids),
+            "status-bulk-locations",
         )
 
     async def read_bulk_editor_comments(
@@ -228,6 +266,7 @@ class GoogleSheetsStatusReader:
                         direction=_cell(row, layout["direction"]).strip() or None,
                         answer_type=_cell(row, layout["answer_type"]).strip() or None,
                         is_urgent=_sheet_bool(_cell(row, layout["is_urgent"])),
+                        change_type=_cell(row, layout.get("change_type", -1)).strip() or None,
                         status=_cell(row, layout["status"]).strip(),
                         editor=_cell(row, layout["editor"]).strip(),
                         editor_comment=_cell(row, layout["comment"]).strip(),
@@ -243,6 +282,7 @@ class GoogleSheetsStatusReader:
     ) -> dict[str, SheetApplicationStatus]:
         api = self._get_sheets_api()
         result: dict[str, SheetApplicationStatus] = {}
+        self.unavailable_single_sources = set()
         grouped: dict[tuple[str, str], list[SubmittedApplication]] = {}
         for application in applications:
             if application.batch_id or not application.spreadsheet_id or not application.sheet_name:
@@ -256,16 +296,50 @@ class GoogleSheetsStatusReader:
             sheet_id = next((item.sheet_id for item in group if item.sheet_id is not None), None)
             if sheet_id is None:
                 sheet_id = self._read_sheet_ids(api, spreadsheet_id).get(sheet_name)
-            for application in group:
-                current = self._read_expected_application_status(
+            wanted_ids = {item.application_id for item in group}
+            max_seen_row = max(
+                (
+                    item.last_seen_row_number
+                    for item in group
+                    if item.last_seen_row_number is not None and item.last_seen_row_number > 1
+                ),
+                default=None,
+            )
+            if max_seen_row is None:
+                continue
+            try:
+                rows = self._read_sheet_range(
                     api,
-                    application,
+                    spreadsheet_id,
+                    sheet_name,
+                    f"A1:X{max_seen_row}",
+                )
+            except HttpError as exc:
+                if not _is_unparseable_range_error(exc):
+                    raise
+                self.unavailable_single_sources.add((spreadsheet_id, sheet_name))
+                LOGGER.warning(
+                    "Single application sheet range is unavailable; skipping source. "
+                    "spreadsheet_id=%s sheet_name=%s range=%s error=%s",
+                    spreadsheet_id,
+                    sheet_name,
+                    f"A1:X{max_seen_row}",
+                    exc,
+                )
+                continue
+            for index, row, layout in _working_data_rows(rows):
+                application_id = _cell(row, layout["application_id"]).strip()
+                if application_id not in wanted_ids:
+                    continue
+                result[application_id] = _status_from_working_row(
+                    application_id=application_id,
                     spreadsheet_id=spreadsheet_id,
                     sheet_name=sheet_name,
                     sheet_id=sheet_id or 0,
+                    row_number=index,
+                    row=row,
+                    layout=layout,
                 )
-                if current is not None:
-                    result[current.application_id] = current
 
         missing_ids = {
             item.application_id
@@ -287,7 +361,20 @@ class GoogleSheetsStatusReader:
                 )
                 if sheet_id is None:
                     sheet_id = self._read_sheet_ids(api, spreadsheet_id).get(sheet_name)
-                rows = self._read_sheet_rows(api, spreadsheet_id, sheet_name)
+                try:
+                    rows = self._read_sheet_rows(api, spreadsheet_id, sheet_name)
+                except HttpError as exc:
+                    if not _is_unparseable_range_error(exc):
+                        raise
+                    self.unavailable_single_sources.add((spreadsheet_id, sheet_name))
+                    LOGGER.warning(
+                        "Single application full sheet range is unavailable; "
+                        "skipping source. spreadsheet_id=%s sheet_name=%s error=%s",
+                        spreadsheet_id,
+                        sheet_name,
+                        exc,
+                    )
+                    continue
                 for index, row, layout in _working_data_rows(rows):
                     application_id = _cell(row, layout["application_id"]).strip()
                     if application_id not in wanted_ids:
@@ -508,6 +595,151 @@ class GoogleSheetsStatusReader:
             )
         return result
 
+    def _resolve_bulk_batch_locations_sync(
+        self,
+        batches: list[BulkBatch],
+        search_batch_ids: set[str],
+    ) -> BulkBatchLocationScan:
+        api = self._get_sheets_api()
+        locations: dict[str, BulkBatchLocation] = {}
+        unavailable_ids: set[str] = set()
+        unresolved_by_sheet: dict[
+            tuple[str, int, str], list[BulkBatch]
+        ] = {}
+        expected_by_spreadsheet: dict[
+            str, list[tuple[BulkBatch, str, int, str]]
+        ] = {}
+        fresh_sheet_ids: dict[str, dict[str, int]] = {}
+
+        for batch in batches:
+            sheet_ids = fresh_sheet_ids.get(batch.spreadsheet_id)
+            if sheet_ids is None:
+                sheet_ids = self._read_sheet_ids(
+                    api,
+                    batch.spreadsheet_id,
+                    refresh=True,
+                )
+                fresh_sheet_ids[batch.spreadsheet_id] = sheet_ids
+            current_name = next(
+                (name for name, sheet_id in sheet_ids.items() if sheet_id == batch.sheet_id),
+                None,
+            )
+            if current_name is None and sheet_ids.get(batch.sheet_name) == batch.sheet_id:
+                current_name = batch.sheet_name
+            if current_name is None:
+                unavailable_ids.add(batch.batch_id)
+                continue
+            range_name = (
+                f"{quote_sheet_name(current_name)}!"
+                f"A{batch.start_row}:N{batch.start_row + 1}"
+            )
+            expected_by_spreadsheet.setdefault(batch.spreadsheet_id, []).append(
+                (batch, range_name, batch.sheet_id, current_name)
+            )
+
+        for spreadsheet_id, entries in expected_by_spreadsheet.items():
+            for chunk_start in range(0, len(entries), 100):
+                chunk = entries[chunk_start : chunk_start + 100]
+                values_resource = api.spreadsheets().values()
+                try:
+                    if hasattr(values_resource, "batchGet"):
+                        response = values_resource.batchGet(
+                            spreadsheetId=spreadsheet_id,
+                            ranges=[entry[1] for entry in chunk],
+                            majorDimension="ROWS",
+                        ).execute()
+                        rows_by_range = [
+                            item.get("values", [])
+                            for item in response.get("valueRanges", [])
+                        ]
+                        rows_by_range.extend([[]] * (len(chunk) - len(rows_by_range)))
+                    else:
+                        rows_by_range = [
+                            values_resource.get(
+                                spreadsheetId=spreadsheet_id,
+                                range=range_name,
+                                majorDimension="ROWS",
+                            ).execute().get("values", [])
+                            for _, range_name, _, _ in chunk
+                        ]
+                except HttpError as exc:
+                    if not _is_unparseable_range_error(exc):
+                        raise
+                    unavailable_ids.update(entry[0].batch_id for entry in chunk)
+                    continue
+
+                for (batch, _, sheet_id, sheet_name), rows in zip(
+                    chunk,
+                    rows_by_range,
+                    strict=True,
+                ):
+                    if _is_bulk_batch_block(rows, batch.batch_id):
+                        locations[batch.batch_id] = BulkBatchLocation(
+                            batch_id=batch.batch_id,
+                            spreadsheet_id=batch.spreadsheet_id,
+                            sheet_name=sheet_name,
+                            sheet_id=sheet_id,
+                            start_row=batch.start_row,
+                        )
+                        continue
+                    unresolved_by_sheet.setdefault(
+                        (batch.spreadsheet_id, sheet_id, sheet_name), []
+                    ).append(batch)
+
+        confirmed_missing_ids: set[str] = set()
+        ambiguous_rows: dict[str, tuple[int, ...]] = {}
+        deferred_ids: set[str] = set()
+        for (spreadsheet_id, sheet_id, sheet_name), sheet_batches in unresolved_by_sheet.items():
+            due_batches = [
+                batch for batch in sheet_batches if batch.batch_id in search_batch_ids
+            ]
+            deferred_ids.update(
+                batch.batch_id
+                for batch in sheet_batches
+                if batch.batch_id not in search_batch_ids
+            )
+            if not due_batches:
+                continue
+            try:
+                rows = self._read_sheet_range(
+                    api,
+                    spreadsheet_id,
+                    sheet_name,
+                    "A:N",
+                )
+            except HttpError as exc:
+                if not _is_unparseable_range_error(exc):
+                    raise
+                unavailable_ids.update(batch.batch_id for batch in due_batches)
+                continue
+            for batch in due_batches:
+                candidates = tuple(
+                    row_number
+                    for row_number in range(1, len(rows) + 1)
+                    if _cell(rows[row_number - 1], 1).strip() == batch.batch_id
+                    and _is_bulk_batch_block(rows[row_number - 1 : row_number + 1], batch.batch_id)
+                )
+                if len(candidates) == 1:
+                    locations[batch.batch_id] = BulkBatchLocation(
+                        batch_id=batch.batch_id,
+                        spreadsheet_id=spreadsheet_id,
+                        sheet_name=sheet_name,
+                        sheet_id=sheet_id,
+                        start_row=candidates[0],
+                    )
+                elif not candidates:
+                    confirmed_missing_ids.add(batch.batch_id)
+                else:
+                    ambiguous_rows[batch.batch_id] = candidates
+
+        return BulkBatchLocationScan(
+            locations=locations,
+            confirmed_missing_ids=confirmed_missing_ids,
+            ambiguous_rows=ambiguous_rows,
+            unavailable_ids=unavailable_ids,
+            deferred_ids=deferred_ids,
+        )
+
     def _read_bulk_editor_comments_sync(
         self,
         batches: list[BulkBatch],
@@ -565,8 +797,14 @@ class GoogleSheetsStatusReader:
                 result.append(spreadsheet_id)
         return result
 
-    def _read_sheet_ids(self, api: Any, spreadsheet_id: str) -> dict[str, int]:
-        if spreadsheet_id in self._sheet_ids_cache:
+    def _read_sheet_ids(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, int]:
+        if not refresh and spreadsheet_id in self._sheet_ids_cache:
             return self._sheet_ids_cache[spreadsheet_id]
         metadata = api.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
@@ -621,6 +859,7 @@ class StatusNotificationService:
         dashboard_sync: DashboardSyncService | None = None,
         dashboard_sync_interval_seconds: float = 300,
         completed_bulk_dashboard_scan_interval_seconds: float = 3600,
+        bulk_relocation_search_interval_seconds: int = 3600,
         dashboard_outbox_retry_base_seconds: int = 60,
         dashboard_outbox_retry_max_seconds: int = 3600,
         dashboard_outbox_sending_stale_seconds: int = 300,
@@ -641,6 +880,9 @@ class StatusNotificationService:
         self.dashboard_sync_interval_seconds = dashboard_sync_interval_seconds
         self.completed_bulk_dashboard_scan_interval_seconds = (
             completed_bulk_dashboard_scan_interval_seconds
+        )
+        self.bulk_relocation_search_interval_seconds = (
+            bulk_relocation_search_interval_seconds
         )
         self.dashboard_outbox_retry_base_seconds = dashboard_outbox_retry_base_seconds
         self.dashboard_outbox_retry_max_seconds = dashboard_outbox_retry_max_seconds
@@ -676,6 +918,22 @@ class StatusNotificationService:
             else []
         )
         scan_batches = _unique_batches([*active_batches, *completed_batches])
+        relocated_batch_ids: set[str] = set()
+        if scan_batches and hasattr(self.status_reader, "resolve_bulk_batch_locations"):
+            (
+                active_batches,
+                completed_batches,
+                scan_batches,
+                verified_batch_ids,
+                relocated_batch_ids,
+            ) = await self._resolve_bulk_batch_locations(
+                active_batches,
+                completed_batches,
+                scan_batches,
+            )
+            scanned_batch_ids = verified_batch_ids
+        else:
+            scanned_batch_ids = {batch.batch_id for batch in scan_batches}
         current_batch_statuses = (
             await self.status_reader.read_batch_statuses(active_batches)
             if active_batches and hasattr(self.status_reader, "read_batch_statuses")
@@ -697,6 +955,11 @@ class StatusNotificationService:
             statuses.update(
                 await self.status_reader.read_bulk_application_statuses(scan_batches)
             )
+        unavailable_single_sources = getattr(
+            self.status_reader,
+            "unavailable_single_sources",
+            set(),
+        )
         await self._process_bulk_batch_statuses(
             active_batches,
             current_batch_statuses,
@@ -708,6 +971,16 @@ class StatusNotificationService:
         for application in tracked:
             current = statuses.get(application.application_id)
             if current is None:
+                if application.batch_id and application.batch_id not in scanned_batch_ids:
+                    continue
+                if (
+                    not application.batch_id
+                    and application.spreadsheet_id
+                    and application.sheet_name
+                    and (application.spreadsheet_id, application.sheet_name)
+                    in unavailable_single_sources
+                ):
+                    continue
                 await self.repository.mark_submitted_application_not_found(
                     application.application_id,
                     threshold=self.status_not_found_threshold,
@@ -729,7 +1002,11 @@ class StatusNotificationService:
                 (current.editor or EDITOR_NOT_SELECTED)
                 != (application.last_seen_editor or EDITOR_NOT_SELECTED)
             )
-            if application.batch_id:
+            is_chips = (
+                ChangeType.normalize(current.change_type or application.change_type)
+                == ChangeType.CHIPS
+            )
+            if application.batch_id or is_chips:
                 final_answer_changed = False
             else:
                 final_answer_changed = (
@@ -812,10 +1089,124 @@ class StatusNotificationService:
                 current_batch_statuses,
             )
             self._last_dashboard_sync_at = self.clock()
+        elif relocated_batch_ids:
+            await self._enqueue_periodic_dashboard_projections(
+                [],
+                statuses,
+                [
+                    batch
+                    for batch in scan_batches
+                    if batch.batch_id in relocated_batch_ids
+                ],
+                current_batch_statuses,
+            )
         if completed_bulk_scan_due:
             self._last_completed_bulk_scan_at = self.clock()
         await self._deliver_outbox()
         await self._deliver_dashboard_outbox()
+
+    async def _resolve_bulk_batch_locations(
+        self,
+        active_batches: list[BulkBatch],
+        completed_batches: list[BulkBatch],
+        scan_batches: list[BulkBatch],
+    ) -> tuple[list[BulkBatch], list[BulkBatch], list[BulkBatch], set[str], set[str]]:
+        search_batch_ids = {
+            batch.batch_id
+            for batch in scan_batches
+            if _bulk_location_search_due(batch)
+        }
+        scan = await self.status_reader.resolve_bulk_batch_locations(
+            scan_batches,
+            search_batch_ids=search_batch_ids,
+        )
+        batches_by_id = {batch.batch_id: batch for batch in scan_batches}
+        resolved_by_id: dict[str, BulkBatch] = {}
+        relocated_batch_ids: set[str] = set()
+
+        for batch_id, location in scan.locations.items():
+            batch = batches_by_id[batch_id]
+            moved = (
+                batch.spreadsheet_id != location.spreadsheet_id
+                or batch.sheet_name != location.sheet_name
+                or batch.sheet_id != location.sheet_id
+                or batch.start_row != location.start_row
+            )
+            needs_reset = batch.location_state != BulkBatchLocationState.KNOWN.value
+            if moved or needs_reset:
+                restored = await self.repository.restore_bulk_batch_location(
+                    batch_id,
+                    spreadsheet_id=location.spreadsheet_id,
+                    sheet_name=location.sheet_name,
+                    sheet_id=location.sheet_id,
+                    start_row=location.start_row,
+                )
+                if restored is not None:
+                    resolved_by_id[batch_id] = restored
+                    if moved:
+                        relocated_batch_ids.add(batch_id)
+                        LOGGER.warning(
+                            "Bulk batch location restored: batch_id=%s sheet_id=%s "
+                            "old_sheet=%s new_sheet=%s old_start_row=%s new_start_row=%s",
+                            batch_id,
+                            location.sheet_id,
+                            batch.sheet_name,
+                            location.sheet_name,
+                            batch.start_row,
+                            location.start_row,
+                        )
+                    continue
+            resolved_by_id[batch_id] = batch
+
+        for batch_id in scan.confirmed_missing_ids:
+            await self.repository.record_bulk_batch_location_problem(
+                batch_id,
+                state=BulkBatchLocationState.MISSING.value,
+                error="Batch ID was not found on its source sheet",
+                recheck_seconds=self.bulk_relocation_search_interval_seconds,
+            )
+            await self.repository.mark_bulk_batch_applications_not_found(
+                batch_id,
+                threshold=self.status_not_found_threshold,
+                recheck_seconds=self.status_not_found_recheck_seconds,
+            )
+            LOGGER.warning(
+                "Bulk batch was not found on its source sheet: batch_id=%s",
+                batch_id,
+            )
+
+        for batch_id, rows in scan.ambiguous_rows.items():
+            message = f"Duplicate batch ID candidates at rows: {','.join(map(str, rows))}"
+            await self.repository.record_bulk_batch_location_problem(
+                batch_id,
+                state=BulkBatchLocationState.AMBIGUOUS.value,
+                error=message,
+                recheck_seconds=self.bulk_relocation_search_interval_seconds,
+            )
+            LOGGER.error(
+                "Bulk batch location is ambiguous: batch_id=%s candidate_rows=%s",
+                batch_id,
+                rows,
+            )
+
+        verified_ids = set(scan.locations)
+
+        def resolved_batches(source: list[BulkBatch]) -> list[BulkBatch]:
+            return [
+                resolved_by_id[batch.batch_id]
+                for batch in source
+                if batch.batch_id in verified_ids
+            ]
+
+        resolved_active = resolved_batches(active_batches)
+        resolved_completed = resolved_batches(completed_batches)
+        return (
+            resolved_active,
+            resolved_completed,
+            _unique_batches([*resolved_active, *resolved_completed]),
+            verified_ids,
+            relocated_batch_ids,
+        )
 
     def _is_dashboard_sync_due(self) -> bool:
         if self.dashboard_sync is None:
@@ -866,16 +1257,17 @@ class StatusNotificationService:
             if current.status == BulkBatchStatus.DONE.value:
                 notifications_by_user.setdefault(batch.telegram_user_id, []).append(item)
             else:
+                projection = self._bulk_dashboard_projection(
+                    batch,
+                    current.status,
+                    application_statuses,
+                    row_link=self._batch_status_row_link(current),
+                )
                 await self.repository.update_bulk_batch_status(
                     batch.batch_id,
                     batch_status=current.status,
                     last_known_batch_status=current.status,
-                    dashboard_projection=self._bulk_dashboard_projection(
-                        batch,
-                        current.status,
-                        application_statuses,
-                        row_link=self._batch_status_row_link(current),
-                    ),
+                    dashboard_projection=projection["snapshot"],
                 )
 
         for telegram_user_id, items in notifications_by_user.items():
@@ -964,9 +1356,7 @@ class StatusNotificationService:
                     item.telegram_user_id,
                     item.html,
                     parse_mode="HTML",
-                    reply_markup=await self._reply_markup_for_user(
-                        item.telegram_user_id
-                    ),
+                    reply_markup=await self._reply_markup_for_outbox_item(item),
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
             except Exception as exc:
@@ -1174,6 +1564,7 @@ class StatusNotificationService:
             "last_seen_editor": current.editor or EDITOR_NOT_SELECTED,
             "last_seen_editor_comment": current.editor_comment,
             "last_seen_final_answer": current.final_answer,
+            "change_type": current.change_type or tracked.change_type,
         }
 
     @staticmethod
@@ -1312,6 +1703,14 @@ class StatusNotificationService:
             await self._keyboard_kind_for_user(telegram_user_id)
         )
 
+    async def _reply_markup_for_outbox_item(
+        self,
+        item: Any,
+    ) -> Any | None:
+        if item.event_type == URGENT_EDITOR_NOTIFICATION_EVENT_TYPE:
+            return None
+        return await self._reply_markup_for_user(item.telegram_user_id)
+
     async def _keyboard_kind_for_user(self, telegram_user_id: int) -> KeyboardKind:
         settings = await self.repository.get_user_settings(telegram_user_id)
         pending_action = settings.pending_action or ""
@@ -1335,11 +1734,15 @@ async def run_status_polling_loop(
     service: StatusNotificationService,
     interval_seconds: float,
     heartbeat_path: str | None = None,
+    memory_log_interval: int = 10,
 ) -> None:
     """Запускать polling постоянно и писать heartbeat только после успеха."""
     consecutive_errors = 0
     successful_iterations = 0
+    attempted_iterations = 0
+    previous_rss_mb: float | None = None
     while True:
+        attempted_iterations += 1
         try:
             await service.run_once()
             successful_iterations += 1
@@ -1359,7 +1762,63 @@ async def run_status_polling_loop(
                 "Status polling iteration failed: consecutive_errors=%s",
                 consecutive_errors,
             )
+        _run_memory_maintenance()
+        if memory_log_interval > 0 and attempted_iterations % memory_log_interval == 0:
+            snapshot = _process_memory_snapshot_mb()
+            if snapshot is not None:
+                rss_mb, vms_mb = snapshot
+                delta_rss_mb = (
+                    0.0 if previous_rss_mb is None else rss_mb - previous_rss_mb
+                )
+                previous_rss_mb = rss_mb
+                LOGGER.info(
+                    "Status polling memory: iteration=%s rss_mb=%.1f "
+                    "vms_mb=%.1f delta_rss_mb=%.1f consecutive_errors=%s",
+                    attempted_iterations,
+                    rss_mb,
+                    vms_mb,
+                    delta_rss_mb,
+                    consecutive_errors,
+                )
         await asyncio.sleep(interval_seconds)
+
+
+def _run_memory_maintenance() -> None:
+    try:
+        gc.collect()
+        _malloc_trim()
+    except Exception:
+        LOGGER.debug("Status polling memory maintenance failed", exc_info=True)
+
+
+def _malloc_trim() -> None:
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        trim = getattr(libc, "malloc_trim", None)
+        if trim is None:
+            return
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        trim(0)
+    except OSError:
+        return
+
+
+def _process_memory_snapshot_mb() -> tuple[float, float] | None:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as file:
+            values = {}
+            for line in file:
+                if line.startswith(("VmRSS:", "VmSize:")):
+                    name, raw_value = line.split(":", maxsplit=1)
+                    values[name] = float(raw_value.strip().split()[0]) / 1024
+    except OSError:
+        return None
+    rss_mb = values.get("VmRSS")
+    vms_mb = values.get("VmSize")
+    if rss_mb is None or vms_mb is None:
+        return None
+    return rss_mb, vms_mb
 
 
 def _render_answer_block(answer: str, row_link: str) -> str:
@@ -1437,6 +1896,7 @@ def _status_from_working_row(
         direction=_cell(row, layout["direction"]).strip() or None,
         answer_type=_cell(row, layout["answer_type"]).strip() or None,
         is_urgent=_sheet_bool(_cell(row, layout["is_urgent"])),
+        change_type=_cell(row, layout.get("change_type", -1)).strip() or None,
         status=_cell(row, layout["status"]).strip(),
         editor=_cell(row, layout["editor"]).strip(),
         editor_comment=_cell(row, layout["comment"]).strip(),
@@ -1447,6 +1907,21 @@ def _status_from_working_row(
 
 def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
     headers = [str(value).strip() for value in header_row]
+    if headers[: len(CHIPS_WORKSHEET_HEADERS)] == CHIPS_WORKSHEET_HEADERS:
+        return {
+            "application_id": 11,
+            "batch_id": 12,
+            "application_type": 13,
+            "direction": 15,
+            "answer_type": 16,
+            "is_urgent": 17,
+            "status": 9,
+            "editor": 10,
+            "comment": 7,
+            "final_answer": -1,
+            "change_type": 20,
+            "end_column": "U",
+        }
     if headers[: len(WORKSHEET_HEADERS)] == WORKSHEET_HEADERS:
         return {
             "application_id": 11,
@@ -1459,6 +1934,7 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "editor": 10,
             "comment": 7,
             "final_answer": 5,
+            "change_type": 23,
             "end_column": "X",
         }
     if headers[: len(CURRENT_WORKSHEET_HEADERS)] == CURRENT_WORKSHEET_HEADERS:
@@ -1473,6 +1949,7 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "editor": 10,
             "comment": 17,
             "final_answer": 19,
+            "change_type": 22,
             "end_column": "W",
         }
     if headers[: len(LEGACY_WORKSHEET_HEADERS)] == LEGACY_WORKSHEET_HEADERS:
@@ -1487,6 +1964,7 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "editor": -1,
             "comment": 16,
             "final_answer": 18,
+            "change_type": 21,
             "end_column": "V",
         }
     return None
@@ -1551,10 +2029,30 @@ def _bulk_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
     return None
 
 
+def _is_bulk_batch_block(rows: list[list[Any]], batch_id: str) -> bool:
+    return (
+        len(rows) >= 2
+        and _cell(rows[0], 1).strip() == batch_id
+        and _bulk_row_layout(rows[1]) is not None
+    )
+
+
 def _bulk_batch_end_row(batch: BulkBatch) -> int:
     if batch.data_end_row is not None:
         return batch.data_end_row
     return batch.data_start_row + max(batch.reserved_rows, 1) - 1
+
+
+def _bulk_location_search_due(batch: BulkBatch) -> bool:
+    if not batch.next_location_search_at:
+        return True
+    try:
+        next_check = datetime.fromisoformat(batch.next_location_search_at)
+    except ValueError:
+        return True
+    if next_check.tzinfo is None:
+        next_check = next_check.replace(tzinfo=timezone.utc)
+    return next_check <= datetime.now(timezone.utc)
 
 
 def _cell(row: list[Any], index: int) -> str:

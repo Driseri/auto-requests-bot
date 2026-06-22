@@ -18,8 +18,10 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert cutoff_to_string(settings.rollout_schedule.thursday_cutoff) == "14:00"
     assert settings.application_editors == ("редактор 1", "редактор 2")
     assert settings.dashboard_sync_interval_seconds == 300
+    assert settings.status_polling_memory_log_interval == 10
     assert settings.status_not_found_threshold == 20
     assert settings.status_not_found_recheck_seconds == 3600
+    assert settings.bulk_relocation_search_interval_seconds == 3600
     assert settings.bulk_reserved_rows == 100
     assert settings.bulk_registration_stale_seconds == 600
     assert settings.bulk_creation_stale_seconds == 600
@@ -27,6 +29,18 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert settings.notification_retry_base_seconds == 30
     assert settings.notification_sending_stale_seconds == 300
     assert settings.notification_message_max_chars == 3500
+    assert settings.urgent_editor_notifications_enabled is False
+    assert settings.editor_urgent_chat_id is None
+
+
+def test_load_settings_uses_simplified_gigachat_prompt_by_default(monkeypatch):
+    monkeypatch.delenv("GIGACHAT_SYSTEM_PROMPT_PATH", raising=False)
+    monkeypatch.delenv("GIGACHAT_USER_PROMPT_PATH", raising=False)
+
+    settings = load_settings()
+
+    assert settings.gigachat_system_prompt_path == "prompts/gigachat_system_v2.md"
+    assert settings.gigachat_user_prompt_path == "prompts/gigachat_user_v2.md"
 
 
 def test_load_settings_uses_custom_dashboard_sync_interval(monkeypatch):
@@ -35,6 +49,46 @@ def test_load_settings_uses_custom_dashboard_sync_interval(monkeypatch):
     settings = load_settings()
 
     assert settings.dashboard_sync_interval_seconds == 120
+
+
+def test_load_settings_uses_custom_status_polling_memory_log_interval(monkeypatch):
+    monkeypatch.setenv("STATUS_POLLING_MEMORY_LOG_INTERVAL", "0")
+
+    settings = load_settings()
+
+    assert settings.status_polling_memory_log_interval == 0
+
+
+def test_load_settings_rejects_invalid_bulk_relocation_interval(monkeypatch):
+    monkeypatch.setenv("BULK_RELOCATION_SEARCH_INTERVAL_SECONDS", "0")
+
+    with pytest.raises(ValueError, match="BULK_RELOCATION_SEARCH_INTERVAL_SECONDS"):
+        load_settings()
+
+
+def test_load_settings_uses_editor_urgent_chat_id(monkeypatch):
+    monkeypatch.setenv("URGENT_EDITOR_NOTIFICATIONS_ENABLED", "true")
+    monkeypatch.setenv("EDITOR_URGENT_CHAT_ID", "-100123456")
+
+    settings = load_settings()
+
+    assert settings.urgent_editor_notifications_enabled is True
+    assert settings.editor_urgent_chat_id == -100123456
+
+
+def test_load_settings_rejects_enabled_editor_notifications_without_chat(monkeypatch):
+    monkeypatch.setenv("URGENT_EDITOR_NOTIFICATIONS_ENABLED", "true")
+    monkeypatch.setenv("EDITOR_URGENT_CHAT_ID", "")
+
+    with pytest.raises(ValueError, match="EDITOR_URGENT_CHAT_ID"):
+        load_settings()
+
+
+def test_load_settings_rejects_invalid_editor_urgent_chat_id(monkeypatch):
+    monkeypatch.setenv("EDITOR_URGENT_CHAT_ID", "not-a-number")
+
+    with pytest.raises(ValueError, match="EDITOR_URGENT_CHAT_ID"):
+        load_settings()
 
 
 def test_load_settings_uses_custom_bulk_limits(monkeypatch):
@@ -63,6 +117,7 @@ def test_load_settings_uses_custom_bulk_limits(monkeypatch):
         ("NOTIFICATION_MESSAGE_MAX_CHARS", "0"),
         ("STATUS_NOT_FOUND_THRESHOLD", "0"),
         ("STATUS_NOT_FOUND_RECHECK_SECONDS", "0"),
+        ("STATUS_POLLING_MEMORY_LOG_INTERVAL", "-1"),
     ],
 )
 def test_load_settings_rejects_invalid_bulk_limits(monkeypatch, name, value):

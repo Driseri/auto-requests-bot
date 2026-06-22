@@ -11,6 +11,7 @@ from app.bot import (
     STALE_CALLBACK_TEXT,
     ActiveMessageManager,
     CallbackQueryAckMiddleware,
+    PrivateChatOnlyMiddleware,
     UserActionLockMiddleware,
     _answer_bulk_registration,
     _show_callback_processing,
@@ -93,9 +94,11 @@ class UiMessage:
         edit_error: Exception | None = None,
         markup_edit_error: Exception | None = None,
         answer_message_id: int | None = None,
+        chat_type: str = "private",
+        chat_title: str | None = None,
     ) -> None:
         self.message_id = message_id
-        self.chat = SimpleNamespace(id=chat_id)
+        self.chat = SimpleNamespace(id=chat_id, type=chat_type, title=chat_title)
         self.from_user = SimpleNamespace(id=user_id, full_name="Test User")
         self.bot = bot or FakeBot()
         self.edit_error = edit_error
@@ -222,6 +225,53 @@ async def test_user_action_lock_serializes_same_user() -> None:
     release_first.set()
     await asyncio.gather(first, second)
     assert entered == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_private_chat_middleware_ignores_group_message(caplog) -> None:
+    middleware = PrivateChatOnlyMiddleware()
+    event = UiMessage(
+        message_id=10,
+        chat_id=-100123456,
+        chat_type="supergroup",
+        chat_title="Editors",
+    )
+    handled = False
+
+    async def handler(current_event, data):
+        nonlocal handled
+        handled = True
+
+    with caplog.at_level("INFO"):
+        result = await middleware(handler, event, {})
+
+    assert result is None
+    assert not handled
+    assert "chat_id=-100123456" in caplog.text
+    assert "chat_type=supergroup" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_private_chat_middleware_rejects_group_callback() -> None:
+    middleware = PrivateChatOnlyMiddleware()
+    message = UiMessage(
+        message_id=10,
+        chat_id=-100123456,
+        chat_type="group",
+        chat_title="Editors",
+    )
+    callback = FakeCallback(message=message, data="app:new")
+    handled = False
+
+    async def handler(current_event, data):
+        nonlocal handled
+        handled = True
+
+    result = await middleware(handler, callback, {})
+
+    assert result is None
+    assert not handled
+    assert callback.answer_texts == ["Бот принимает заявки только в личном чате."]
 
 
 @pytest.mark.asyncio

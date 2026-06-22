@@ -136,3 +136,44 @@ async def test_review_escapes_source_text_before_formatting(tmp_path):
     response = await flow.show_review(29)
 
     assert "<b>&lt;tag&gt;</b>" in response.text
+
+
+@pytest.mark.asyncio
+async def test_chips_saves_formatting_for_each_text_independently(tmp_path):
+    flow, repository = await make_flow(tmp_path)
+    user_id = 30
+    await flow.start_new(user_id)
+    await flow.select_direction(user_id, Direction.FL)
+    await flow.select_answer_type(user_id, AnswerType.ROLLOUT)
+    await flow.select_change_type(user_id, ChangeType.CHIPS)
+    await flow.handle_text(user_id, "Writer")
+    await flow.handle_text(user_id, "intent")
+    await flow.handle_text(user_id, "reason")
+    await flow.handle_text(
+        user_id,
+        "before",
+        [TextFormattingSpan(start=0, end=3, bold=True)],
+    )
+    await flow.handle_text(
+        user_id,
+        "chip",
+        [TextFormattingSpan(start=0, end=4, strikethrough=True)],
+    )
+    await flow.handle_text(
+        user_id,
+        "after",
+        [TextFormattingSpan(start=1, end=5, bold=True)],
+    )
+
+    draft = await repository.get_by_user_id(user_id)
+
+    assert draft is not None
+    assert json.loads(draft.chip_text_before_formatting_json or "[]") == [
+        {"start": 0, "end": 3, "bold": True, "strikethrough": False}
+    ]
+    assert json.loads(draft.chip_text_formatting_json or "[]") == [
+        {"start": 0, "end": 4, "bold": False, "strikethrough": True}
+    ]
+    assert json.loads(draft.chip_text_after_formatting_json or "[]") == [
+        {"start": 1, "end": 5, "bold": True, "strikethrough": False}
+    ]

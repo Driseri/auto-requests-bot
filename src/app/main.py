@@ -145,6 +145,10 @@ async def main() -> None:
         bulk_reserved_rows=settings.bulk_reserved_rows,
         bulk_creation_stale_seconds=settings.bulk_creation_stale_seconds,
         dashboard_enabled=bool(settings.google_dashboard_spreadsheet_id),
+        urgent_editor_notifications_enabled=(
+            settings.urgent_editor_notifications_enabled
+        ),
+        editor_urgent_chat_id=settings.editor_urgent_chat_id,
     )
 
     session = AiohttpSession(
@@ -177,6 +181,9 @@ async def main() -> None:
                     completed_bulk_dashboard_scan_interval_seconds=(
                         settings.completed_bulk_dashboard_scan_interval_seconds
                     ),
+                    bulk_relocation_search_interval_seconds=(
+                        settings.bulk_relocation_search_interval_seconds
+                    ),
                     dashboard_outbox_retry_base_seconds=(
                         settings.dashboard_outbox_retry_base_seconds
                     ),
@@ -202,6 +209,7 @@ async def main() -> None:
                 ),
                 interval_seconds=settings.status_polling_interval_seconds,
                 heartbeat_path=settings.status_polling_heartbeat_path,
+                memory_log_interval=settings.status_polling_memory_log_interval,
             )
         )
 

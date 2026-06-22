@@ -277,11 +277,46 @@ class UserActionLockMiddleware(BaseMiddleware):
             return await handler(event, data)
 
 
+class PrivateChatOnlyMiddleware(BaseMiddleware):
+    """Пропускает пользовательский workflow только в личных чатах."""
+
+    async def __call__(
+        self,
+        handler: Callable[[Message | CallbackQuery, dict[str, Any]], Awaitable[Any]],
+        event: Message | CallbackQuery,
+        data: dict[str, Any],
+    ) -> Any:
+        is_callback = hasattr(event, "message") and hasattr(event, "answer")
+        message = event.message if is_callback else event
+        if _is_private_chat_message(message):
+            return await handler(event, data)
+
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        chat_type = _chat_type_value(getattr(chat, "type", None))
+        title = getattr(chat, "title", None)
+        LOGGER.info(
+            "Ignored non-private chat update: chat_id=%s chat_type=%s title=%s",
+            chat_id,
+            chat_type,
+            title,
+        )
+        if is_callback:
+            await CallbackQueryAckMiddleware._answer(
+                event,
+                "Бот принимает заявки только в личном чате.",
+            )
+        return None
+
+
 def create_router(flow: ApplicationFlow) -> Router:
     """Собрать Telegram handlers и связать их с ApplicationFlow."""
     router = Router()
     ui = ActiveMessageManager(flow.repository)
     user_action_lock = UserActionLockMiddleware()
+    private_chat_only = PrivateChatOnlyMiddleware()
+    router.message.outer_middleware(private_chat_only)
+    router.callback_query.outer_middleware(private_chat_only)
     router.callback_query.outer_middleware(CallbackQueryAckMiddleware(flow.repository))
     router.callback_query.outer_middleware(user_action_lock)
     router.message.outer_middleware(user_action_lock)
@@ -712,6 +747,16 @@ def _message_coordinates(message: Any) -> tuple[int, int] | None:
     if chat_id is None or message_id is None:
         return None
     return int(chat_id), int(message_id)
+
+
+def _is_private_chat_message(message: Any) -> bool:
+    chat = getattr(message, "chat", None)
+    return _chat_type_value(getattr(chat, "type", None)) == "private"
+
+
+def _chat_type_value(chat_type: Any) -> str:
+    value = getattr(chat_type, "value", chat_type)
+    return str(value or "")
 
 
 def _is_expired_callback_error(exc: TelegramBadRequest) -> bool:

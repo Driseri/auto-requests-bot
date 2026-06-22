@@ -118,3 +118,33 @@ def _http_status(exc: Exception) -> int | None:
         return status
     status_code = getattr(exc, "status_code", None)
     return status_code if isinstance(status_code, int) else None
+
+
+def is_google_rate_limit_error(exc: Exception) -> bool:
+    status = _http_status(exc)
+    if status == 429:
+        return True
+    if status is not None:
+        return False
+    text = _exception_text(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "quota exceeded",
+            "rate limit",
+            "ratelimit",
+            "read requests per minute",
+            "writerequestsperminute",
+            "readrequestsperminute",
+        )
+    )
+
+
+def _exception_text(exc: Exception) -> str:
+    parts = [str(exc)]
+    content = getattr(exc, "content", None)
+    if isinstance(content, bytes):
+        parts.append(content.decode("utf-8", errors="ignore"))
+    elif content is not None:
+        parts.append(str(content))
+    return " ".join(parts)

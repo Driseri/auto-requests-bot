@@ -32,8 +32,11 @@
 - [Подробный мониторинг](#подробный-мониторинг)
 - [Управление контейнером](#управление-контейнером)
 - [Ручное обновление](#ручное-обновление)
+- [Выкладка текущих локальных изменений](#выкладка-текущих-локальных-изменений-на-vps)
+- [Нагрузочное тестирование](#нагрузочное-тестирование)
 - [Rollback](#rollback)
 - [Резервные копии](#резервные-копии)
+- [Удаление заявок из SQLite](#удаление-заявок-из-sqlite)
 - [Выбор действия при сбое](#когда-ждать-когда-перезапускать-когда-делать-rollback)
 - [Критические ситуации](#критические-ситуации)
 - [Таблица команд и рисков](#таблица-команд-и-рисков)
@@ -580,6 +583,63 @@ PY
 Не меняйте состояния outbox вручную через SQL. Перезапуск не возвращает `FAILED`
 в `PENDING`; сначала нужно установить причину и передать event ID разработчику.
 
+### Уведомления редакторов о срочных заявках
+
+Функция выключена по умолчанию. Чтобы включить уведомления в общий чат редакторов:
+
+1. Добавьте бота в общий Telegram-чат редакторов.
+2. Напишите любое сообщение в этот чат.
+3. Получите `chat_id` из логов. Для supergroup он обычно начинается с `-100`:
+
+```bash
+docker compose -f docker-compose.prod.yml logs --since=10m bot \
+  | grep 'Ignored non-private chat update'
+```
+
+Бот не должен отвечать в группе интерфейсом заведения заявки. Он только пишет
+`chat_id` в логи и игнорирует входящее сообщение.
+
+4. В `.env` укажите:
+
+```env
+URGENT_EDITOR_NOTIFICATIONS_ENABLED=true
+EDITOR_URGENT_CHAT_ID=-1001234567890
+```
+
+5. Примените `.env` без удаления данных:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --force-recreate bot
+docker compose -f docker-compose.prod.yml exec -T bot python -m app.health
+```
+
+Healthcheck не отправляет тестовое сообщение в чат, чтобы не спамить редакторов.
+Проверка выполняется созданием одной тестовой одиночной срочной заявки. После успешной
+записи строки в Google Sheets в `notification_outbox` появится событие
+`urgent-editor-application-created`, а бот отправит в общий чат короткое сообщение со
+ссылкой `Открыть заявку`.
+
+Проверить последние editor-chat события:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+connection = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
+for row in connection.execute(
+    """
+    SELECT telegram_user_id, state, attempts, updated_at
+    FROM notification_outbox
+    WHERE event_type = 'urgent-editor-application-created'
+    ORDER BY updated_at DESC
+    LIMIT 20
+    """
+):
+    print(row)
+connection.close()
+PY
+```
+
 ### Очередь дашборда
 
 ```bash
@@ -815,6 +875,363 @@ docker images 'alfa-auto-requests-bot'
 
 Не удаляйте `PREVIOUS_VERSION` до окончания пилотной проверки новой версии.
 
+## Выкладка текущих локальных изменений на VPS
+
+Этот сценарий используйте, когда изменения уже сделаны локально в рабочей папке и их
+нужно аккуратно залить на пилотный VPS. Image собирается локально, на VPS передается
+готовый `.tar`. На сервере сборку не выполняем, чтобы не тратить RAM и CPU VPS.
+
+Команды ниже рассчитаны на текущий пилотный сервер:
+
+- VPS user: `root`;
+- VPS host: `85.137.93.143`;
+- каталог приложения на VPS: `/opt/alfa-auto-requests`;
+- production Compose: `docker-compose.prod.yml`.
+
+### 1. Локально выбрать тег версии
+
+PowerShell, на локальном компьютере:
+
+```powershell
+cd "C:\Users\Yasch\OneDrive\Документы\Работа\Альфа-автозаявки"
+$env:APP_VERSION = "pilot-$(Get-Date -Format yyyyMMdd-HHmm)"
+$env:APP_VERSION
+```
+
+Зачем: у каждого релиза должен быть уникальный тег. Тогда можно понять, какая версия
+запущена, и быстро вернуться на предыдущий image при rollback.
+
+### 2. Локально проверить код перед сборкой
+
+```powershell
+pytest -q
+ruff check src tests
+python -m compileall src tests
+docker compose config
+docker compose -f docker-compose.prod.yml config
+```
+
+Зачем: если тесты, линтер, импорт Python или Compose-конфигурация падают локально,
+такой image нельзя выкатывать на VPS.
+
+### 3. Локально собрать и сохранить image
+
+```powershell
+docker build -t alfa-auto-requests-bot:$env:APP_VERSION .
+docker save alfa-auto-requests-bot:$env:APP_VERSION -o "alfa-auto-requests-bot-$env:APP_VERSION.tar"
+```
+
+Зачем: `docker build` выполняется на локальной машине, а VPS получает уже готовый
+image. Это стабильнее для маленького сервера.
+
+### 4. Передать image на VPS
+
+```powershell
+scp ".\alfa-auto-requests-bot-$env:APP_VERSION.tar" root@85.137.93.143:/opt/alfa-auto-requests/
+```
+
+Если менялся `docker-compose.prod.yml`, отдельно передайте его:
+
+```powershell
+scp ".\docker-compose.prod.yml" root@85.137.93.143:/opt/alfa-auto-requests/docker-compose.prod.yml
+```
+
+`.env` так не перезаписывайте. Его меняют вручную на VPS, чтобы случайно не затереть
+боевые токены, ID таблиц и список редакторов.
+
+### 5. На VPS проверить текущее состояние
+
+SSH на VPS:
+
+```bash
+ssh root@85.137.93.143
+cd /opt/alfa-auto-requests
+
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml exec bot python -m app.health
+df -h /
+free -h
+docker system df
+grep '^APP_VERSION=' .env
+```
+
+Зачем: перед обновлением нужно убедиться, что сервер жив, места хватает, текущая
+версия известна, а healthcheck не показывает уже существующую проблему.
+
+Сохранить текущую версию в переменную для rollback:
+
+```bash
+PREVIOUS_VERSION=$(grep '^APP_VERSION=' .env | cut -d= -f2-)
+echo "$PREVIOUS_VERSION"
+docker image inspect "alfa-auto-requests-bot:$PREVIOUS_VERSION" \
+  --format '{{.RepoTags}}'
+```
+
+Если `docker image inspect` не нашел старый image, rollback будет сложнее. В таком
+случае не удаляйте старые `.tar` и не чистите Docker до завершения пилотной проверки.
+
+### 6. Сделать backup SQLite перед обновлением
+
+```bash
+cd /opt/alfa-auto-requests
+docker compose -f docker-compose.prod.yml \
+  --profile maintenance run --rm backup
+ls -lht backups/ | head
+```
+
+Зачем: backup нужен перед любым обновлением, потому что новая версия может выполнить
+автоматические миграции SQLite. Image можно откатить, но данные нужно уметь восстановить
+отдельно.
+
+### 7. Загрузить image и переключить APP_VERSION
+
+На VPS подставьте тот же тег, который был в PowerShell:
+
+```bash
+VERSION=pilot-YYYYMMDD-HHMM
+docker load -i "alfa-auto-requests-bot-$VERSION.tar"
+docker image inspect "alfa-auto-requests-bot:$VERSION" \
+  --format '{{.RepoTags}}'
+```
+
+Проверить Compose с новым тегом без запуска:
+
+```bash
+APP_VERSION="$VERSION" docker compose -f docker-compose.prod.yml config --quiet
+```
+
+Обновить только `APP_VERSION` в `.env`:
+
+```bash
+grep -q '^APP_VERSION=' .env \
+  && sed -i "s/^APP_VERSION=.*/APP_VERSION=$VERSION/" .env \
+  || echo "APP_VERSION=$VERSION" >> .env
+
+grep '^APP_VERSION=' .env
+```
+
+Зачем: Compose берет тег image из `.env`. Пока `APP_VERSION` не изменен, сервер
+продолжит запускать старую версию.
+
+### 8. Пересоздать контейнер
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --force-recreate bot
+docker compose -f docker-compose.prod.yml ps
+```
+
+`up -d --force-recreate` создает новый контейнер из нового image и нового `.env`.
+Данные SQLite остаются в named volume `bot-data`.
+
+Наблюдать старт:
+
+```bash
+docker compose -f docker-compose.prod.yml logs -f --tail=100 bot
+```
+
+Остановить просмотр логов: `Ctrl+C`. Это не останавливает контейнер.
+
+### 9. Проверить после запуска
+
+```bash
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml exec bot python -m app.health
+docker stats --no-stream
+docker compose -f docker-compose.prod.yml logs --since=10m bot \
+  | grep -Ei "traceback|error|failed|unhealthy|polling iteration" \
+  | tail -n 80
+```
+
+Нормально:
+
+- контейнер один;
+- статус `healthy`;
+- `python -m app.health` выводит `ok`;
+- в логах нет повторяющихся traceback;
+- бот отвечает в Telegram;
+- тестовая заявка доходит до Google Sheets.
+
+### 10. Smoke-тест после выкладки
+
+Минимальный безопасный сценарий:
+
+1. В Telegram выполнить `/new`.
+2. Пройти создание тестовой одиночной заявки.
+3. Проверить, что строка появилась в нужной Google-таблице.
+4. Изменить статус/редактора в таблице и дождаться уведомления.
+5. Проверить общий дашборд, если он включен.
+6. Проверить логи за последние 15 минут.
+
+Команда для логов:
+
+```bash
+docker compose -f docker-compose.prod.yml logs --since=15m bot
+```
+
+### 11. Удалить переданный tar после успешной проверки
+
+```bash
+rm -f "/opt/alfa-auto-requests/alfa-auto-requests-bot-$VERSION.tar"
+docker images 'alfa-auto-requests-bot'
+```
+
+Удаляется только `.tar`, загруженный Docker image остается. Старый image
+`$PREVIOUS_VERSION` не удаляйте до окончания проверки новой версии.
+
+### 12. Быстрый rollback, если новая версия плохая
+
+```bash
+cd /opt/alfa-auto-requests
+sed -i "s/^APP_VERSION=.*/APP_VERSION=$PREVIOUS_VERSION/" .env
+docker compose -f docker-compose.prod.yml up -d --force-recreate bot
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml exec bot python -m app.health
+```
+
+Rollback переключает код на старый image, но не откатывает SQLite. Если новая версия
+уже изменила данные несовместимым способом, потребуется восстановление backup из
+раздела [Резервные копии](#резервные-копии).
+
+## Нагрузочное тестирование
+
+Нагрузочный тест запускается как отдельный one-off process внутри production image.
+Он использует production `.env`, SQLite volume и Google Sheets, но не отправляет
+сообщения в Telegram и не вызывает GigaChat. Пользователи имитируются разными
+`telegram_user_id` напрямую через бизнес-логику бота.
+
+Важно:
+
+- production bot на время теста нужно остановить;
+- тестовые строки в Google Sheets останутся после теста;
+- SQLite очищается автоматически только при `--cleanup-sqlite`;
+- все тестовые данные помечаются `RUN_ID`, например `LOADTEST-20260616-153000`;
+- удаление строк из Google Sheets выполняется вручную по `RUN_ID`.
+
+### Профили
+
+| Профиль | Что делает |
+|---|---|
+| `baseline` | 5 пользователей, по 1 одиночной заявке, 5 polling cycles |
+| `pilot15` | 15 пользователей, по 10 одиночных заявок, 3 массовые пачки по 30 строк, 30 polling cycles |
+| `stress` | 30 пользователей, по 5 одиночных заявок, 5 массовых пачек по 30 строк, 60 polling cycles |
+
+### Перед тестом
+
+```bash
+cd /opt/alfa-auto-requests
+docker compose -f docker-compose.prod.yml --profile maintenance run --rm backup
+docker compose -f docker-compose.prod.yml stop bot
+mkdir -p loadtest-reports
+```
+
+Зачем:
+
+- backup нужен перед записью тестовых данных;
+- `stop bot` исключает второй активный процесс с той же SQLite и теми же таблицами;
+- каталог `loadtest-reports` нужен для сохранения отчетов.
+
+### Запуск baseline
+
+```bash
+RUN_ID="LOADTEST-$(date +%Y%m%d-%H%M%S)"
+
+docker compose -f docker-compose.prod.yml run --rm \
+  -v "$PWD/loadtest-reports:/reports" \
+  --entrypoint python bot \
+  -m app.loadtest \
+  --profile baseline \
+  --run-id "$RUN_ID" \
+  --cleanup-sqlite \
+  --concurrency 5 \
+  --google-throttle-seconds 0.5 \
+  --report-path "/reports/loadtest-$RUN_ID.json"
+```
+
+Сначала запускайте `baseline`. Если он прошел без ошибок, переходите к `pilot15`.
+
+### Запуск pilot15
+
+```bash
+RUN_ID="LOADTEST-$(date +%Y%m%d-%H%M%S)"
+
+docker compose -f docker-compose.prod.yml run --rm \
+  -v "$PWD/loadtest-reports:/reports" \
+  --entrypoint python bot \
+  -m app.loadtest \
+  --profile pilot15 \
+  --run-id "$RUN_ID" \
+  --cleanup-sqlite \
+  --concurrency 5 \
+  --google-throttle-seconds 0.5 \
+  --report-path "/reports/loadtest-$RUN_ID.json"
+```
+
+Этот профиль основной для проверки пилота на 15 человек.
+
+### Запуск stress
+
+```bash
+RUN_ID="LOADTEST-$(date +%Y%m%d-%H%M%S)"
+
+docker compose -f docker-compose.prod.yml run --rm \
+  -v "$PWD/loadtest-reports:/reports" \
+  --entrypoint python bot \
+  -m app.loadtest \
+  --profile stress \
+  --run-id "$RUN_ID" \
+  --cleanup-sqlite \
+  --concurrency 5 \
+  --google-throttle-seconds 1.0 \
+  --report-path "/reports/loadtest-$RUN_ID.json"
+```
+
+`stress` запускайте только после успешного `pilot15`.
+
+### После теста
+
+```bash
+docker compose -f docker-compose.prod.yml start bot
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml exec bot python -m app.health
+docker compose -f docker-compose.prod.yml logs --since=10m bot
+```
+
+Посмотреть отчеты:
+
+```bash
+ls -lh loadtest-reports/
+```
+
+Вывести конкретный отчет:
+
+```bash
+cat loadtest-reports/loadtest-LOADTEST-YYYYMMDD-HHMMSS.json
+```
+
+### Как читать результат
+
+В отчете проверьте:
+
+- `errors` должен быть пустым;
+- `counts.single_created` соответствует профилю;
+- `counts.bulk_batches_created` соответствует профилю;
+- `counts.bulk_rows_registered` соответствует профилю;
+- `sqlite.cleanup` показывает удаление тестовых записей;
+- `manual_google_cleanup.ranges` содержит диапазоны, которые нужно удалить из Google Sheets вручную;
+- `memory.before` и `memory.after` не должны показывать резкий необъяснимый рост RSS.
+
+### Ручная очистка Google Sheets
+
+Откройте отчет и найдите:
+
+- `run_id`;
+- `created.google_ranges`;
+- `manual_google_cleanup.ranges`.
+
+В Google Sheets найдите строки по `run_id`, например `LOADTEST-20260616-153000`, и
+удалите созданные тестовые строки вручную. SQLite cleanup не удаляет строки из Google
+Sheets намеренно, чтобы не рисковать production-таблицами автоматическим удалением.
+
 ### Чек-лист после обновления
 
 - [ ] Контейнер один.
@@ -988,6 +1405,353 @@ scp VPS_USER@VPS_HOST:/opt/alfa-auto-requests/backups/BACKUP_FILE .
 ```
 
 Это ручное действие и не является автоматическим backup.
+
+## Удаление заявок из SQLite
+
+Используйте этот раздел только для локального tracking в SQLite. Эти команды не
+удаляют строки из Google Sheets и не меняют уже отправленные Telegram-сообщения.
+
+Типовые случаи:
+
+- в SQLite осталась заявка, которой уже нет в таблице;
+- нужно остановить ложный polling/not_found по конкретному `application_id`;
+- нужно убрать локальный tracking тестовой массовой пачки.
+
+Перед любым `DELETE` обязательно:
+
+1. сделать backup;
+2. выполнить read-only preview;
+3. удалять только явно перечисленные ID;
+4. проверить результат.
+
+### 1. Backup перед удалением
+
+```bash
+cd /opt/alfa-auto-requests
+docker compose -f docker-compose.prod.yml \
+  --profile maintenance run --rm backup
+ls -lht backups/ | head
+```
+
+Зачем: удаление из SQLite необратимо без backup. Даже если удаляется “только tracking”,
+ошибка в SQL может затронуть больше записей, чем планировалось.
+
+### 2. Найти заявку по application_id
+
+Команда только читает SQLite:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+ids = ["APPLICATION_ID_1", "APPLICATION_ID_2"]
+conn = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
+conn.row_factory = sqlite3.Row
+
+query = """
+SELECT application_id, telegram_user_id, batch_id, sheet_name,
+       last_known_status, last_seen_row_number, polling_state,
+       not_found_count, created_at, updated_at
+FROM submitted_applications
+WHERE application_id IN ({})
+ORDER BY created_at
+""".format(",".join("?" for _ in ids))
+
+for row in conn.execute(query, ids):
+    print(dict(row))
+
+conn.close()
+PY
+```
+
+Замените `APPLICATION_ID_1`, `APPLICATION_ID_2` на реальные ID, например
+`31096ED3`. Если ID один, оставьте список из одного элемента:
+
+```python
+ids = ["31096ED3"]
+```
+
+### 3. Посмотреть связанные dashboard-записи
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+ids = ["APPLICATION_ID_1", "APPLICATION_ID_2"]
+conn = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
+conn.row_factory = sqlite3.Row
+
+query = """
+SELECT entity_type, entity_id, state, attempts,
+       next_attempt_at, substr(last_error, 1, 200) AS last_error,
+       updated_at
+FROM dashboard_outbox
+WHERE entity_type = 'APPLICATION'
+  AND entity_id IN ({})
+ORDER BY updated_at
+""".format(",".join("?" for _ in ids))
+
+for row in conn.execute(query, ids):
+    print(dict(row))
+
+conn.close()
+PY
+```
+
+Зачем: если заявка стоит в `dashboard_outbox`, после удаления tracking нужно убрать и
+ее pending-проекцию, иначе бот может продолжить пытаться обновить дашборд по старой
+сущности.
+
+### 4. Удалить tracking одиночных заявок по application_id
+
+Выполняйте только после backup и preview.
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+ids = ["APPLICATION_ID_1", "APPLICATION_ID_2"]
+
+conn = sqlite3.connect("/data/app.db")
+conn.row_factory = sqlite3.Row
+conn.execute("BEGIN IMMEDIATE")
+
+query = """
+SELECT application_id, telegram_user_id, batch_id, sheet_name,
+       last_known_status, last_seen_row_number
+FROM submitted_applications
+WHERE application_id IN ({})
+ORDER BY created_at
+""".format(",".join("?" for _ in ids))
+found = conn.execute(query, ids).fetchall()
+
+print("will_delete_submitted_applications", [dict(row) for row in found])
+
+delete_dashboard = """
+DELETE FROM dashboard_outbox
+WHERE entity_type = 'APPLICATION'
+  AND entity_id IN ({})
+""".format(",".join("?" for _ in ids))
+conn.execute(delete_dashboard, ids)
+after_dashboard = conn.total_changes
+
+delete_submitted = """
+DELETE FROM submitted_applications
+WHERE application_id IN ({})
+""".format(",".join("?" for _ in ids))
+conn.execute(delete_submitted, ids)
+after_all = conn.total_changes
+
+conn.commit()
+conn.close()
+
+print("deleted_dashboard_outbox", after_dashboard)
+print("deleted_submitted_applications", after_all - after_dashboard)
+print("deleted_total_changes", after_all)
+PY
+```
+
+Что удаляется:
+
+- записи из `submitted_applications` по выбранным `application_id`;
+- связанные pending/failed dashboard-проекции `APPLICATION` из `dashboard_outbox`.
+
+Что не удаляется:
+
+- строки в Google Sheets;
+- история уже отправленных Telegram-уведомлений;
+- черновики пользователей;
+- массовая пачка, если заявка была частью пачки.
+
+Если заявка относится к массовой пачке (`batch_id IS NOT NULL`), обычно лучше не
+удалять отдельную строку без причины: она нужна для поздних изменений редактора,
+итогового ответа и дашборда. Для ложных `not_found` чаще достаточно сбросить счетчики.
+
+### 5. Сбросить not_found без удаления
+
+Этот вариант безопаснее удаления, если заявка существует в Google Sheets, но бот
+временно пометил ее как не найденную.
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+ids = ["APPLICATION_ID_1", "APPLICATION_ID_2"]
+conn = sqlite3.connect("/data/app.db")
+conn.execute("BEGIN IMMEDIATE")
+query = """
+UPDATE submitted_applications
+SET polling_state = 'ACTIVE',
+    not_found_count = 0,
+    last_not_found_at = NULL,
+    next_status_check_at = NULL,
+    updated_at = datetime('now')
+WHERE application_id IN ({})
+""".format(",".join("?" for _ in ids))
+conn.execute(query, ids)
+print("updated", conn.total_changes)
+conn.commit()
+conn.close()
+PY
+```
+
+Используйте это, когда строка есть в таблице, но tracking ушел в редкую проверку.
+
+### 6. Preview массовой пачки по batch_id
+
+Команда только читает SQLite:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+batch_id = "BATCH_ID"
+conn = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
+conn.row_factory = sqlite3.Row
+
+print("bulk_batch")
+for row in conn.execute(
+    """
+    SELECT batch_id, telegram_user_id, direction, sheet_name, start_row,
+           data_start_row, data_end_row, reserved_rows, registration_state,
+           last_known_batch_status, registered_count, created_at, updated_at
+    FROM bulk_batches
+    WHERE batch_id = ?
+    """,
+    (batch_id,),
+):
+    print(dict(row))
+
+print("submitted_applications")
+for row in conn.execute(
+    """
+    SELECT application_id, last_known_status, last_seen_row_number,
+           polling_state, not_found_count, updated_at
+    FROM submitted_applications
+    WHERE batch_id = ?
+    ORDER BY last_seen_row_number, application_id
+    """,
+    (batch_id,),
+):
+    print(dict(row))
+
+conn.close()
+PY
+```
+
+### 7. Удалить локальный tracking массовой пачки
+
+Используйте только для тестовой или ошибочной пачки, которую точно больше не нужно
+отслеживать. Строки в Google Sheets не удаляются.
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+batch_id = "BATCH_ID"
+
+conn = sqlite3.connect("/data/app.db")
+conn.row_factory = sqlite3.Row
+conn.execute("BEGIN IMMEDIATE")
+
+apps = conn.execute(
+    """
+    SELECT application_id, last_known_status, last_seen_row_number
+    FROM submitted_applications
+    WHERE batch_id = ?
+    ORDER BY last_seen_row_number, application_id
+    """,
+    (batch_id,),
+).fetchall()
+batch = conn.execute(
+    """
+    SELECT batch_id, telegram_user_id, registration_state, last_known_batch_status
+    FROM bulk_batches
+    WHERE batch_id = ?
+    """,
+    (batch_id,),
+).fetchone()
+
+print("will_delete_batch", dict(batch) if batch else None)
+print("will_delete_applications", [dict(row) for row in apps])
+
+conn.execute(
+    "DELETE FROM dashboard_outbox WHERE entity_type = 'BULK_BATCH' AND entity_id = ?",
+    (batch_id,),
+)
+conn.execute(
+    "DELETE FROM bulk_creation_requests WHERE batch_id = ?",
+    (batch_id,),
+)
+conn.execute(
+    "DELETE FROM submitted_applications WHERE batch_id = ?",
+    (batch_id,),
+)
+conn.execute(
+    "DELETE FROM bulk_batches WHERE batch_id = ?",
+    (batch_id,),
+)
+
+print("deleted_total_changes", conn.total_changes)
+conn.commit()
+conn.close()
+PY
+```
+
+Не используйте этот сценарий для обычной завершенной пачки: завершенные пачки
+специально остаются в tracking и проверяются архивным scan раз в час.
+
+### 8. Проверить результат удаления
+
+Для одиночных заявок:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+ids = ["APPLICATION_ID_1", "APPLICATION_ID_2"]
+conn = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
+query = "SELECT COUNT(*) FROM submitted_applications WHERE application_id IN ({})".format(
+    ",".join("?" for _ in ids)
+)
+print(conn.execute(query, ids).fetchone()[0])
+conn.close()
+PY
+```
+
+Ожидаемый результат: `0`.
+
+Для массовой пачки:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+batch_id = "BATCH_ID"
+conn = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
+print("bulk_batches", conn.execute(
+    "SELECT COUNT(*) FROM bulk_batches WHERE batch_id = ?",
+    (batch_id,),
+).fetchone()[0])
+print("submitted_applications", conn.execute(
+    "SELECT COUNT(*) FROM submitted_applications WHERE batch_id = ?",
+    (batch_id,),
+).fetchone()[0])
+conn.close()
+PY
+```
+
+Ожидаемый результат: оба значения `0`.
+
+### 9. Чего не делать
+
+- Не выполняйте `DELETE` без `WHERE`.
+- Не удаляйте `/data/app.db`, `/data/app.db-wal`, `/data/app.db-shm` вручную.
+- Не используйте `docker compose down -v`.
+- Не чистите `notification_outbox` вручную без разбора причины.
+- Не удаляйте tracking завершенных массовых пачек только из-за того, что они не
+  проверяются каждые 30 секунд. Это нормальная оптимизация: они проверяются архивным
+  проходом.
 
 ## Когда ждать, когда перезапускать, когда делать rollback
 

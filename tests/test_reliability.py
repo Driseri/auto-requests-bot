@@ -10,7 +10,12 @@ import pytest
 
 from app.flow import ApplicationFlow
 import app.google_api as google_api
-from app.google_api import GoogleApiRetryConfig, execute_with_retry, execute_with_retry_async
+from app.google_api import (
+    GoogleApiRetryConfig,
+    execute_with_retry,
+    execute_with_retry_async,
+    is_google_rate_limit_error,
+)
 from app.health import ExternalProbeError, check_health, write_heartbeat
 from app.maintenance import create_backup, restore_backup, verify_database
 from app.models import (
@@ -130,7 +135,8 @@ async def test_ambiguous_append_is_reconciled_without_duplicate(tmp_path):
 
 
 class FakeHttpError(Exception):
-    def __init__(self, status: int) -> None:
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(message)
         self.resp = type("Response", (), {"status": status})()
 
 
@@ -180,6 +186,23 @@ def test_google_retry_does_not_retry_permanent_errors(error):
             operation_id="test",
         )
     assert attempts == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FakeHttpError(429),
+        ValueError("Quota exceeded for quota metric 'Read requests'"),
+        ValueError("ReadRequestsPerMinutePerUser limit exceeded"),
+    ],
+)
+def test_google_rate_limit_error_detects_quota_errors(error):
+    assert is_google_rate_limit_error(error) is True
+
+
+@pytest.mark.parametrize("error", [FakeHttpError(403), FakeHttpError(400), ValueError("schema")])
+def test_google_rate_limit_error_ignores_non_quota_errors(error):
+    assert is_google_rate_limit_error(error) is False
 
 
 @pytest.mark.asyncio

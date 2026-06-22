@@ -15,6 +15,7 @@ from app.models import (
     LlmCheckStatus,
     LlmResult,
     Step,
+    SubmissionResult,
 )
 from app.repository import DraftRepository
 from app.submission import InMemorySubmissionService
@@ -83,6 +84,21 @@ class FakeBulkRegistrar:
         return self.result
 
 
+class RateLimitedSubmissionService:
+    def resolve_target(self, application):
+        return ("spreadsheet", "sheet")
+
+    async def submit(self, application):
+        return SubmissionResult(
+            success=False,
+            message=(
+                "Google API временно перегружен и не принял заявку.\n\n"
+                "Повторите отправку через 2-3 минуты. "
+                "Заявка сохранена, заново заполнять её не нужно."
+            ),
+        )
+
+
 async def make_flow(tmp_path, llm_client: FakeLlmClient | None = None):
     repository = DraftRepository(str(tmp_path / "test.db"))
     await repository.init()
@@ -119,6 +135,18 @@ async def fill_to_review(flow: ApplicationFlow, user_id: int = 100) -> None:
     await flow.select_urgency(user_id, True)
 
 
+async def fill_urgent_to_review(flow: ApplicationFlow, user_id: int = 100) -> None:
+    await flow.start_single(user_id)
+    await flow.select_direction(user_id, Direction.FL)
+    await flow.select_answer_type(user_id, AnswerType.URGENT)
+    await flow.select_change_type(user_id, ChangeType.ADD)
+    await flow.handle_text(user_id, "urgent.intent")
+    await flow.handle_text(user_id, "Urgent Scriptwriter")
+    await flow.handle_text(user_id, "Client case")
+    await flow.handle_text(user_id, "Fix urgent answer")
+    await flow.handle_text(user_id, "Source answer")
+
+
 @pytest.mark.asyncio
 async def test_start_new_application(tmp_path):
     flow, repository, _, _ = await make_flow(tmp_path)
@@ -147,6 +175,34 @@ async def test_start_single_application(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_change_description_prompt_explains_expected_detail(tmp_path):
+    flow, _, _, _ = await make_flow(tmp_path)
+    await flow.start_single(12)
+    await flow.select_direction(12, Direction.FL)
+    await flow.select_answer_type(12, AnswerType.ROLLOUT)
+    await flow.select_change_type(12, ChangeType.ADD)
+    await flow.handle_text(12, "intent.change_limit")
+    await flow.handle_text(12, "Иван Иванов")
+
+    response = await flow.handle_text(12, "Клиентское сообщение")
+
+    assert "Кратко опишите, зачем вы меняете текст" in response.text
+    assert "Не пишите общих фраз" in response.text
+
+
+@pytest.mark.asyncio
+async def test_missing_reason_uses_client_case_label(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    await fill_to_review(flow, 13)
+    await repository.save_answer(13, FieldName.REASON.value, "")
+
+    response = await flow.submit(13)
+
+    assert "Кейс или сообщения клиента" in response.text
+    assert "Причина изменений" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_rollout_requires_change_type_before_intent(tmp_path):
     flow, repository, _, _ = await make_flow(tmp_path)
     await flow.start_single(101)
@@ -160,24 +216,184 @@ async def test_rollout_requires_change_type_before_intent(tmp_path):
 
     assert response.keyboard == KeyboardKind.STEP
     assert draft is not None
-    assert draft.current_step == Step.INTENT
+    assert draft.current_step == Step.SCRIPTWRITER
     assert draft.change_type == ChangeType.CHIPS.value
 
 
 @pytest.mark.asyncio
-async def test_non_rollout_skips_and_clears_change_type(tmp_path):
+async def test_chips_collects_dedicated_fields_without_gigachat(tmp_path):
+    flow, repository, _, llm_client = await make_flow(tmp_path)
+    user_id = 103
+    await flow.start_single(user_id)
+    await flow.select_direction(user_id, Direction.FL)
+    await flow.select_answer_type(user_id, AnswerType.ROLLOUT)
+    response = await flow.select_change_type(user_id, ChangeType.CHIPS)
+
+    assert response.draft is not None
+    assert response.draft.current_step == Step.SCRIPTWRITER
+    assert await flow.should_show_llm_processing(user_id) is False
+
+    response = await flow.handle_text(user_id, "Scriptwriter")
+    assert response.draft.current_step == Step.INTENT
+    response = await flow.handle_text(user_id, "intent.chips")
+    assert response.draft.current_step == Step.REASON
+    response = await flow.handle_text(user_id, "reason")
+    assert response.draft.current_step == Step.CHIP_TEXT_BEFORE
+    response = await flow.handle_text(user_id, "before")
+    assert response.draft.current_step == Step.CHIP_TEXT
+    response = await flow.handle_text(user_id, "chip")
+    assert response.draft.current_step == Step.CHIP_TEXT_AFTER
+    response = await flow.handle_text(user_id, "after")
+
+    draft = await repository.get_by_user_id(user_id)
+    assert response.keyboard == KeyboardKind.REVIEW
+    assert draft is not None
+    assert draft.current_step == Step.REVIEW
+    assert draft.llm_check_status == LlmCheckStatus.SKIPPED.value
+    assert (draft.chip_text_before, draft.chip_text, draft.chip_text_after) == (
+        "before",
+        "chip",
+        "after",
+    )
+    assert llm_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_chips_uses_default_values_in_chips_order(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    user_id = 104
+    await repository.save_user_setting(user_id, "default_scriptwriter", "Default writer")
+    await repository.save_user_setting(user_id, "default_intent", "default.intent")
+    await flow.start_single(user_id)
+    await flow.select_direction(user_id, Direction.FL)
+    await flow.select_answer_type(user_id, AnswerType.ROLLOUT)
+    await flow.select_change_type(user_id, ChangeType.CHIPS)
+
+    response = await flow.use_default_scriptwriter(user_id)
+    assert response.draft.current_step == Step.INTENT
+    response = await flow.use_default_intent(user_id)
+    assert response.draft.current_step == Step.REASON
+
+
+@pytest.mark.asyncio
+async def test_legacy_chips_draft_resumes_at_first_new_required_field(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    user_id = 105
+    await flow.start_single(user_id)
+    await repository.save_answer(user_id, FieldName.DIRECTION.value, Direction.FL.value)
+    await repository.save_answer(user_id, FieldName.ANSWER_TYPE.value, AnswerType.ROLLOUT.value)
+    await repository.save_answer(user_id, FieldName.CHANGE_TYPE.value, ChangeType.CHIPS.value)
+    await repository.save_answer(user_id, FieldName.SCRIPTWRITER.value, "Writer")
+    await repository.save_answer(user_id, FieldName.INTENT.value, "intent")
+    await repository.save_answer(user_id, FieldName.REASON.value, "reason")
+    await repository.set_step(user_id, Step.SOURCE_TEXT)
+
+    response = await flow.continue_existing(user_id)
+    draft = await repository.get_by_user_id(user_id)
+
+    assert draft is not None
+    assert response.draft.current_step == Step.CHIP_TEXT_BEFORE
+    assert draft.current_step == Step.CHIP_TEXT_BEFORE
+
+
+@pytest.mark.asyncio
+async def test_urgent_requires_change_type(tmp_path):
     flow, repository, _, _ = await make_flow(tmp_path)
     await flow.start_single(102)
     await flow.select_direction(102, Direction.FL)
-    await repository.save_answer(102, FieldName.CHANGE_TYPE.value, ChangeType.ADD.value)
-
     response = await flow.select_answer_type(102, AnswerType.URGENT)
     draft = await repository.get_by_user_id(102)
+
+    assert response.keyboard == KeyboardKind.CHANGE_TYPE
+    assert draft is not None
+    assert draft.current_step == Step.CHANGE_TYPE
+    assert not draft.change_type
+
+
+@pytest.mark.asyncio
+async def test_integration_clears_change_type(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    await flow.start_single(106)
+    await flow.select_direction(106, Direction.FL)
+    await repository.save_answer(106, FieldName.CHANGE_TYPE.value, ChangeType.ADD.value)
+
+    response = await flow.select_answer_type(106, AnswerType.INTEGRATION)
+    draft = await repository.get_by_user_id(106)
 
     assert response.keyboard == KeyboardKind.STEP
     assert draft is not None
     assert draft.current_step == Step.INTENT
     assert not draft.change_type
+
+
+@pytest.mark.asyncio
+async def test_urgent_chips_skips_gigachat_and_uses_chips_fields(tmp_path):
+    flow, repository, _, llm_client = await make_flow(tmp_path)
+    user_id = 107
+    await flow.start_single(user_id)
+    await flow.select_direction(user_id, Direction.FL)
+    await flow.select_answer_type(user_id, AnswerType.URGENT)
+    await flow.select_change_type(user_id, ChangeType.CHIPS)
+    await flow.handle_text(user_id, "Writer")
+    await flow.handle_text(user_id, "urgent.chips")
+    await flow.handle_text(user_id, "Reason")
+    await flow.handle_text(user_id, "Before")
+    await flow.handle_text(user_id, "Chip")
+    response = await flow.handle_text(user_id, "After")
+
+    draft = await repository.get_by_user_id(user_id)
+    assert response.keyboard == KeyboardKind.REVIEW
+    assert draft is not None
+    assert draft.answer_type == AnswerType.URGENT.value
+    assert draft.change_type == ChangeType.CHIPS.value
+    assert draft.llm_check_status == LlmCheckStatus.SKIPPED.value
+    assert draft.is_urgent is True
+    assert llm_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_urgent_add_keeps_gigachat_and_shows_change_type(tmp_path):
+    flow, repository, _, llm_client = await make_flow(tmp_path)
+    user_id = 109
+    await flow.start_single(user_id)
+    await flow.select_direction(user_id, Direction.FL)
+    await flow.select_answer_type(user_id, AnswerType.URGENT)
+    response = await flow.select_change_type(user_id, ChangeType.ADD)
+    assert response.draft is not None
+    assert response.draft.current_step == Step.INTENT
+    await flow.handle_text(user_id, "urgent.add")
+    await flow.handle_text(user_id, "Writer")
+    await flow.handle_text(user_id, "Client case")
+    assert await flow.should_show_llm_processing(user_id) is True
+    await flow.handle_text(user_id, "Change description")
+    response = await flow.handle_text(user_id, "Source answer")
+
+    draft = await repository.get_by_user_id(user_id)
+    assert draft is not None
+    assert response.keyboard == KeyboardKind.REVIEW
+    assert draft.llm_check_status == LlmCheckStatus.COMPLETE.value
+    assert len(llm_client.calls) == 1
+    assert "Тип изменения:</b> ADD" in response.text
+
+
+@pytest.mark.asyncio
+async def test_old_urgent_draft_without_change_type_resumes_at_selection(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    user_id = 108
+    await flow.start_single(user_id)
+    await repository.save_answer(user_id, FieldName.DIRECTION.value, Direction.FL.value)
+    await repository.save_answer(
+        user_id,
+        FieldName.ANSWER_TYPE.value,
+        AnswerType.URGENT.value,
+    )
+    await repository.set_step(user_id, Step.INTENT)
+
+    response = await flow.continue_existing(user_id)
+
+    assert response.keyboard == KeyboardKind.CHANGE_TYPE
+    assert response.draft is not None
+    assert response.draft.current_step == Step.CHANGE_TYPE
 
 
 @pytest.mark.asyncio
@@ -224,6 +440,94 @@ async def test_collects_application_and_submits_stub(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_urgent_application_enqueues_editor_notification(tmp_path):
+    repository = DraftRepository(str(tmp_path / "test.db"))
+    await repository.init()
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await fill_urgent_to_review(flow, 14)
+    draft = await repository.get_by_user_id(14)
+    assert draft is not None
+
+    await flow.submit(14)
+
+    outbox = await repository.list_notification_outbox()
+    assert len(outbox) == 1
+    assert outbox[0].telegram_user_id == -100123456
+    assert outbox[0].event_type == "urgent-editor-application-created"
+    assert outbox[0].dedupe_key.startswith(
+        f"urgent-editor-application-created:{draft.application_id}:"
+    )
+    assert "<b>Направление:</b>" in outbox[0].html
+    assert "Urgent Scriptwriter" in outbox[0].html
+    assert "urgent.intent" in outbox[0].html
+    assert "Открыть заявку</a>" in outbox[0].html
+
+
+@pytest.mark.asyncio
+async def test_non_urgent_application_does_not_enqueue_editor_notification(tmp_path):
+    repository = DraftRepository(str(tmp_path / "test.db"))
+    await repository.init()
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await fill_to_review(flow, 15)
+    await flow.submit(15)
+
+    assert await repository.list_notification_outbox() == []
+
+
+@pytest.mark.asyncio
+async def test_urgent_editor_notification_is_deduplicated_on_retry(tmp_path):
+    repository = DraftRepository(str(tmp_path / "test.db"))
+    await repository.init()
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await fill_urgent_to_review(flow, 16)
+    await flow.submit(16)
+    await flow.submit(16)
+
+    outbox = await repository.list_notification_outbox()
+    assert len(outbox) == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_rate_limit_keeps_draft_on_review_for_retry(tmp_path):
+    repository = DraftRepository(str(tmp_path / "test.db"))
+    await repository.init()
+    flow = ApplicationFlow(repository, FakeLlmClient(), RateLimitedSubmissionService())
+
+    await fill_to_review(flow, 12)
+    response = await flow.submit(12)
+    draft = await repository.get_by_user_id(12)
+
+    assert response.keyboard == KeyboardKind.REVIEW
+    assert "Google API временно перегружен" in response.text
+    assert "Повторите отправку через 2-3 минуты" in response.text
+    assert draft is not None
+    assert draft.current_step == Step.REVIEW
+    assert draft.submission_state == "FAILED"
+    assert draft.application_id
+
+
+@pytest.mark.asyncio
 async def test_review_contains_emoji_labels_and_bold_html(tmp_path):
     flow, _, _, _ = await make_flow(tmp_path)
     await fill_to_review(flow, 22)
@@ -233,7 +537,7 @@ async def test_review_contains_emoji_labels_and_bold_html(tmp_path):
     assert response.parse_mode == "HTML"
     assert "🎯 <b>Интент:</b>" in response.text
     assert "👤 <b>Закрепленный сценарист:</b>" in response.text
-    assert "📝 <b>Причина изменений:</b>" in response.text
+    assert "📝 <b>Кейс или сообщения клиента:</b>" in response.text
     assert "🔧 <b>Суть изменений:</b>" in response.text
     assert "📄 <b>Исходный текст:</b>" in response.text
     assert "🧭 <b>Направление:</b>" in response.text
@@ -250,6 +554,15 @@ def test_direction_keyboard_uses_chatbot_labels_and_internal_callbacks():
     assert keyboard.inline_keyboard[0][0].callback_data == "app:direction:ФЛ"
     assert keyboard.inline_keyboard[0][1].text == "SME-chatbot"
     assert keyboard.inline_keyboard[0][1].callback_data == "app:direction:SME"
+
+
+def test_review_keyboard_uses_client_case_label():
+    keyboard = build_keyboard(KeyboardKind.EDIT_MENU_ROLLOUT)
+
+    assert keyboard is not None
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert "Кейс/сообщения" in labels
+    assert "Причина" not in labels
 
 
 def test_bulk_created_keyboard_has_only_ready_button():
@@ -340,7 +653,7 @@ async def test_edit_text_field_returns_to_review(tmp_path):
     draft = await repository.get_by_user_id(15)
 
     assert menu.keyboard == KeyboardKind.EDIT_MENU_ROLLOUT
-    assert "новую причину" in prompt.text
+    assert "новый кейс или сообщения клиента" in prompt.text
     assert response.keyboard == KeyboardKind.REVIEW
     assert draft is not None
     assert draft.current_step == Step.REVIEW
@@ -856,7 +1169,8 @@ async def test_llm_error_keeps_user_text_and_continues(tmp_path):
     assert draft.raw_change_description == "Поменять срок ответа на 5 дней"
     assert draft.formatted_change_description == "Поменять срок ответа на 5 дней"
     assert draft.llm_score is None
-    assert "Продолжаем с исходным текстом" in response.text
+    assert "GigaChat временно не смог корректно проверить описание" in response.text
+    assert "Продолжаем заполнение заявки" in response.text
 
 
 @pytest.mark.asyncio

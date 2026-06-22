@@ -5,7 +5,13 @@ import json
 import pytest
 import aiosqlite
 
-from app.models import ApplicationStatus, BulkRegistrationState, FieldName, Step
+from app.models import (
+    ApplicationStatus,
+    BulkBatchLocationState,
+    BulkRegistrationState,
+    FieldName,
+    Step,
+)
 from app.repository import DraftRepository
 
 
@@ -389,6 +395,136 @@ async def test_repository_migration_adds_submitted_applications_table(tmp_path):
     await repository.init()
 
     assert await repository.list_submitted_applications() == []
+    async with aiosqlite.connect(db_path) as db:
+        draft_columns = {
+            row[1] for row in await (await db.execute("PRAGMA table_info(drafts)")).fetchall()
+        }
+        tracking_columns = {
+            row[1]
+            for row in await (
+                await db.execute("PRAGMA table_info(submitted_applications)")
+            ).fetchall()
+        }
+    assert {
+        "chip_text_before",
+        "chip_text_before_formatting_json",
+        "chip_text",
+        "chip_text_formatting_json",
+        "chip_text_after",
+        "chip_text_after_formatting_json",
+    } <= draft_columns
+    assert "change_type" in tracking_columns
+
+
+@pytest.mark.asyncio
+async def test_repository_restores_bulk_batch_and_child_coordinates(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk-location.db"))
+    await repository.init()
+    await repository.save_bulk_batch(
+        batch_id="BATCH-ABC12345",
+        telegram_user_id=100,
+        spreadsheet_id="sheet-1",
+        direction="FL",
+        sheet_name="Old name",
+        sheet_id=300,
+        start_row=10,
+        data_start_row=12,
+        reserved_rows=100,
+        data_end_row=16,
+    )
+    await repository.create_bulk_creation_request(
+        idempotency_key="request-1",
+        telegram_user_id=100,
+        batch_id="BATCH-ABC12345",
+    )
+    await repository.complete_bulk_creation(
+        "request-1",
+        insert_url="https://docs.google.com/old-range",
+    )
+    for application_id, row_number in (("A1B2C3D4", 12), ("B1C2D3E4", 16)):
+        await repository.save_submitted_application(
+            application_id=application_id,
+            telegram_user_id=100,
+            spreadsheet_id="sheet-1",
+            sheet_id=300,
+            sheet_name="Old name",
+            last_known_status=ApplicationStatus.NEW.value,
+            batch_id="BATCH-ABC12345",
+            last_seen_row_number=row_number,
+        )
+        await repository.mark_submitted_application_not_found(
+            application_id,
+            threshold=1,
+            recheck_seconds=3600,
+        )
+    await repository.record_bulk_batch_location_problem(
+        "BATCH-ABC12345",
+        state=BulkBatchLocationState.MISSING.value,
+        error="missing",
+        recheck_seconds=3600,
+    )
+
+    restored = await repository.restore_bulk_batch_location(
+        "BATCH-ABC12345",
+        spreadsheet_id="sheet-1",
+        sheet_name="Renamed",
+        sheet_id=300,
+        start_row=30,
+    )
+
+    assert restored is not None
+    assert restored.start_row == 30
+    assert restored.data_start_row == 32
+    assert restored.data_end_row == 36
+    assert restored.location_state == BulkBatchLocationState.KNOWN.value
+    tracked = await repository.list_submitted_applications(include_deferred=True)
+    assert [item.last_seen_row_number for item in tracked] == [32, 36]
+    assert all(item.sheet_name == "Renamed" for item in tracked)
+    assert all(item.not_found_count == 0 for item in tracked)
+    assert all(item.polling_state == "ACTIVE" for item in tracked)
+    creation_request = await repository.get_bulk_creation_request("request-1")
+    assert creation_request is not None
+    assert creation_request.insert_url == (
+        "https://docs.google.com/spreadsheets/d/sheet-1/edit#gid=300&range=A32:G32"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repository_migrates_bulk_location_columns(tmp_path):
+    db_path = str(tmp_path / "old-bulk.db")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE bulk_batches (
+                batch_id TEXT PRIMARY KEY,
+                telegram_user_id INTEGER NOT NULL,
+                sheet_name TEXT NOT NULL,
+                sheet_id INTEGER NOT NULL,
+                start_row INTEGER NOT NULL,
+                data_start_row INTEGER NOT NULL,
+                reserved_rows INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.commit()
+
+    repository = DraftRepository(db_path)
+    await repository.init()
+
+    async with aiosqlite.connect(db_path) as db:
+        columns = {
+            row[1]
+            for row in await (await db.execute("PRAGMA table_info(bulk_batches)")).fetchall()
+        }
+    assert {
+        "location_state",
+        "location_miss_count",
+        "last_location_search_at",
+        "next_location_search_at",
+        "last_location_error",
+    } <= columns
 
 
 @pytest.mark.asyncio

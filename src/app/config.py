@@ -47,10 +47,12 @@ class Settings:
     gigachat_show_response_json: bool
     status_polling_enabled: bool
     status_polling_interval_seconds: float
+    status_polling_memory_log_interval: int
     status_not_found_threshold: int
     status_not_found_recheck_seconds: int
     dashboard_sync_interval_seconds: float
     completed_bulk_dashboard_scan_interval_seconds: float
+    bulk_relocation_search_interval_seconds: int
     dashboard_outbox_retry_base_seconds: int
     dashboard_outbox_retry_max_seconds: int
     dashboard_outbox_sending_stale_seconds: int
@@ -61,6 +63,8 @@ class Settings:
     notification_retry_base_seconds: int
     notification_sending_stale_seconds: int
     notification_message_max_chars: int
+    urgent_editor_notifications_enabled: bool
+    editor_urgent_chat_id: int | None
     rollout_schedule: RolloutSchedule
     application_editors: tuple[str, ...]
     google_api_retry: GoogleApiRetryConfig
@@ -76,6 +80,9 @@ def load_settings() -> Settings:
     )
     status_polling_interval_seconds = float(
         os.getenv("STATUS_POLLING_INTERVAL_SECONDS", "30").strip() or "30"
+    )
+    status_polling_memory_log_interval = int(
+        os.getenv("STATUS_POLLING_MEMORY_LOG_INTERVAL", "10").strip() or "10"
     )
     status_not_found_threshold = int(
         os.getenv("STATUS_NOT_FOUND_THRESHOLD", "20").strip() or "20"
@@ -93,6 +100,9 @@ def load_settings() -> Settings:
         ).strip()
         or "3600"
     )
+    bulk_relocation_search_interval_seconds = int(
+        os.getenv("BULK_RELOCATION_SEARCH_INTERVAL_SECONDS", "3600").strip() or "3600"
+    )
     dashboard_outbox_retry_base_seconds = int(
         os.getenv("DASHBOARD_OUTBOX_RETRY_BASE_SECONDS", "60").strip() or "60"
     )
@@ -104,6 +114,8 @@ def load_settings() -> Settings:
     )
     if status_polling_interval_seconds <= 0:
         raise ValueError("STATUS_POLLING_INTERVAL_SECONDS must be greater than 0")
+    if status_polling_memory_log_interval < 0:
+        raise ValueError("STATUS_POLLING_MEMORY_LOG_INTERVAL must be greater than or equal to 0")
     if status_not_found_threshold <= 0:
         raise ValueError("STATUS_NOT_FOUND_THRESHOLD must be greater than 0")
     if status_not_found_recheck_seconds <= 0:
@@ -114,6 +126,8 @@ def load_settings() -> Settings:
         raise ValueError(
             "COMPLETED_BULK_DASHBOARD_SCAN_INTERVAL_SECONDS must be greater than 0"
         )
+    if bulk_relocation_search_interval_seconds <= 0:
+        raise ValueError("BULK_RELOCATION_SEARCH_INTERVAL_SECONDS must be greater than 0")
     bulk_reserved_rows = int(os.getenv("BULK_RESERVED_ROWS", "100").strip() or "100")
     bulk_registration_stale_seconds = int(
         os.getenv("BULK_REGISTRATION_STALE_SECONDS", "600").strip() or "600"
@@ -133,6 +147,22 @@ def load_settings() -> Settings:
     notification_message_max_chars = int(
         os.getenv("NOTIFICATION_MESSAGE_MAX_CHARS", "3500").strip() or "3500"
     )
+    urgent_editor_notifications_enabled = _env_bool(
+        "URGENT_EDITOR_NOTIFICATIONS_ENABLED",
+        default=False,
+    )
+    editor_urgent_chat_id_raw = os.getenv("EDITOR_URGENT_CHAT_ID", "").strip()
+    editor_urgent_chat_id: int | None = None
+    if editor_urgent_chat_id_raw:
+        try:
+            editor_urgent_chat_id = int(editor_urgent_chat_id_raw)
+        except ValueError as exc:
+            raise ValueError("EDITOR_URGENT_CHAT_ID must be an integer") from exc
+    if urgent_editor_notifications_enabled and editor_urgent_chat_id is None:
+        raise ValueError(
+            "EDITOR_URGENT_CHAT_ID must be set when "
+            "URGENT_EDITOR_NOTIFICATIONS_ENABLED=true"
+        )
     if bulk_reserved_rows <= 0:
         raise ValueError("BULK_RESERVED_ROWS must be greater than 0")
     positive_values = {
@@ -214,23 +244,25 @@ def load_settings() -> Settings:
         ),
         gigachat_system_prompt_path=os.getenv(
             "GIGACHAT_SYSTEM_PROMPT_PATH",
-            "prompts/gigachat_system.md",
+            "prompts/gigachat_system_v2.md",
         ).strip()
-        or "prompts/gigachat_system.md",
+        or "prompts/gigachat_system_v2.md",
         gigachat_user_prompt_path=os.getenv(
             "GIGACHAT_USER_PROMPT_PATH",
-            "prompts/gigachat_user.md",
+            "prompts/gigachat_user_v2.md",
         ).strip()
-        or "prompts/gigachat_user.md",
+        or "prompts/gigachat_user_v2.md",
         gigachat_show_response_json=_env_bool("GIGACHAT_SHOW_RESPONSE_JSON", default=False),
         status_polling_enabled=_env_bool("STATUS_POLLING_ENABLED", default=True),
         status_polling_interval_seconds=status_polling_interval_seconds,
+        status_polling_memory_log_interval=status_polling_memory_log_interval,
         status_not_found_threshold=status_not_found_threshold,
         status_not_found_recheck_seconds=status_not_found_recheck_seconds,
         dashboard_sync_interval_seconds=dashboard_sync_interval_seconds,
         completed_bulk_dashboard_scan_interval_seconds=(
             completed_bulk_dashboard_scan_interval_seconds
         ),
+        bulk_relocation_search_interval_seconds=bulk_relocation_search_interval_seconds,
         dashboard_outbox_retry_base_seconds=dashboard_outbox_retry_base_seconds,
         dashboard_outbox_retry_max_seconds=dashboard_outbox_retry_max_seconds,
         dashboard_outbox_sending_stale_seconds=dashboard_outbox_sending_stale_seconds,
@@ -241,6 +273,8 @@ def load_settings() -> Settings:
         notification_retry_base_seconds=notification_retry_base_seconds,
         notification_sending_stale_seconds=notification_sending_stale_seconds,
         notification_message_max_chars=notification_message_max_chars,
+        urgent_editor_notifications_enabled=urgent_editor_notifications_enabled,
+        editor_urgent_chat_id=editor_urgent_chat_id,
         rollout_schedule=RolloutSchedule.from_strings(
             timezone_name=os.getenv("BOT_TIMEZONE", DEFAULT_TIMEZONE).strip()
             or DEFAULT_TIMEZONE,

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import re
 
 import pytest
 
+from app.google_api import GoogleApiRetryConfig
 from app.formatting import TextFormattingSpan, serialize_formatting_spans
 from app.models import (
     AnswerType,
@@ -26,6 +28,8 @@ from app.sheet_dates import (
     google_sheets_date_cell,
 )
 from app.submission import (
+    CHIPS_V2_MARKER,
+    CHIPS_WORKSHEET_HEADERS,
     DASHBOARD_HEADERS,
     DASHBOARD_SHEET_NAME,
     DashboardSyncService,
@@ -36,12 +40,15 @@ from app.submission import (
     LEGACY_WORKSHEET_HEADERS,
     SHEET_HEADERS,
     SheetConfigurationError,
+    build_google_sheets_api,
     dashboard_projection,
     dashboard_tracked_row,
+    chips_draft_to_sheet_row,
     _draft_to_row_data,
     _dashboard_duplicate_row_numbers,
     _repair_dashboard_headers,
     _repair_sheet_bool,
+    _working_sheet_schema,
     draft_to_sheet_row,
     target_sheet_name,
     week_sheet_name,
@@ -50,6 +57,55 @@ from app.submission import (
 
 FL_SPREADSHEET = "fl-spreadsheet"
 DASHBOARD_SPREADSHEET = "dashboard-spreadsheet"
+
+
+def test_new_working_sheet_uses_client_case_header():
+    assert "Кейс или сообщения клиента" in SHEET_HEADERS
+    assert "Причина изменений" not in SHEET_HEADERS
+    assert _working_sheet_schema(SHEET_HEADERS) == "new"
+
+
+def test_old_working_sheet_headers_remain_supported():
+    assert "Причина изменений" in LEGACY_WORKSHEET_HEADERS
+    assert "Причина изменений" in CURRENT_WORKSHEET_HEADERS
+    assert _working_sheet_schema(LEGACY_WORKSHEET_HEADERS) == "legacy"
+    assert _working_sheet_schema(CURRENT_WORKSHEET_HEADERS) == "current"
+
+
+def test_build_google_sheets_api_disables_discovery_cache(monkeypatch):
+    calls = {}
+
+    class FakeCredentials:
+        @staticmethod
+        def from_service_account_file(path, scopes):
+            calls["credentials_path"] = path
+            calls["scopes"] = scopes
+            return "credentials"
+
+    def fake_build(service_name, version, **kwargs):
+        calls["service_name"] = service_name
+        calls["version"] = version
+        calls["kwargs"] = kwargs
+        return "api"
+
+    import google.oauth2.service_account
+    import googleapiclient.discovery
+
+    monkeypatch.setattr(
+        google.oauth2.service_account,
+        "Credentials",
+        FakeCredentials,
+    )
+    monkeypatch.setattr(googleapiclient.discovery, "build", fake_build)
+
+    api = build_google_sheets_api("credentials.json")
+
+    assert api == "api"
+    assert calls["credentials_path"] == "credentials.json"
+    assert calls["service_name"] == "sheets"
+    assert calls["version"] == "v4"
+    assert calls["kwargs"]["credentials"] == "credentials"
+    assert calls["kwargs"]["cache_discovery"] is False
 
 
 class FakeRequest:
@@ -95,6 +151,15 @@ class FakeValuesResource:
                 self.api.rows[(spreadsheet_id, sheet_name)] = values
         else:
             self.api.updated_rows.append((spreadsheet_id, sheet_name, values[0]))
+        range_part = kwargs["range"].split("!", maxsplit=1)[1]
+        row_match = re.fullmatch(r"A(\d+):[A-Z]+(\d+)", range_part)
+        if row_match:
+            start_row = int(row_match.group(1))
+            rows = self.api.rows.setdefault((spreadsheet_id, sheet_name), [])
+            while len(rows) < start_row - 1 + len(values):
+                rows.append([])
+            for offset, row in enumerate(values):
+                rows[start_row - 1 + offset] = row
         return FakeRequest({"updatedRows": len(values)})
 
 
@@ -182,6 +247,28 @@ class FakeSheetsApi:
         return FakeSpreadsheetsResource(self)
 
 
+class FakeGoogleHttpError(Exception):
+    def __init__(self, status: int, message: str = "") -> None:
+        super().__init__(message)
+        self.resp = type("Response", (), {"status": status})()
+
+
+class FailingMetadataSheetsApi(FakeSheetsApi):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    def spreadsheets(self):
+        api = self
+
+        class Resource(FakeSpreadsheetsResource):
+            def get(self, **kwargs):
+                api.metadata_get_calls.append(kwargs)
+                return FakeRequest(lambda: (_ for _ in ()).throw(api.error))
+
+        return Resource(api)
+
+
 def make_draft(**overrides) -> Draft:
     values = {
         "telegram_user_id": 123,
@@ -230,6 +317,15 @@ def make_service(
     )
 
 
+def make_service_with_retry(
+    api: FakeSheetsApi,
+    retry: GoogleApiRetryConfig,
+) -> GoogleSheetsSubmissionService:
+    service = make_service(api)
+    service.google_api_retry = retry
+    return service
+
+
 def test_draft_to_sheet_row_uses_new_direction_schema():
     row = draft_to_sheet_row(make_draft())
 
@@ -259,6 +355,29 @@ def test_draft_to_sheet_row_uses_new_direction_schema():
         1.0,
         ChangeType.ADD.value,
     ]
+
+
+def test_chips_draft_to_sheet_row_uses_dedicated_schema():
+    draft = make_draft(
+        change_type=ChangeType.CHIPS.value,
+        chip_text_before="before",
+        chip_text="chip",
+        chip_text_after="after",
+    )
+
+    row = chips_draft_to_sheet_row(draft)
+
+    assert row[:6] == [
+        draft.scriptwriter,
+        draft.intent,
+        draft.reason,
+        "before",
+        "chip",
+        "after",
+    ]
+    assert row[9] == ApplicationStatus.NEW.value
+    assert row[11] == draft.application_id
+    assert row[20] == ChangeType.CHIPS.value
 
 
 def test_google_sheets_date_cell_converts_utc_to_bot_timezone():
@@ -310,7 +429,7 @@ def test_google_sheets_date_cell_treats_naive_datetime_as_utc():
 
 @pytest.mark.parametrize(
     ("schema", "date_index"),
-    [("new", 14), ("current", 3), ("legacy", 3)],
+    [("new", 14), ("chips", 14), ("current", 3), ("legacy", 3)],
 )
 def test_all_working_sheet_schemas_use_typed_submission_date(schema, date_index):
     row_data = _draft_to_row_data(
@@ -411,6 +530,135 @@ def test_target_sheet_name_prefixes_voicebot_rollout():
     )
 
 
+def urgent_draft(change_type: ChangeType, **overrides) -> Draft:
+    values = {
+        "answer_type": AnswerType.URGENT.value,
+        "is_urgent": True,
+        "change_type": change_type.value,
+    }
+    if change_type == ChangeType.CHIPS:
+        values.update(
+            chip_text_before="before",
+            chip_text="chip",
+            chip_text_after="after",
+            llm_check_status=LlmCheckStatus.SKIPPED.value,
+        )
+    values.update(overrides)
+    return make_draft(**values)
+
+
+@pytest.mark.asyncio
+async def test_new_urgent_sheet_creates_chips_section_and_inserts_add_above_it():
+    api = FakeSheetsApi()
+    service = make_service(api)
+
+    result = await service.submit(urgent_draft(ChangeType.ADD))
+
+    assert result.success is True
+    assert result.sheet_name == "Срочные"
+    assert api.rows[(FL_SPREADSHEET, "Срочные")] == [
+        SHEET_HEADERS,
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+    ]
+    requests = api.batch_updates[-1]["body"]["requests"]
+    assert requests[0]["insertDimension"]["range"]["startIndex"] == 1
+    assert requests[1]["updateCells"]["range"]["startRowIndex"] == 1
+    assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 2
+    assert result.row_number == 2
+
+
+@pytest.mark.asyncio
+async def test_new_urgent_chips_appends_to_dedicated_section():
+    api = FakeSheetsApi()
+    service = make_service(api)
+
+    result = await service.submit(urgent_draft(ChangeType.CHIPS))
+
+    assert result.success is True
+    assert result.sheet_name == "Срочные"
+    append_request = api.batch_updates[-1]["body"]["requests"][0]["appendCells"]
+    cells = append_request["rows"][0]["values"]
+    assert len(cells) == len(CHIPS_WORKSHEET_HEADERS)
+    assert cells[3]["userEnteredValue"] == {"stringValue": "before"}
+    assert cells[4]["userEnteredValue"] == {"stringValue": "chip"}
+    assert cells[5]["userEnteredValue"] == {"stringValue": "after"}
+    initialization_requests = api.batch_updates[-2]["body"]["requests"]
+    urgent_filter = next(
+        request["setBasicFilter"]
+        for request in initialization_requests
+        if "setBasicFilter" in request
+    )
+    assert urgent_filter["filter"]["range"]["endRowIndex"] == 1
+    assert result.row_number == 4
+
+
+@pytest.mark.asyncio
+async def test_existing_urgent_sheet_gets_chips_section_without_changing_rows():
+    existing_row = draft_to_sheet_row(urgent_draft(ChangeType.ADD))
+    rows = [SHEET_HEADERS, existing_row]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 42}},
+        headers={(FL_SPREADSHEET, "Срочные"): SHEET_HEADERS},
+        rows={(FL_SPREADSHEET, "Срочные"): rows},
+    )
+    service = make_service(api)
+
+    result = await service.submit(
+        urgent_draft(ChangeType.EDIT, application_id="B1C2D3E4")
+    )
+
+    assert result.success is True
+    assert api.rows[(FL_SPREADSHEET, "Срочные")][:2] == [
+        SHEET_HEADERS,
+        existing_row,
+    ]
+    assert api.rows[(FL_SPREADSHEET, "Срочные")][2:4] == [
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+    ]
+    requests = api.batch_updates[-1]["body"]["requests"]
+    assert requests[0]["insertDimension"]["range"]["startIndex"] == 2
+    assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 3
+    assert result.row_number == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [LEGACY_WORKSHEET_HEADERS, CURRENT_WORKSHEET_HEADERS, SHEET_HEADERS],
+)
+async def test_urgent_add_supports_all_existing_base_headers(headers):
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 42}},
+        headers={(FL_SPREADSHEET, "Срочные"): headers},
+        rows={(FL_SPREADSHEET, "Срочные"): [headers]},
+    )
+    service = make_service(api)
+
+    result = await service.submit(urgent_draft(ChangeType.ADD))
+
+    assert result.success is True
+    update = api.batch_updates[-1]["body"]["requests"][1]["updateCells"]
+    assert update["range"]["endColumnIndex"] == len(headers)
+
+
+@pytest.mark.asyncio
+async def test_urgent_sheet_rejects_damaged_chips_header():
+    rows = [SHEET_HEADERS, [ChangeType.CHIPS.value], ["wrong"]]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 42}},
+        headers={(FL_SPREADSHEET, "Срочные"): SHEET_HEADERS},
+        rows={(FL_SPREADSHEET, "Срочные"): rows},
+    )
+    service = make_service(api)
+
+    result = await service.submit(urgent_draft(ChangeType.CHIPS))
+
+    assert result.success is False
+    assert "Повреждена шапка секции CHIPS" in result.message
+
+
 @pytest.mark.asyncio
 async def test_submit_creates_week_sheet_and_appends_row():
     api = FakeSheetsApi()
@@ -476,6 +724,80 @@ async def test_sectioned_week_sheet_writes_to_selected_section(
 
 
 @pytest.mark.asyncio
+async def test_empty_legacy_chips_section_is_upgraded_in_place():
+    rows = [
+        ["ADD"],
+        SHEET_HEADERS,
+        ["EDIT"],
+        SHEET_HEADERS,
+        ["CHIPS"],
+        SHEET_HEADERS,
+    ]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "01.06 ср"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "01.06 ср"): rows},
+    )
+    service = make_service(api)
+
+    result = await service.submit(
+        make_draft(
+            change_type=ChangeType.CHIPS.value,
+            chip_text_before="before",
+            chip_text="chip",
+            chip_text_after="after",
+        )
+    )
+
+    assert result.success is True
+    header_updates = [
+        call for call in api.value_updates if call["range"].endswith("!A6:U6")
+    ]
+    assert header_updates[0]["body"]["values"] == [CHIPS_WORKSHEET_HEADERS]
+    assert not any(
+        call["body"]["values"][0] == [CHIPS_V2_MARKER]
+        for call in api.value_updates
+    )
+
+
+@pytest.mark.asyncio
+async def test_populated_legacy_chips_section_creates_and_uses_v2():
+    legacy_chips_row = ["legacy"] * len(SHEET_HEADERS)
+    rows = [
+        ["ADD"],
+        SHEET_HEADERS,
+        ["EDIT"],
+        SHEET_HEADERS,
+        ["CHIPS"],
+        SHEET_HEADERS,
+        legacy_chips_row,
+    ]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "01.06 ср"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "01.06 ср"): rows},
+    )
+    service = make_service(api)
+
+    result = await service.submit(
+        make_draft(
+            change_type=ChangeType.CHIPS.value,
+            chip_text_before="before",
+            chip_text="chip",
+            chip_text_after="after",
+        )
+    )
+
+    assert result.success is True
+    assert api.rows[(FL_SPREADSHEET, "01.06 ср")][6] == legacy_chips_row
+    assert api.rows[(FL_SPREADSHEET, "01.06 ср")][7:9] == [
+        [CHIPS_V2_MARKER],
+        CHIPS_WORKSHEET_HEADERS,
+    ]
+    assert result.row_number == 10
+
+
+@pytest.mark.asyncio
 async def test_submit_routes_by_submission_time_not_draft_creation_time():
     api = FakeSheetsApi()
     service = make_service(
@@ -510,6 +832,40 @@ async def test_existing_wrong_headers_return_error_and_do_not_append():
     assert result.success is False
     assert "Структура колонок" in result.message
     assert api.append_cells == []
+
+
+@pytest.mark.asyncio
+async def test_submit_returns_user_friendly_message_after_google_rate_limit():
+    api = FailingMetadataSheetsApi(
+        FakeGoogleHttpError(429, "Quota exceeded for quota metric 'Read requests'")
+    )
+    service = make_service_with_retry(
+        api,
+        GoogleApiRetryConfig(max_attempts=1, base_seconds=0, max_seconds=0),
+    )
+
+    result = await service.submit(make_draft())
+
+    assert result.success is False
+    assert "Google API временно перегружен" in result.message
+    assert "Повторите отправку через 2-3 минуты" in result.message
+    assert "HttpError" not in result.message
+    assert "Quota exceeded" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_submit_keeps_generic_message_for_non_rate_limit_google_error():
+    api = FailingMetadataSheetsApi(FakeGoogleHttpError(400, "schema error"))
+    service = make_service_with_retry(
+        api,
+        GoogleApiRetryConfig(max_attempts=1, base_seconds=0, max_seconds=0),
+    )
+
+    result = await service.submit(make_draft())
+
+    assert result.success is False
+    assert "Не удалось отправить заявку" in result.message
+    assert "schema error" in result.message
 
 
 @pytest.mark.asyncio
@@ -704,6 +1060,33 @@ def test_new_worksheet_formatting_has_active_group_border():
     assert border["range"]["startColumnIndex"] == 10
     assert border["range"]["endColumnIndex"] == 11
     assert border["cell"]["userEnteredFormat"]["borders"]["right"]["style"] == "SOLID_THICK"
+
+
+def test_chips_row_preserves_rich_text_in_all_three_fragments():
+    bold = serialize_formatting_spans(
+        [TextFormattingSpan(start=0, end=3, bold=True)]
+    )
+    strike = serialize_formatting_spans(
+        [TextFormattingSpan(start=1, end=4, strikethrough=True)]
+    )
+    row_data = _draft_to_row_data(
+        make_draft(
+            change_type=ChangeType.CHIPS.value,
+            chip_text_before="before",
+            chip_text_before_formatting_json=bold,
+            chip_text="chip",
+            chip_text_formatting_json=strike,
+            chip_text_after="after",
+            chip_text_after_formatting_json=bold,
+        ),
+        schema="chips",
+    )
+
+    cells = row_data["values"]
+    assert cells[3]["textFormatRuns"][0]["format"]["bold"] is True
+    assert cells[4]["textFormatRuns"][0]["startIndex"] == 0
+    assert cells[4]["textFormatRuns"][1]["format"]["strikethrough"] is True
+    assert cells[5]["textFormatRuns"][0]["format"]["bold"] is True
 
 
 @pytest.mark.asyncio

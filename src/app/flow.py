@@ -12,7 +12,7 @@ from app.formatting import (
     serialize_formatting_spans,
 )
 from app.bulk import BulkApplicationRegistrar, BulkBatchServiceProtocol
-from app.llm import LlmClient
+from app.llm import LLM_ERROR_PREFIX, LlmClient
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -37,6 +37,8 @@ from app.models import (
 from app.repository import DraftRepository
 from app.submission import SubmissionServiceProtocol, dashboard_projection, dashboard_row
 
+URGENT_EDITOR_NOTIFICATION_EVENT_TYPE = "urgent-editor-application-created"
+
 
 FIELD_LABELS = {
     FieldName.DIRECTION: "Направление",
@@ -44,9 +46,12 @@ FIELD_LABELS = {
     FieldName.CHANGE_TYPE: "Тип изменения",
     FieldName.INTENT: "Интент",
     FieldName.SCRIPTWRITER: "Закрепленный сценарист",
-    FieldName.REASON: "Причина изменений",
+    FieldName.REASON: "Кейс или сообщения клиента",
     FieldName.CHANGE_DESCRIPTION: "Суть изменений",
     FieldName.SOURCE_TEXT: "Исходный текст",
+    FieldName.CHIP_TEXT_BEFORE: "Текст до чипса",
+    FieldName.CHIP_TEXT: "Текст чипса",
+    FieldName.CHIP_TEXT_AFTER: "Текст после чипса",
     FieldName.URGENCY: "Срочная",
     FieldName.PRIORITY: "Приоритет",
 }
@@ -59,21 +64,35 @@ PENDING_CREATE_BULK_DIRECTION = "create_bulk_direction"
 STEP_PROMPTS = {
     Step.DIRECTION: "Выберите направление заявки.",
     Step.ANSWER_TYPE: "Выберите тип ответа.",
-    Step.CHANGE_TYPE: "Выберите тип изменения для раскатки.",
+    Step.CHANGE_TYPE: "Выберите тип изменения.",
     Step.INTENT: "В каком интенте необходимо внести изменения?",
     Step.SCRIPTWRITER: "За каким сценаристом закреплен интент?",
-    Step.REASON: "Опишите причину изменений.",
-    Step.CHANGE_DESCRIPTION: "В чем суть изменений?",
+    Step.REASON: "Опишите кейс или сообщения клиента.",
+    Step.CHANGE_DESCRIPTION: (
+        "В чем суть изменений?\n\n"
+        "Кратко опишите, зачем вы меняете текст: что было не так и почему это важно. "
+        "Не пишите общих фраз — нам нужно понять логику изменений."
+    ),
     Step.CHANGE_DESCRIPTION_CLARIFICATION: "Введите дополнение к сути изменений.",
     Step.SOURCE_TEXT: "Пришлите исходный текст ответа чат-бота.",
+    Step.CHIP_TEXT_BEFORE: "Введите текст до чипса.",
+    Step.CHIP_TEXT: "Введите текст чипса.",
+    Step.CHIP_TEXT_AFTER: "Введите текст после чипса.",
     Step.URGENCY: "Заявка срочная?",
     Step.PRIORITY: "Выберите приоритет заявки.",
     Step.EDIT_INTENT: "Введите новый интент.",
-    Step.EDIT_CHANGE_TYPE: "Выберите новый тип изменения для раскатки.",
+    Step.EDIT_CHANGE_TYPE: "Выберите новый тип изменения.",
     Step.EDIT_SCRIPTWRITER: "Введите нового закрепленного сценариста.",
-    Step.EDIT_REASON: "Введите новую причину изменений.",
-    Step.EDIT_CHANGE_DESCRIPTION: "Введите новую суть изменений.",
+    Step.EDIT_REASON: "Введите новый кейс или сообщения клиента.",
+    Step.EDIT_CHANGE_DESCRIPTION: (
+        "Введите новую суть изменений. Кратко опишите, зачем вы меняете текст: "
+        "что было не так и почему это важно. Не пишите общих фраз — нам нужно "
+        "понять логику изменений."
+    ),
     Step.EDIT_SOURCE_TEXT: "Введите новый исходный текст.",
+    Step.EDIT_CHIP_TEXT_BEFORE: "Введите новый текст до чипса.",
+    Step.EDIT_CHIP_TEXT: "Введите новый текст чипса.",
+    Step.EDIT_CHIP_TEXT_AFTER: "Введите новый текст после чипса.",
     Step.EDIT_URGENCY: "Выберите новый признак срочности.",
     Step.EDIT_PRIORITY: "Выберите новый приоритет заявки.",
 }
@@ -93,6 +112,8 @@ class ApplicationFlow:
         bulk_reserved_rows: int = 100,
         bulk_creation_stale_seconds: int = 600,
         dashboard_enabled: bool = False,
+        urgent_editor_notifications_enabled: bool = False,
+        editor_urgent_chat_id: int | None = None,
     ) -> None:
         self.repository = repository
         self.llm_client = llm_client
@@ -103,6 +124,8 @@ class ApplicationFlow:
         self.bulk_reserved_rows = bulk_reserved_rows
         self.bulk_creation_stale_seconds = bulk_creation_stale_seconds
         self.dashboard_enabled = dashboard_enabled
+        self.urgent_editor_notifications_enabled = urgent_editor_notifications_enabled
+        self.editor_urgent_chat_id = editor_urgent_chat_id
         self._submission_locks: dict[str, asyncio.Lock] = {}
 
     async def show_start(self) -> BotResponse:
@@ -219,11 +242,12 @@ class ApplicationFlow:
         if not draft.direction and draft.current_step != Step.DIRECTION:
             draft = await self.repository.set_step(telegram_user_id, Step.DIRECTION)
         elif (
-            draft.answer_type == AnswerType.ROLLOUT.value
+            _answer_type_requires_change_type(draft.answer_type)
             and ChangeType.normalize(draft.change_type) is None
             and draft.current_step not in {Step.ANSWER_TYPE, Step.EDIT_ANSWER_TYPE}
         ):
             draft = await self.repository.set_step(telegram_user_id, Step.CHANGE_TYPE)
+        draft = await self._normalize_change_type_step(telegram_user_id, draft)
         return await self._prompt_response_for_user(
             telegram_user_id,
             draft,
@@ -504,7 +528,10 @@ class ApplicationFlow:
             FieldName.INTENT.value,
             settings.default_intent,
         )
-        draft = await self.repository.set_step(telegram_user_id, Step.SCRIPTWRITER)
+        draft = await self.repository.set_step(
+            telegram_user_id,
+            Step.REASON if _is_chips(draft) else Step.SCRIPTWRITER,
+        )
         return await self._prompt_response_for_user(
             telegram_user_id,
             draft,
@@ -532,7 +559,10 @@ class ApplicationFlow:
             FieldName.SCRIPTWRITER.value,
             settings.default_scriptwriter,
         )
-        draft = await self.repository.set_step(telegram_user_id, Step.REASON)
+        draft = await self.repository.set_step(
+            telegram_user_id,
+            Step.INTENT if _is_chips(draft) else Step.REASON,
+        )
         return await self._prompt_response_for_user(
             telegram_user_id,
             draft,
@@ -551,6 +581,7 @@ class ApplicationFlow:
             return pending_response
 
         draft = await self._get_active_or_start(telegram_user_id)
+        draft = await self._normalize_change_type_step(telegram_user_id, draft)
         value = (text or "").strip()
         if not value:
             return await self._prompt_response_for_user(
@@ -580,7 +611,10 @@ class ApplicationFlow:
                 )
             case Step.INTENT:
                 await self.repository.save_answer(telegram_user_id, FieldName.INTENT.value, value)
-                draft = await self.repository.set_step(telegram_user_id, Step.SCRIPTWRITER)
+                draft = await self.repository.set_step(
+                    telegram_user_id,
+                    Step.REASON if _is_chips(draft) else Step.SCRIPTWRITER,
+                )
                 return await self._prompt_response_for_user(telegram_user_id, draft)
             case Step.SCRIPTWRITER:
                 await self.repository.save_answer(
@@ -588,12 +622,45 @@ class ApplicationFlow:
                     FieldName.SCRIPTWRITER.value,
                     value,
                 )
-                draft = await self.repository.set_step(telegram_user_id, Step.REASON)
+                draft = await self.repository.set_step(
+                    telegram_user_id,
+                    Step.INTENT if _is_chips(draft) else Step.REASON,
+                )
                 return await self._prompt_response_for_user(telegram_user_id, draft)
             case Step.REASON:
                 await self.repository.save_answer(telegram_user_id, FieldName.REASON.value, value)
-                draft = await self.repository.set_step(telegram_user_id, Step.CHANGE_DESCRIPTION)
+                draft = await self.repository.set_step(
+                    telegram_user_id,
+                    Step.CHIP_TEXT_BEFORE if _is_chips(draft) else Step.CHANGE_DESCRIPTION,
+                )
                 return await self._prompt_response_for_user(telegram_user_id, draft)
+            case Step.CHIP_TEXT_BEFORE:
+                await self._save_formatted_text(
+                    telegram_user_id,
+                    FieldName.CHIP_TEXT_BEFORE,
+                    value,
+                    formatting_spans,
+                )
+                draft = await self.repository.set_step(telegram_user_id, Step.CHIP_TEXT)
+                return await self._prompt_response_for_user(telegram_user_id, draft)
+            case Step.CHIP_TEXT:
+                await self._save_formatted_text(
+                    telegram_user_id,
+                    FieldName.CHIP_TEXT,
+                    value,
+                    formatting_spans,
+                )
+                draft = await self.repository.set_step(telegram_user_id, Step.CHIP_TEXT_AFTER)
+                return await self._prompt_response_for_user(telegram_user_id, draft)
+            case Step.CHIP_TEXT_AFTER:
+                await self._save_formatted_text(
+                    telegram_user_id,
+                    FieldName.CHIP_TEXT_AFTER,
+                    value,
+                    formatting_spans,
+                )
+                draft = await self.repository.set_step(telegram_user_id, Step.REVIEW)
+                return self._review_response(draft)
             case Step.CHANGE_DESCRIPTION:
                 return await self._process_change_description(telegram_user_id, value)
             case Step.CHANGE_DESCRIPTION_CLARIFICATION:
@@ -655,6 +722,19 @@ class ApplicationFlow:
             case Step.EDIT_SOURCE_TEXT:
                 await self._save_source_text(telegram_user_id, value, formatting_spans)
                 return await self._return_to_review(telegram_user_id)
+            case Step.EDIT_CHIP_TEXT_BEFORE | Step.EDIT_CHIP_TEXT | Step.EDIT_CHIP_TEXT_AFTER:
+                field = {
+                    Step.EDIT_CHIP_TEXT_BEFORE: FieldName.CHIP_TEXT_BEFORE,
+                    Step.EDIT_CHIP_TEXT: FieldName.CHIP_TEXT,
+                    Step.EDIT_CHIP_TEXT_AFTER: FieldName.CHIP_TEXT_AFTER,
+                }[draft.current_step]
+                await self._save_formatted_text(
+                    telegram_user_id,
+                    field,
+                    value,
+                    formatting_spans,
+                )
+                return await self._return_to_review(telegram_user_id)
             case Step.EDIT_DIRECTION:
                 return await self._prompt_response_for_user(telegram_user_id, draft)
             case Step.EDIT_ANSWER_TYPE:
@@ -666,7 +746,7 @@ class ApplicationFlow:
 
     async def should_show_llm_processing(self, telegram_user_id: int) -> bool:
         draft = await self.repository.get_by_user_id(telegram_user_id)
-        return draft is not None and draft.current_step in {
+        return draft is not None and not _is_chips(draft) and draft.current_step in {
             Step.CHANGE_DESCRIPTION,
             Step.CHANGE_DESCRIPTION_CLARIFICATION,
             Step.EDIT_CHANGE_DESCRIPTION,
@@ -736,7 +816,7 @@ class ApplicationFlow:
             FieldName.ANSWER_TYPE.value,
             answer_type.value,
         )
-        if answer_type != AnswerType.ROLLOUT:
+        if not _answer_type_requires_change_type(answer_type.value):
             await self.repository.save_answer(
                 telegram_user_id,
                 FieldName.CHANGE_TYPE.value,
@@ -747,7 +827,7 @@ class ApplicationFlow:
             FieldName.URGENCY.value,
             answer_type == AnswerType.URGENT,
         )
-        if answer_type == AnswerType.ROLLOUT:
+        if _answer_type_requires_change_type(answer_type.value):
             next_step = (
                 Step.EDIT_CHANGE_TYPE
                 if draft.current_step == Step.EDIT_ANSWER_TYPE
@@ -772,7 +852,7 @@ class ApplicationFlow:
                 draft,
                 prefix="Сейчас выбор типа изменения не ожидается.",
             )
-        if draft.answer_type != AnswerType.ROLLOUT.value:
+        if not _answer_type_requires_change_type(draft.answer_type):
             await self.repository.save_answer(
                 telegram_user_id,
                 FieldName.CHANGE_TYPE.value,
@@ -781,7 +861,7 @@ class ApplicationFlow:
             return await self._prompt_response_for_user(
                 telegram_user_id,
                 draft,
-                prefix="Тип изменения выбирается только для раскатки.",
+                prefix="Тип изменения выбирается только для раскатки или срочной заявки.",
             )
 
         await self.repository.save_answer(
@@ -789,11 +869,79 @@ class ApplicationFlow:
             FieldName.CHANGE_TYPE.value,
             change_type.value,
         )
-        next_step = Step.REVIEW if draft.current_step == Step.EDIT_CHANGE_TYPE else Step.INTENT
+        edit_mode = draft.current_step == Step.EDIT_CHANGE_TYPE
+        if draft.change_type != change_type.value:
+            await self._reset_change_type_specific_fields(telegram_user_id, change_type)
+        updated = await self.repository.get_by_user_id(telegram_user_id)
+        if updated is None:
+            raise LookupError(f"Draft not found for user {telegram_user_id}")
+        if edit_mode:
+            next_step = _first_missing_step(updated) or Step.REVIEW
+        else:
+            next_step = Step.SCRIPTWRITER if change_type == ChangeType.CHIPS else Step.INTENT
         draft = await self.repository.set_step(telegram_user_id, next_step)
         if next_step == Step.REVIEW:
             return self._review_response(draft, prefix="Тип изменения обновлен.")
         return await self._prompt_response_for_user(telegram_user_id, draft)
+
+    async def _reset_change_type_specific_fields(
+        self,
+        telegram_user_id: int,
+        change_type: ChangeType,
+    ) -> None:
+        if change_type == ChangeType.CHIPS:
+            await self.repository.save_llm_result(
+                telegram_user_id,
+                formatted_change_description=None,
+                raw_change_description=None,
+                llm_check_status=LlmCheckStatus.SKIPPED.value,
+                llm_score=None,
+                clarification_count=0,
+            )
+            await self.repository.save_answer(telegram_user_id, FieldName.SOURCE_TEXT.value, "")
+            await self.repository.save_answer(
+                telegram_user_id,
+                "source_text_formatting_json",
+                "",
+            )
+            for field in (
+                FieldName.CHIP_TEXT_BEFORE,
+                FieldName.CHIP_TEXT,
+                FieldName.CHIP_TEXT_AFTER,
+            ):
+                await self.repository.save_answer(telegram_user_id, field.value, "")
+                await self.repository.save_answer(
+                    telegram_user_id,
+                    f"{field.value}_formatting_json",
+                    "",
+                )
+            return
+
+        for field in (
+            FieldName.CHIP_TEXT_BEFORE,
+            FieldName.CHIP_TEXT,
+            FieldName.CHIP_TEXT_AFTER,
+        ):
+            await self.repository.save_answer(telegram_user_id, field.value, "")
+            await self.repository.save_answer(
+                telegram_user_id,
+                f"{field.value}_formatting_json",
+                "",
+            )
+        await self.repository.save_llm_result(
+            telegram_user_id,
+            formatted_change_description=None,
+            raw_change_description=None,
+            llm_check_status=LlmCheckStatus.NOT_CHECKED.value,
+            llm_score=None,
+            clarification_count=0,
+        )
+        await self.repository.save_answer(telegram_user_id, FieldName.SOURCE_TEXT.value, "")
+        await self.repository.save_answer(
+            telegram_user_id,
+            "source_text_formatting_json",
+            "",
+        )
 
     async def select_urgency(self, telegram_user_id: int, is_urgent: bool) -> BotResponse:
         draft = await self._get_active_or_start(telegram_user_id)
@@ -828,9 +976,28 @@ class ApplicationFlow:
 
     async def back(self, telegram_user_id: int) -> BotResponse:
         draft = await self._get_active_or_start(telegram_user_id)
-        if (
+        if _is_chips(draft):
+            previous_step = {
+                Step.SCRIPTWRITER: Step.CHANGE_TYPE,
+                Step.INTENT: Step.SCRIPTWRITER,
+                Step.REASON: Step.INTENT,
+                Step.CHIP_TEXT_BEFORE: Step.REASON,
+                Step.CHIP_TEXT: Step.CHIP_TEXT_BEFORE,
+                Step.CHIP_TEXT_AFTER: Step.CHIP_TEXT,
+                Step.REVIEW: Step.CHIP_TEXT_AFTER,
+                Step.EDIT_DIRECTION: Step.REVIEW,
+                Step.EDIT_ANSWER_TYPE: Step.REVIEW,
+                Step.EDIT_CHANGE_TYPE: Step.REVIEW,
+                Step.EDIT_INTENT: Step.REVIEW,
+                Step.EDIT_SCRIPTWRITER: Step.REVIEW,
+                Step.EDIT_REASON: Step.REVIEW,
+                Step.EDIT_CHIP_TEXT_BEFORE: Step.REVIEW,
+                Step.EDIT_CHIP_TEXT: Step.REVIEW,
+                Step.EDIT_CHIP_TEXT_AFTER: Step.REVIEW,
+            }.get(draft.current_step)
+        elif (
             draft.current_step == Step.INTENT
-            and draft.answer_type == AnswerType.ROLLOUT.value
+            and _answer_type_requires_change_type(draft.answer_type)
         ):
             previous_step = Step.CHANGE_TYPE
         elif draft.current_step == Step.INTENT and not _direction_requires_answer_type(draft.direction):
@@ -887,15 +1054,28 @@ class ApplicationFlow:
         return BotResponse(
             text="Что нужно отредактировать?",
             keyboard=(
-                KeyboardKind.EDIT_MENU_ROLLOUT
-                if draft.answer_type == AnswerType.ROLLOUT.value
-                else KeyboardKind.EDIT_MENU
+                KeyboardKind.EDIT_MENU_CHIPS
+                if _is_chips(draft)
+                else (
+                    KeyboardKind.EDIT_MENU_ROLLOUT
+                    if _answer_type_requires_change_type(draft.answer_type)
+                    else KeyboardKind.EDIT_MENU
+                )
             ),
             draft=draft,
         )
 
     async def select_edit_field(self, telegram_user_id: int, field: FieldName) -> BotResponse:
         draft = await self._get_active_or_start(telegram_user_id)
+        chip_fields = {
+            FieldName.CHIP_TEXT_BEFORE,
+            FieldName.CHIP_TEXT,
+            FieldName.CHIP_TEXT_AFTER,
+        }
+        if (_is_chips(draft) and field in {FieldName.CHANGE_DESCRIPTION, FieldName.SOURCE_TEXT}) or (
+            not _is_chips(draft) and field in chip_fields
+        ):
+            return self._review_response(draft, prefix="Эта кнопка не относится к выбранному типу изменения.")
         if field == FieldName.URGENCY and _direction_requires_answer_type(draft.direction):
             return self._review_response(
                 draft,
@@ -910,6 +1090,9 @@ class ApplicationFlow:
             FieldName.REASON: Step.EDIT_REASON,
             FieldName.CHANGE_DESCRIPTION: Step.EDIT_CHANGE_DESCRIPTION,
             FieldName.SOURCE_TEXT: Step.EDIT_SOURCE_TEXT,
+            FieldName.CHIP_TEXT_BEFORE: Step.EDIT_CHIP_TEXT_BEFORE,
+            FieldName.CHIP_TEXT: Step.EDIT_CHIP_TEXT,
+            FieldName.CHIP_TEXT_AFTER: Step.EDIT_CHIP_TEXT_AFTER,
             FieldName.URGENCY: Step.EDIT_URGENCY,
             FieldName.PRIORITY: Step.EDIT_PRIORITY,
         }
@@ -993,6 +1176,7 @@ class ApplicationFlow:
                 direction=draft.direction,
                 answer_type=draft.answer_type,
                 application_type=draft.application_type,
+                change_type=draft.change_type,
                 is_urgent=draft.is_urgent,
                 submitted_at=result.submitted_at,
                 dashboard_projection=(
@@ -1008,12 +1192,52 @@ class ApplicationFlow:
                     if self.dashboard_enabled
                     else None
                 ),
+                notification_event=self._urgent_editor_notification_event(
+                    draft,
+                    row_link=result.row_link,
+                ),
             )
         return BotResponse(
             text=f"{result.message}\n\nЧтобы создать новую заявку, отправьте /new.",
             keyboard=KeyboardKind.CREATE_MODE,
             draft=draft,
         )
+
+    def _urgent_editor_notification_event(
+        self,
+        draft: Draft,
+        *,
+        row_link: str | None,
+    ) -> dict[str, object] | None:
+        if not self.urgent_editor_notifications_enabled:
+            return None
+        if self.editor_urgent_chat_id is None:
+            return None
+        if not draft.is_urgent:
+            return None
+        if not row_link:
+            return None
+        application_id = draft.application_id or ""
+        if not application_id:
+            return None
+        snapshot = {
+            "application_id": application_id,
+            "direction": draft.direction or "",
+            "scriptwriter": draft.scriptwriter or "",
+            "intent": draft.intent or "",
+            "row_link": row_link,
+        }
+        return {
+            "telegram_user_id": self.editor_urgent_chat_id,
+            "event_type": URGENT_EDITOR_NOTIFICATION_EVENT_TYPE,
+            "dedupe_key": f"{URGENT_EDITOR_NOTIFICATION_EVENT_TYPE}:{application_id}",
+            "snapshot_json": json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            "chunks": [_render_urgent_editor_notification(snapshot)],
+        }
 
     async def _process_change_description(
         self,
@@ -1023,6 +1247,21 @@ class ApplicationFlow:
         edit_mode: bool = False,
     ) -> BotResponse:
         """Проверить полноту описания и запросить не более одного уточнения."""
+        existing = await self.repository.get_by_user_id(telegram_user_id)
+        if existing is not None and _is_chips(existing):
+            await self.repository.save_llm_result(
+                telegram_user_id,
+                formatted_change_description=None,
+                raw_change_description=None,
+                llm_check_status=LlmCheckStatus.SKIPPED.value,
+                llm_score=None,
+                clarification_count=0,
+            )
+            next_step = _first_missing_step(existing) or Step.REVIEW
+            draft = await self.repository.set_step(telegram_user_id, next_step)
+            if next_step == Step.REVIEW:
+                return self._review_response(draft)
+            return await self._prompt_response_for_user(telegram_user_id, draft)
         draft = await self.repository.save_answer(
             telegram_user_id,
             "raw_change_description",
@@ -1080,6 +1319,12 @@ class ApplicationFlow:
         draft = await self.repository.get_by_user_id(telegram_user_id)
         if draft is None:
             return await self.start_new(telegram_user_id, force=True)
+        if _is_chips(draft):
+            next_step = _first_missing_step(draft) or Step.REVIEW
+            draft = await self.repository.set_step(telegram_user_id, next_step)
+            if next_step == Step.REVIEW:
+                return self._review_response(draft)
+            return await self._prompt_response_for_user(telegram_user_id, draft)
 
         original_description = draft.raw_change_description or ""
         combined_description = (
@@ -1143,8 +1388,8 @@ class ApplicationFlow:
     def _llm_success_prefix(status: str) -> str:
         if status == LlmCheckStatus.ERROR.value:
             return (
-                "Не удалось проверить суть изменений через GigaChat. "
-                "Продолжаем с исходным текстом и пометкой для редактора."
+                "GigaChat временно не смог корректно проверить описание. "
+                "Продолжаем заполнение заявки; редактор увидит пометку о проблеме проверки."
             )
         if status == LlmCheckStatus.NEEDS_ATTENTION.value:
             return (
@@ -1181,6 +1426,20 @@ class ApplicationFlow:
         await self.repository.save_answer(
             telegram_user_id,
             "source_text_formatting_json",
+            serialize_formatting_spans(formatting_spans) or "",
+        )
+
+    async def _save_formatted_text(
+        self,
+        telegram_user_id: int,
+        field: FieldName,
+        value: str,
+        formatting_spans: list[TextFormattingSpan] | None,
+    ) -> None:
+        await self.repository.save_answer(telegram_user_id, field.value, value)
+        await self.repository.save_answer(
+            telegram_user_id,
+            f"{field.value}_formatting_json",
             serialize_formatting_spans(formatting_spans) or "",
         )
 
@@ -1267,6 +1526,27 @@ class ApplicationFlow:
                 response.keyboard = KeyboardKind.SCRIPTWRITER_STEP_WITH_DEFAULT
         return response
 
+    async def _normalize_change_type_step(
+        self,
+        telegram_user_id: int,
+        draft: Draft,
+    ) -> Draft:
+        """Move pre-migration drafts away from steps incompatible with their type."""
+        if not _is_chips(draft):
+            return draft
+        incompatible_steps = {
+            Step.CHANGE_DESCRIPTION,
+            Step.CHANGE_DESCRIPTION_CLARIFICATION,
+            Step.SOURCE_TEXT,
+            Step.EDIT_CHANGE_DESCRIPTION,
+            Step.EDIT_SOURCE_TEXT,
+        }
+        next_step = _first_missing_step(draft)
+        needs_review_repair = draft.current_step == Step.REVIEW and next_step is not None
+        if draft.current_step not in incompatible_steps and not needs_review_repair:
+            return draft
+        return await self.repository.set_step(telegram_user_id, next_step or Step.REVIEW)
+
     def _prompt_response(self, draft: Draft, *, prefix: str | None = None) -> BotResponse:
         text = STEP_PROMPTS[draft.current_step]
         if prefix:
@@ -1308,9 +1588,26 @@ class ApplicationFlow:
 
     @staticmethod
     def _render_review(draft: Draft) -> str:
+        if _is_chips(draft):
+            return (
+                "Проверьте заявку перед отправкой.\n\n"
+                f"🧭 <b>Направление:</b> {_html_value(direction_display_label(draft.direction))}\n"
+                f"🏷 <b>Тип ответа:</b> {_html_value(draft.answer_type)}\n"
+                f"🔀 <b>Тип изменения:</b> {ChangeType.CHIPS.value}\n"
+                f"👤 <b>Закрепленный сценарист:</b> {_html_value(draft.scriptwriter)}\n"
+                f"🎯 <b>Интент:</b> {_html_value(draft.intent)}\n"
+                f"📝 <b>Причина:</b> {_html_value(draft.reason)}\n"
+                "⬅️ <b>Текст до чипса:</b> "
+                f"{_render_formatted_draft_value(draft.chip_text_before, draft.chip_text_before_formatting_json)}\n"
+                "🔘 <b>Текст чипса:</b> "
+                f"{_render_formatted_draft_value(draft.chip_text, draft.chip_text_formatting_json)}\n"
+                "➡️ <b>Текст после чипса:</b> "
+                f"{_render_formatted_draft_value(draft.chip_text_after, draft.chip_text_after_formatting_json)}\n"
+                f"⚡ <b>Срочная:</b> {_html_value('Да' if draft.is_urgent else 'Нет')}"
+            )
         change_type_line = (
             f"🔀 <b>Тип изменения:</b> {_html_value(draft.change_type)}\n"
-            if draft.answer_type == AnswerType.ROLLOUT.value
+            if _answer_type_requires_change_type(draft.answer_type)
             else ""
         )
         return (
@@ -1320,7 +1617,7 @@ class ApplicationFlow:
             f"{change_type_line}"
             f"🎯 <b>Интент:</b> {_html_value(draft.intent)}\n"
             f"👤 <b>Закрепленный сценарист:</b> {_html_value(draft.scriptwriter)}\n"
-            f"📝 <b>Причина изменений:</b> {_html_value(draft.reason)}\n"
+            f"📝 <b>Кейс или сообщения клиента:</b> {_html_value(draft.reason)}\n"
             "🔧 <b>Суть изменений:</b> "
             f"{_html_value(draft.formatted_change_description or draft.raw_change_description)}\n"
             "📄 <b>Исходный текст:</b> "
@@ -1336,7 +1633,7 @@ class ApplicationFlow:
         if _direction_requires_answer_type(draft.direction) and not draft.answer_type:
             missing.append(FIELD_LABELS[FieldName.ANSWER_TYPE])
         if (
-            draft.answer_type == AnswerType.ROLLOUT.value
+            _answer_type_requires_change_type(draft.answer_type)
             and ChangeType.normalize(draft.change_type) is None
         ):
             missing.append(FIELD_LABELS[FieldName.CHANGE_TYPE])
@@ -1345,11 +1642,19 @@ class ApplicationFlow:
         if not draft.scriptwriter:
             missing.append(FIELD_LABELS[FieldName.SCRIPTWRITER])
         if not draft.reason:
-            missing.append(FIELD_LABELS[FieldName.REASON])
-        if not draft.formatted_change_description and not draft.raw_change_description:
-            missing.append(FIELD_LABELS[FieldName.CHANGE_DESCRIPTION])
-        if not draft.source_text:
-            missing.append(FIELD_LABELS[FieldName.SOURCE_TEXT])
+            missing.append("Причина" if _is_chips(draft) else FIELD_LABELS[FieldName.REASON])
+        if _is_chips(draft):
+            if not draft.chip_text_before:
+                missing.append(FIELD_LABELS[FieldName.CHIP_TEXT_BEFORE])
+            if not draft.chip_text:
+                missing.append(FIELD_LABELS[FieldName.CHIP_TEXT])
+            if not draft.chip_text_after:
+                missing.append(FIELD_LABELS[FieldName.CHIP_TEXT_AFTER])
+        else:
+            if not draft.formatted_change_description and not draft.raw_change_description:
+                missing.append(FIELD_LABELS[FieldName.CHANGE_DESCRIPTION])
+            if not draft.source_text:
+                missing.append(FIELD_LABELS[FieldName.SOURCE_TEXT])
         if draft.is_urgent is None:
             missing.append(FIELD_LABELS[FieldName.URGENCY])
         return missing
@@ -1359,15 +1664,75 @@ def _html_value(value: str | None) -> str:
     return escape(value or "-")
 
 
+def _render_formatted_draft_value(value: str | None, formatting_json: str | None) -> str:
+    return render_html_with_formatting(
+        value,
+        deserialize_formatting_spans(formatting_json),
+    )
+
+
+def _is_chips(draft: Draft) -> bool:
+    return ChangeType.normalize(draft.change_type) == ChangeType.CHIPS
+
+
+def _first_missing_step(draft: Draft) -> Step | None:
+    common = (
+        (draft.scriptwriter, Step.SCRIPTWRITER),
+        (draft.intent, Step.INTENT),
+        (draft.reason, Step.REASON),
+    )
+    for value, step in common:
+        if not value:
+            return step
+    if _is_chips(draft):
+        for value, step in (
+            (draft.chip_text_before, Step.CHIP_TEXT_BEFORE),
+            (draft.chip_text, Step.CHIP_TEXT),
+            (draft.chip_text_after, Step.CHIP_TEXT_AFTER),
+        ):
+            if not value:
+                return step
+        return None
+    if not draft.formatted_change_description and not draft.raw_change_description:
+        return Step.CHANGE_DESCRIPTION
+    if not draft.source_text:
+        return Step.SOURCE_TEXT
+    return None
+
+
+def _render_urgent_editor_notification(snapshot: dict[str, str]) -> str:
+    return "\n".join(
+        [
+            "🚨 <b>Новая срочная заявка</b>",
+            "",
+            f"<b>Направление:</b> {_html_value(snapshot.get('direction'))}",
+            "",
+            f"<b>Сценарист:</b> {_html_value(snapshot.get('scriptwriter'))}",
+            f"<b>Интент:</b> {_html_value(snapshot.get('intent'))}",
+            "",
+            (
+                f'<a href="{escape(snapshot.get("row_link", ""), quote=True)}">'
+                "Открыть заявку</a>"
+            ),
+        ]
+    )
+
+
 def _direction_requires_answer_type(direction: str | None) -> bool:
     return direction in {Direction.FL.value, Direction.SME.value, Direction.AI.value}
+
+
+def _answer_type_requires_change_type(answer_type: str | None) -> bool:
+    return answer_type in {AnswerType.ROLLOUT.value, AnswerType.URGENT.value}
 
 
 def _is_llm_error_result(llm_result) -> bool:
     problem = llm_result.blocking_problem or ""
     return (
-        problem.startswith("Ошибка GigaChat:")
+        problem.startswith(LLM_ERROR_PREFIX)
+        or problem.startswith("РћС€РёР±РєР° GigaChat:")
         or problem == "GIGACHAT_CREDENTIALS не задан."
+        or problem == "GIGACHAT_CREDENTIALS РЅРµ Р·Р°РґР°РЅ."
     )
 
 

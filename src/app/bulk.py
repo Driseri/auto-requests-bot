@@ -70,7 +70,7 @@ BULK_INPUT_HEADERS = [
     "Тип изменения",
     "Закрепленный сценарист",
     "Интент",
-    "Причина изменений",
+    "Кейс или сообщения клиента",
     "Суть изменений",
     "Исходный текст",
 ]
@@ -546,8 +546,14 @@ class BulkApplicationRegistrar:
                 success=False,
                 message="Структура колонок массовой заявки не соответствует поддерживаемым схемам.",
             )
-        if await self._run_google(
-            lambda: self._has_overflow_data(self._get_sheets_api(), batch, layout),
+        overflow_range = await self._overflow_check_range(batch)
+        if overflow_range is not None and await self._run_google(
+            lambda: self._has_overflow_data(
+                self._get_sheets_api(),
+                batch,
+                layout,
+                overflow_range=overflow_range,
+            ),
             f"bulk-overflow:{batch.batch_id}",
         ):
             return BulkRegistrationResult(
@@ -835,18 +841,43 @@ class BulkApplicationRegistrar:
                 return rows[:index]
         return rows
 
+    async def _overflow_check_range(self, batch: BulkBatch) -> tuple[int, int] | None:
+        overflow_start = _batch_reserved_end_row(batch) + 1
+        overflow_end = await self._overflow_check_end_row(batch)
+        if overflow_start > overflow_end:
+            return None
+        return overflow_start, overflow_end
+
+    async def _overflow_check_end_row(self, batch: BulkBatch) -> int:
+        current_reserved_end = _batch_reserved_end_row(batch)
+        spreadsheet_id = batch.spreadsheet_id or self.spreadsheet_id
+        batches = await self.repository.list_bulk_batches()
+        next_start_rows = [
+            candidate.start_row
+            for candidate in batches
+            if candidate.batch_id != batch.batch_id
+            and (candidate.spreadsheet_id or self.spreadsheet_id) == spreadsheet_id
+            and candidate.sheet_name == batch.sheet_name
+            and candidate.start_row > current_reserved_end
+        ]
+        if next_start_rows:
+            return min(next_start_rows) - 1
+        return current_reserved_end + max(batch.reserved_rows, 1)
+
     def _has_overflow_data(
         self,
         api: Any,
         batch: BulkBatch,
         layout: dict[str, Any],
+        *,
+        overflow_range: tuple[int, int],
     ) -> bool:
-        end_row = _batch_data_end_row(batch)
+        start_row, end_row = overflow_range
         result = api.spreadsheets().values().get(
             spreadsheetId=batch.spreadsheet_id or self.spreadsheet_id,
             range=(
                 f"{quote_sheet_name(batch.sheet_name)}!"
-                f"A{end_row + 1}:N"
+                f"A{start_row}:N{end_row}"
             ),
             majorDimension="ROWS",
         ).execute()

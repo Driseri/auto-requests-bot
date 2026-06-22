@@ -10,7 +10,11 @@ from threading import RLock
 from typing import Any, Callable, Protocol
 
 from app.formatting import build_text_format_runs, deserialize_formatting_spans
-from app.google_api import GoogleApiRetryConfig, execute_with_retry_async
+from app.google_api import (
+    GoogleApiRetryConfig,
+    execute_with_retry_async,
+    is_google_rate_limit_error,
+)
 from app.models import (
     AnswerType,
     ApplicationStatus,
@@ -66,7 +70,7 @@ CURRENT_WORKSHEET_HEADERS = [
 WORKSHEET_HEADERS = [
     "Закрепленный сценарист",
     "Интент",
-    "Причина изменений",
+    "Кейс или сообщения клиента",
     "Суть изменений",
     "Исходный текст",
     "Итоговый ответ редактора",
@@ -89,6 +93,30 @@ WORKSHEET_HEADERS = [
     "LLM оценка",
     "Тип изменения",
 ]
+CHIPS_WORKSHEET_HEADERS = [
+    "Закрепленный сценарист",
+    "Интент",
+    "Причина",
+    "Текст до чипса",
+    "Текст чипса",
+    "Текст после чипса",
+    "Комментарий качества",
+    "Вопросы/комментарии редактора",
+    "Ответ сценариста",
+    "Статус",
+    "Редактор",
+    "ID заявки",
+    "ID пачки",
+    "Тип заявки",
+    "Дата заявки",
+    "Направление",
+    "Тип ответа",
+    "Срочная",
+    "Автор заявки",
+    "Telegram ID",
+    "Тип изменения",
+]
+CHIPS_V2_MARKER = "CHIPS V2"
 
 LEGACY_DASHBOARD_HEADERS = [
     "ID заявки",
@@ -128,6 +156,7 @@ BATCH_DASHBOARD_SHEET_NAME = "Пачки"
 INTEGRATION_SHEET_NAME = "Интеграционные"
 URGENT_SHEET_NAME = "Срочные"
 ROLLOUT_SECTION_MARKERS = tuple(change_type.value for change_type in ChangeType)
+ALL_ROLLOUT_SECTION_MARKERS = (*ROLLOUT_SECTION_MARKERS, CHIPS_V2_MARKER)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
@@ -243,7 +272,9 @@ class GoogleSheetsSubmissionService:
         self.timezone_name = timezone_name
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.application_editors = application_editors
-        self._prepared_sheets: dict[tuple[str, str], str] = {}
+        self._prepared_sheets: dict[
+            tuple[str, str, str], tuple[str, str | None]
+        ] = {}
         self._sheet_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._dashboard = dashboard_sync or DashboardSyncService(
             spreadsheet_id=dashboard_spreadsheet_id,
@@ -304,6 +335,15 @@ class GoogleSheetsSubmissionService:
                     reset_client=self._reset_sheets_api,
                 )
         except Exception as exc:
+            if is_google_rate_limit_error(exc):
+                return SubmissionResult(
+                    success=False,
+                    message=(
+                        "Google API временно перегружен и не принял заявку.\n\n"
+                        "Повторите отправку через 2-3 минуты. "
+                        "Заявка сохранена, заново заполнять её не нужно."
+                    ),
+                )
             return SubmissionResult(
                 success=False,
                 message=(
@@ -335,12 +375,19 @@ class GoogleSheetsSubmissionService:
             )
         api = self._get_sheets_api()
 
-        use_sections = application.answer_type == AnswerType.ROLLOUT.value
-        sheet_id, layout = self._ensure_sheet_ready(
+        if application.answer_type == AnswerType.ROLLOUT.value:
+            sheet_mode = "rollout"
+        elif application.answer_type == AnswerType.URGENT.value:
+            sheet_mode = "urgent"
+        else:
+            sheet_mode = "flat"
+        change_type = ChangeType.normalize(application.change_type)
+        sheet_id, layout, section_marker = self._ensure_sheet_ready(
             api,
             spreadsheet_id,
             sheet_name,
-            use_sections=use_sections,
+            sheet_mode=sheet_mode,
+            change_type=change_type,
         )
         schema = layout.split(":", maxsplit=1)[1]
         existing_row = self._find_application_row(
@@ -377,7 +424,17 @@ class GoogleSheetsSubmissionService:
                 spreadsheet_id,
                 sheet_id,
                 sheet_name,
-                ChangeType.normalize(application.change_type),
+                change_type,
+                row_data,
+                target_marker=section_marker,
+            )
+        elif layout.startswith("urgent:"):
+            row_number = self._insert_urgent_row(
+                api,
+                spreadsheet_id,
+                sheet_id,
+                sheet_name,
+                change_type,
                 row_data,
             )
         else:
@@ -429,6 +486,7 @@ class GoogleSheetsSubmissionService:
         rows = self._read_rows(api, spreadsheet_id, sheet_name)
         id_column_index: int | None = None
         known_headers = (
+            CHIPS_WORKSHEET_HEADERS,
             WORKSHEET_HEADERS,
             CURRENT_WORKSHEET_HEADERS,
             LEGACY_WORKSHEET_HEADERS,
@@ -460,36 +518,80 @@ class GoogleSheetsSubmissionService:
         spreadsheet_id: str,
         sheet_name: str,
         *,
-        use_sections: bool,
-    ) -> tuple[int, str]:
+        sheet_mode: str,
+        change_type: ChangeType | None,
+    ) -> tuple[int, str, str | None]:
         """Создать или распознать поддерживаемую схему до записи данных."""
-        cache_key = (spreadsheet_id, sheet_name)
+        cache_key = (
+            spreadsheet_id,
+            sheet_name,
+            f"{sheet_mode}:{change_type.value if change_type is not None else 'none'}",
+        )
         if cache_key in self._prepared_sheets:
+            layout, marker = self._prepared_sheets[cache_key]
             return (
                 self._get_or_create_sheet_id(api, spreadsheet_id, sheet_name),
-                self._prepared_sheets[cache_key],
+                layout,
+                marker,
             )
 
         sheet_id = self._get_or_create_sheet_id(api, spreadsheet_id, sheet_name)
         rows = self._read_rows(api, spreadsheet_id, sheet_name)
-        if not rows:
-            if use_sections:
+        if sheet_mode == "urgent":
+            if change_type is None:
+                raise SheetConfigurationError(
+                    "Для срочной заявки не выбран тип изменения ADD, EDIT или CHIPS."
+                )
+            if not rows:
+                self._initialize_urgent_sheet(api, spreadsheet_id, sheet_id, sheet_name)
+                schema = "chips" if change_type == ChangeType.CHIPS else "new"
+            else:
+                schema = self._prepare_urgent_sheet(
+                    api,
+                    spreadsheet_id,
+                    sheet_id,
+                    sheet_name,
+                    rows,
+                    change_type,
+                )
+            layout, marker = f"urgent:{schema}", ChangeType.CHIPS.value
+        elif not rows:
+            if sheet_mode == "rollout":
                 self._initialize_sectioned_sheet(api, spreadsheet_id, sheet_id, sheet_name)
-                layout = "sectioned:new"
+                if change_type == ChangeType.CHIPS:
+                    layout, marker = "sectioned:chips", ChangeType.CHIPS.value
+                else:
+                    layout, marker = "sectioned:new", change_type.value if change_type else None
             else:
                 self._initialize_empty_sheet(api, spreadsheet_id, sheet_id, sheet_name)
-                layout = "flat:new"
-        elif sectioned_schema := _sectioned_working_sheet_schema(rows):
-            layout = f"sectioned:{sectioned_schema}"
-        else:
+                layout, marker = "flat:new", None
+        elif sheet_mode == "rollout" and _is_sectioned_working_sheet(rows):
+            if change_type is None:
+                raise SheetConfigurationError(
+                    "Для раскатки не выбран тип изменения ADD, EDIT или CHIPS."
+                )
+            schema, marker = self._prepare_rollout_section(
+                api,
+                spreadsheet_id,
+                sheet_id,
+                sheet_name,
+                rows,
+                change_type,
+            )
+            layout = f"sectioned:{schema}"
+        elif sheet_mode in {"flat", "rollout"}:
             schema = _working_sheet_schema(rows[0])
             if schema is None:
                 raise SheetConfigurationError(
                     "Структура колонок рабочей вкладки не совпадает с поддерживаемыми схемами."
                 )
-            layout = f"flat:{schema}"
-        self._prepared_sheets[cache_key] = layout
-        return sheet_id, layout
+            layout, marker = f"flat:{schema}", None
+        else:
+            raise SheetConfigurationError(
+                "Структура секций недельной вкладки не совпадает с поддерживаемой схемой."
+            )
+        self._prepared_sheets[cache_key] = (layout, marker)
+        return sheet_id, layout, marker
 
     def _get_or_create_sheet_id(self, api: Any, spreadsheet_id: str, sheet_name: str) -> int:
         metadata = api.spreadsheets().get(
@@ -585,7 +687,11 @@ class GoogleSheetsSubmissionService:
         rows: list[list[Any]] = []
         for marker in ROLLOUT_SECTION_MARKERS:
             rows.append([marker])
-            rows.append(WORKSHEET_HEADERS)
+            rows.append(
+                CHIPS_WORKSHEET_HEADERS
+                if marker == ChangeType.CHIPS.value
+                else WORKSHEET_HEADERS
+            )
         api.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=f"{quote_sheet_name(sheet_name)}!A1:X6",
@@ -602,6 +708,189 @@ class GoogleSheetsSubmissionService:
             },
         ).execute()
 
+    def _initialize_urgent_sheet(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+    ) -> None:
+        api.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{quote_sheet_name(sheet_name)}!A1:X3",
+            valueInputOption="USER_ENTERED",
+            body={
+                "values": [
+                    WORKSHEET_HEADERS,
+                    [ChangeType.CHIPS.value],
+                    CHIPS_WORKSHEET_HEADERS,
+                ]
+            },
+        ).execute()
+        requests = worksheet_formatting_requests(
+            sheet_id,
+            self.application_editors,
+        )
+        requests = [request for request in requests if "setBasicFilter" not in request]
+        requests.append(
+            _basic_filter_request(
+                sheet_id,
+                SHEET_COLUMN_COUNT,
+                end_row_index=1,
+            )
+        )
+        requests.extend(
+            _section_marker_header_format_requests(
+                sheet_id,
+                1,
+                len(CHIPS_WORKSHEET_HEADERS),
+            )
+        )
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+
+    def _prepare_urgent_sheet(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+        rows: list[list[Any]],
+        change_type: ChangeType,
+    ) -> str:
+        schema = _working_sheet_schema(rows[0])
+        if schema is None:
+            raise SheetConfigurationError(
+                "Повреждена общая шапка листа срочных заявок."
+            )
+        marker_positions = [
+            index
+            for index, row in enumerate(rows)
+            if _is_exact_marker_row(row, ChangeType.CHIPS.value)
+        ]
+        if len(marker_positions) > 1:
+            raise SheetConfigurationError(
+                "В листе срочных заявок найдено несколько секций CHIPS."
+            )
+        if not marker_positions:
+            marker_row = len(rows) + 1
+            api.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{quote_sheet_name(sheet_name)}!A{marker_row}:U{marker_row + 1}",
+                valueInputOption="USER_ENTERED",
+                body={
+                    "values": [
+                        [ChangeType.CHIPS.value],
+                        CHIPS_WORKSHEET_HEADERS,
+                    ]
+                },
+            ).execute()
+            marker_position = marker_row - 1
+            formatting_requests = _section_marker_header_format_requests(
+                sheet_id,
+                marker_position,
+                len(CHIPS_WORKSHEET_HEADERS),
+            )
+        else:
+            marker_position = marker_positions[0]
+            if (
+                marker_position == 0
+                or marker_position + 1 >= len(rows)
+                or not _is_chips_header(rows[marker_position + 1])
+            ):
+                raise SheetConfigurationError(
+                    "Повреждена шапка секции CHIPS в листе срочных заявок."
+                )
+            formatting_requests = []
+        formatting_requests.append(
+            _basic_filter_request(
+                sheet_id,
+                SHEET_COLUMN_COUNT,
+                end_row_index=marker_position,
+            )
+        )
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": formatting_requests},
+        ).execute()
+        return "chips" if change_type == ChangeType.CHIPS else schema
+
+    def _prepare_rollout_section(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+        rows: list[list[Any]],
+        change_type: ChangeType,
+    ) -> tuple[str, str]:
+        positions = _rollout_marker_positions(rows)
+        if change_type != ChangeType.CHIPS:
+            position = positions[change_type.value]
+            schema = _working_sheet_schema(rows[position + 1])
+            if schema is None:
+                raise SheetConfigurationError(
+                    f"Повреждена шапка секции {change_type.value}."
+                )
+            return schema, change_type.value
+
+        if CHIPS_V2_MARKER in positions:
+            position = positions[CHIPS_V2_MARKER]
+            if not _is_chips_header(rows[position + 1]):
+                raise SheetConfigurationError("Повреждена шапка секции CHIPS V2.")
+            return "chips", CHIPS_V2_MARKER
+
+        position = positions[ChangeType.CHIPS.value]
+        header = rows[position + 1]
+        if _is_chips_header(header):
+            return "chips", ChangeType.CHIPS.value
+        if _working_sheet_schema(header) is None:
+            raise SheetConfigurationError("Повреждена шапка секции CHIPS.")
+
+        following_markers = sorted(
+            marker_position
+            for marker_position in positions.values()
+            if marker_position > position
+        )
+        section_end = following_markers[0] if following_markers else len(rows)
+        has_data = any(
+            any(str(value or "").strip() for value in row)
+            for row in rows[position + 2 : section_end]
+        )
+        if not has_data:
+            header_row = position + 2
+            api.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=(
+                    f"{quote_sheet_name(sheet_name)}!"
+                    f"A{header_row}:U{header_row}"
+                ),
+                valueInputOption="USER_ENTERED",
+                body={"values": [CHIPS_WORKSHEET_HEADERS]},
+            ).execute()
+            return "chips", ChangeType.CHIPS.value
+
+        marker_row = len(rows) + 1
+        api.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{quote_sheet_name(sheet_name)}!A{marker_row}:U{marker_row + 1}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[CHIPS_V2_MARKER], CHIPS_WORKSHEET_HEADERS]},
+        ).execute()
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": _section_marker_header_format_requests(
+                    sheet_id,
+                    marker_row - 1,
+                    len(CHIPS_WORKSHEET_HEADERS),
+                )
+            },
+        ).execute()
+        return "chips", CHIPS_V2_MARKER
+
     def _insert_section_row(
         self,
         api: Any,
@@ -610,6 +899,8 @@ class GoogleSheetsSubmissionService:
         sheet_name: str,
         change_type: ChangeType | None,
         row_data: dict[str, Any],
+        *,
+        target_marker: str | None = None,
     ) -> int:
         if change_type is None:
             raise SheetConfigurationError(
@@ -620,22 +911,30 @@ class GoogleSheetsSubmissionService:
             rows = [
                 item
                 for marker in ROLLOUT_SECTION_MARKERS
-                for item in ([marker], WORKSHEET_HEADERS)
+                for item in (
+                    [marker],
+                    CHIPS_WORKSHEET_HEADERS
+                    if marker == ChangeType.CHIPS.value
+                    else WORKSHEET_HEADERS,
+                )
             ]
         marker_rows = {
             _cell(row, 0).strip(): index + 1
             for index, row in enumerate(rows)
-            if _cell(row, 0).strip() in ROLLOUT_SECTION_MARKERS
+            if _cell(row, 0).strip() in ALL_ROLLOUT_SECTION_MARKERS
         }
-        if set(marker_rows) != set(ROLLOUT_SECTION_MARKERS):
+        if not set(ROLLOUT_SECTION_MARKERS) <= set(marker_rows):
             raise SheetConfigurationError(
                 "В недельной вкладке повреждена структура секций ADD, EDIT и CHIPS."
             )
 
-        marker_index = ROLLOUT_SECTION_MARKERS.index(change_type.value)
-        if marker_index + 1 < len(ROLLOUT_SECTION_MARKERS):
-            next_marker = ROLLOUT_SECTION_MARKERS[marker_index + 1]
-            row_number = marker_rows[next_marker]
+        selected_marker = target_marker or change_type.value
+        selected_row = marker_rows.get(selected_marker)
+        if selected_row is None:
+            raise SheetConfigurationError(f"Секция {selected_marker} не найдена.")
+        following_rows = sorted(row for row in marker_rows.values() if row > selected_row)
+        if following_rows:
+            row_number = following_rows[0]
             insert_index = row_number - 1
             requests = [
                 {
@@ -679,6 +978,94 @@ class GoogleSheetsSubmissionService:
                         ),
                     }
                 }
+            ]
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+        return row_number
+
+    def _insert_urgent_row(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+        change_type: ChangeType | None,
+        row_data: dict[str, Any],
+    ) -> int:
+        if change_type is None:
+            raise SheetConfigurationError(
+                "Для срочной заявки не выбран тип изменения ADD, EDIT или CHIPS."
+            )
+        rows = self._read_rows(api, spreadsheet_id, sheet_name)
+        marker_positions = [
+            index
+            for index, row in enumerate(rows)
+            if _is_exact_marker_row(row, ChangeType.CHIPS.value)
+        ]
+        if len(marker_positions) != 1:
+            raise SheetConfigurationError(
+                "В листе срочных заявок отсутствует однозначная секция CHIPS."
+            )
+        marker_position = marker_positions[0]
+        if (
+            marker_position + 1 >= len(rows)
+            or not _is_chips_header(rows[marker_position + 1])
+        ):
+            raise SheetConfigurationError(
+                "Повреждена шапка секции CHIPS в листе срочных заявок."
+            )
+
+        if change_type == ChangeType.CHIPS:
+            row_number = len(rows) + 1
+            requests = [
+                {
+                    "appendCells": {
+                        "sheetId": sheet_id,
+                        "rows": [row_data],
+                        "fields": (
+                            "userEnteredValue,dataValidation,"
+                            "userEnteredFormat,textFormatRuns"
+                        ),
+                    }
+                }
+            ]
+        else:
+            row_number = marker_position + 1
+            requests = [
+                {
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": marker_position,
+                            "endIndex": marker_position + 1,
+                        },
+                        "inheritFromBefore": True,
+                    }
+                },
+                {
+                    "updateCells": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": marker_position,
+                            "endRowIndex": marker_position + 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(row_data["values"]),
+                        },
+                        "rows": [row_data],
+                        "fields": (
+                            "userEnteredValue,dataValidation,"
+                            "userEnteredFormat,textFormatRuns"
+                        ),
+                    }
+                },
+                _basic_filter_request(
+                    sheet_id,
+                    SHEET_COLUMN_COUNT,
+                    end_row_index=marker_position + 1,
+                ),
             ]
         api.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
@@ -1163,7 +1550,7 @@ def build_google_sheets_api(credentials_path: str) -> Any:
     from googleapiclient.discovery import build
 
     creds = Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 def target_sheet_name(
@@ -1236,6 +1623,37 @@ def draft_to_sheet_row(
         draft.llm_check_status or "",
         draft.llm_score if draft.llm_score is not None else "",
         draft.change_type or "",
+    ]
+
+
+def chips_draft_to_sheet_row(
+    draft: Draft,
+    *,
+    batch_id: str = "",
+    submitted_at: datetime | str | None = None,
+) -> list[Any]:
+    return [
+        draft.scriptwriter or "",
+        draft.intent or "",
+        draft.reason or "",
+        draft.chip_text_before or "",
+        draft.chip_text or "",
+        draft.chip_text_after or "",
+        "",
+        "",
+        "",
+        ApplicationStatus.NEW.value,
+        EDITOR_NOT_SELECTED,
+        draft.application_id or "",
+        batch_id,
+        draft.application_type or ApplicationType.SINGLE.value,
+        submitted_at or draft.created_at,
+        draft.direction or "",
+        draft.answer_type or "",
+        bool_to_sheet_value(draft.is_urgent),
+        draft.author_name or draft.scriptwriter or "",
+        draft.telegram_user_id,
+        ChangeType.CHIPS.value,
     ]
 
 
@@ -1321,6 +1739,12 @@ def dashboard_tracked_row(
     existing = list(existing_row or [])
     existing.extend([""] * (len(DASHBOARD_HEADERS) - len(existing)))
     urgent_value = current.is_urgent if current.is_urgent is not None else tracked.is_urgent
+    final_answer_present = bool(current.final_answer)
+    if (
+        ChangeType.normalize(getattr(current, "change_type", None) or tracked.change_type)
+        == ChangeType.CHIPS
+    ):
+        final_answer_present = False
     return [
         tracked.application_id,
         current.batch_id or tracked.batch_id or existing[1],
@@ -1335,7 +1759,7 @@ def dashboard_tracked_row(
         or tracked.last_seen_editor
         or existing[9]
         or EDITOR_NOT_SELECTED,
-        bool_to_sheet_value(bool(current.final_answer)),
+        bool_to_sheet_value(final_answer_present),
         row_link,
     ]
 
@@ -1458,7 +1882,13 @@ def _draft_to_row_data(
     timezone_name: str = DEFAULT_TIMEZONE,
 ) -> dict[str, Any]:
     layout = _worksheet_schema_layout(schema)
-    if schema == "new":
+    if schema == "chips":
+        row = chips_draft_to_sheet_row(
+            draft,
+            batch_id=batch_id,
+            submitted_at=submitted_at,
+        )
+    elif schema == "new":
         row = draft_to_sheet_row(
             draft,
             batch_id=batch_id,
@@ -1489,8 +1919,24 @@ def _draft_to_row_data(
             )
         elif index == layout["status"]:
             cells.append(_status_cell_data(ApplicationStatus.NEW.value))
-        elif index == layout["source_text"]:
-            cells.append(_source_text_cell_data(draft))
+        elif index == layout["source_text"] or (
+            isinstance(layout["source_text"], tuple)
+            and index in layout["source_text"]
+        ):
+            if schema == "chips":
+                formatting_by_index = {
+                    3: draft.chip_text_before_formatting_json,
+                    4: draft.chip_text_formatting_json,
+                    5: draft.chip_text_after_formatting_json,
+                }
+                cells.append(
+                    _formatted_text_cell_data(
+                        str(value or ""),
+                        formatting_by_index[index],
+                    )
+                )
+            else:
+                cells.append(_source_text_cell_data(draft))
         elif index == layout["editor"]:
             cells.append(_editor_cell_data(value, application_editors))
         elif index == layout["llm_score"] and value != "":
@@ -1510,6 +1956,15 @@ def _worksheet_schema_layout(schema: str) -> dict[str, Any]:
             "telegram_id": 19,
             "llm_score": 22,
             "end_column": "X",
+        },
+        "chips": {
+            "date": 14,
+            "status": 9,
+            "editor": 10,
+            "source_text": (3, 4, 5),
+            "telegram_id": 19,
+            "llm_score": -1,
+            "end_column": "U",
         },
         "current": {
             "date": 3,
@@ -1555,11 +2010,18 @@ def _editor_cell_data(
 
 
 def _source_text_cell_data(draft: Draft) -> dict[str, Any]:
-    cell = _cell_data(draft.source_text or "")
+    return _formatted_text_cell_data(
+        draft.source_text or "",
+        draft.source_text_formatting_json,
+    )
+
+
+def _formatted_text_cell_data(value: str, formatting_json: str | None) -> dict[str, Any]:
+    cell = _cell_data(value)
     cell["userEnteredFormat"] = {"wrapStrategy": "CLIP"}
     runs = build_text_format_runs(
-        draft.source_text or "",
-        deserialize_formatting_spans(draft.source_text_formatting_json),
+        value,
+        deserialize_formatting_spans(formatting_json),
     )
     if runs:
         cell["textFormatRuns"] = runs
@@ -1802,6 +2264,56 @@ def sectioned_worksheet_formatting_requests(
     return requests
 
 
+def _section_marker_header_format_requests(
+    sheet_id: int,
+    marker_row_index: int,
+    column_count: int,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": marker_row_index,
+                    "endRowIndex": marker_row_index + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": column_count,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.82, "green": 0.86, "blue": 0.91},
+                        "textFormat": {"bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": marker_row_index + 1,
+                    "endRowIndex": marker_row_index + 2,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": column_count,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.94, "green": 0.94, "blue": 0.94},
+                        "horizontalAlignment": "CENTER",
+                        "textFormat": {"bold": True},
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                    "textFormat,wrapStrategy)"
+                ),
+            }
+        },
+    ]
+
+
 def dashboard_formatting_requests(
     sheet_id: int,
     column_count: int,
@@ -1870,16 +2382,24 @@ def _dashboard_final_answer_note_request(sheet_id: int) -> dict[str, Any]:
     }
 
 
-def _basic_filter_request(sheet_id: int, column_count: int) -> dict[str, Any]:
+def _basic_filter_request(
+    sheet_id: int,
+    column_count: int,
+    *,
+    end_row_index: int | None = None,
+) -> dict[str, Any]:
+    range_config = {
+        "sheetId": sheet_id,
+        "startRowIndex": 0,
+        "startColumnIndex": 0,
+        "endColumnIndex": column_count,
+    }
+    if end_row_index is not None:
+        range_config["endRowIndex"] = end_row_index
     return {
         "setBasicFilter": {
             "filter": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": 0,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": column_count,
-                }
+                "range": range_config
             }
         }
     }
@@ -2125,26 +2645,49 @@ def _working_sheet_schema(header_row: list[Any]) -> str | None:
     return None
 
 
+def _is_chips_header(header_row: list[Any]) -> bool:
+    headers = [str(value).strip() for value in header_row]
+    return headers[: len(CHIPS_WORKSHEET_HEADERS)] == CHIPS_WORKSHEET_HEADERS
+
+
+def _rollout_marker_positions(rows: list[list[Any]]) -> dict[str, int]:
+    return {
+        _cell(row, 0).strip(): index
+        for index, row in enumerate(rows)
+        if _cell(row, 0).strip() in ALL_ROLLOUT_SECTION_MARKERS
+    }
+
+
+def _is_exact_marker_row(row: list[Any], marker: str) -> bool:
+    return _cell(row, 0).strip() == marker and all(
+        not str(value or "").strip() for value in row[1:]
+    )
+
+
 def _sectioned_working_sheet_schema(rows: list[list[Any]]) -> str | None:
-    marker_positions: dict[str, int] = {}
-    for index, row in enumerate(rows):
-        marker = _cell(row, 0).strip()
-        if marker in ROLLOUT_SECTION_MARKERS:
-            marker_positions[marker] = index
-    if set(marker_positions) != set(ROLLOUT_SECTION_MARKERS):
-        return False
+    marker_positions = _rollout_marker_positions(rows)
+    if not set(ROLLOUT_SECTION_MARKERS) <= set(marker_positions):
+        return None
     positions = [marker_positions[marker] for marker in ROLLOUT_SECTION_MARKERS]
     if positions != sorted(positions):
         return None
-    schemas: set[str] = set()
-    for position in positions:
-        if position + 1 >= len(rows):
+    for marker in (ChangeType.ADD.value, ChangeType.EDIT.value):
+        position = marker_positions[marker]
+        if position + 1 >= len(rows) or _working_sheet_schema(rows[position + 1]) is None:
             return None
-        schema = _working_sheet_schema(rows[position + 1])
-        if schema is None:
+    chips_position = marker_positions[ChangeType.CHIPS.value]
+    if chips_position + 1 >= len(rows):
+        return None
+    chips_header = rows[chips_position + 1]
+    if _working_sheet_schema(chips_header) is None and not _is_chips_header(chips_header):
+        return None
+    if CHIPS_V2_MARKER in marker_positions:
+        v2_position = marker_positions[CHIPS_V2_MARKER]
+        if v2_position <= chips_position or v2_position + 1 >= len(rows):
             return None
-        schemas.add(schema)
-    return schemas.pop() if len(schemas) == 1 else None
+        if not _is_chips_header(rows[v2_position + 1]):
+            return None
+    return "mixed"
 
 
 def _is_sectioned_working_sheet(rows: list[list[Any]]) -> bool:

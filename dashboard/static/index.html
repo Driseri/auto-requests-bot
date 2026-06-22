@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Alfa Auto Requests Bot Dashboard</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23e30613'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='Arial' font-size='42' font-weight='800' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">A</div>
+          <div>
+            <h1>Alfa Auto Requests Bot</h1>
+            <p>Локальный read-only мониторинг</p>
+          </div>
+        </div>
+        <dl class="status-strip" aria-label="Краткий статус">
+          <div><dt>APP_VERSION</dt><dd id="top-version">—</dd></div>
+          <div><dt>Режим</dt><dd id="top-mode" class="good">production</dd></div>
+          <div><dt>Uptime</dt><dd id="top-uptime">—</dd></div>
+          <div><dt>Restarts</dt><dd id="top-restarts">—</dd></div>
+          <div><dt>Контейнер</dt><dd id="top-container">—</dd></div>
+          <div><dt>Heartbeat</dt><dd id="top-heartbeat">—</dd></div>
+          <div><dt>External health</dt><dd id="top-external">—</dd></div>
+          <div><dt>Обновлено</dt><dd id="top-updated">—</dd></div>
+        </dl>
+        <div class="header-actions">
+          <span class="readonly" title="Dashboard не выполняет write-команды">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2m-9 0h8a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2Z"/></svg>
+            read-only
+          </span>
+          <button id="refresh-button" type="button" title="Безопасно перечитать данные по SSH">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-14.5 4.7M4 12A8 8 0 0 1 18.5 7.3M18 3v5h-5M6 21v-5h5"/></svg>
+            Обновить
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <section id="empty-state" class="empty-state hidden">
+          <h2>Данных пока нет</h2>
+          <p>Backend работает, но snapshot еще не собран. Нажмите «Обновить» или дождитесь фонового сбора.</p>
+        </section>
+
+        <section class="grid top-grid" aria-label="Основные показатели">
+          <article class="card hero-status" id="card-summary"></article>
+          <article class="card" id="card-container"></article>
+          <article class="card" id="card-vps"></article>
+          <article class="card" id="card-polling"></article>
+          <article class="card" id="card-telegram"></article>
+          <article class="card" id="card-google"></article>
+        </section>
+
+        <section class="grid business-grid" aria-label="Бизнес-виджеты для менеджеров">
+          <article class="card manager-focus" id="card-manager-focus"></article>
+          <article class="card" id="card-business-today"></article>
+          <article class="card" id="card-team-load"></article>
+          <article class="card" id="card-directions"></article>
+        </section>
+
+        <section class="grid mid-grid" aria-label="Очереди и бизнес-состояние">
+          <article class="card" id="card-gigachat"></article>
+          <article class="card" id="card-dashboard-outbox"></article>
+          <article class="card wide" id="card-applications"></article>
+          <article class="card" id="card-bulk"></article>
+          <article class="card" id="card-urgent"></article>
+        </section>
+
+        <section class="grid lower-grid" aria-label="Последние проблемы">
+          <article class="card table-card" id="card-errors"></article>
+          <article class="card" id="card-notification"></article>
+        </section>
+      </main>
+
+      <footer>
+        <span>Часовой пояс: MSK (UTC+3)</span>
+        <span>Страница читает локальный cache каждые 30 секунд</span>
+      </footer>
+    </div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
