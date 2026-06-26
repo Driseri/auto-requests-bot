@@ -8,8 +8,9 @@ FastAPI backend and static web UI for local, read-only monitoring of the product
 - Does not run a web service on the VPS.
 - Uses SSH only for short read-only commands.
 - Reads production SQLite with `file:/data/app.db?mode=ro` and `PRAGMA query_only=ON`.
-- Stores snapshots locally in `dashboard/data`.
+- Stores snapshots and application reports locally in `dashboard/data`.
 - Does not expose SSH password through API.
+- Does not provide restart, cleanup, delete, rollback, or database write actions.
 
 ## Setup
 
@@ -44,37 +45,37 @@ Useful endpoints:
 - `GET http://127.0.0.1:8080/api/snapshot/latest`
 - `GET http://127.0.0.1:8080/api/history?limit=100`
 - `GET http://127.0.0.1:8080/api/config/safe`
+- `POST http://127.0.0.1:8080/api/applications/report`
+- `GET http://127.0.0.1:8080/api/applications/report/latest`
 
 ## Frontend
 
-The web page is based on the MVP monitoring reference, adapted for the current backend:
+The web page uses a compact operations-dashboard layout adapted for the current backend:
 
-- one screen, no sidebar navigation;
-- explicit `read-only` state;
-- no write actions, restart buttons, cleanup buttons, or rollback buttons;
-- normal page refresh reads only local `latest.json` through `/api/snapshot/latest`;
-- the `Обновить` button calls `/api/collect`, which performs one read-only SSH collection;
-- unavailable historical metrics are shown as `нет истории` or `нет данных` instead of fake charts.
+- fixed left navigation rail;
+- active `Мониторинг` and `Заявки` tabs;
+- future navigation items are visible but disabled;
+- explicit `Только чтение` state;
+- normal page refresh reads local `latest.json` through `/api/snapshot/latest`;
+- the `Обновить` button calls `/api/collect`, which performs one read-only SSH collection.
 
-The page currently renders these MVP blocks:
+The `Заявки` tab is intentionally manual:
 
-- overall status;
-- container;
-- VPS;
-- polling;
-- Telegram;
-- Google;
-- GigaChat;
-- dashboard outbox;
-- applications;
-- bulk batches;
-- urgent applications;
-- recent errors;
-- notification outbox.
+- it first reads local `dashboard/data/application-reports/latest.json`;
+- `Получить актуальные заявки` calls `/api/applications/report`;
+- the backend runs one bounded SSH command and read-only SQLite queries;
+- failed collections are saved to history but do not overwrite the last successful report;
+- only metadata is shown: IDs, statuses, sheet/row links, counters, timestamps and workflow states.
 
-Historical charts, 24h counters, polling duration percentiles, RSS trend, and restart deltas
-should be added only after enough local snapshots are accumulated or the backend exposes
-those values explicitly.
+The application report includes:
+
+- lost applications: `polling_state != 'ACTIVE' OR not_found_count > 0`;
+- urgent applications without a final answer;
+- applications without an owner/editor;
+- applications needing clarification;
+- applications without movement for more than 24 hours;
+- problematic bulk batches;
+- unfinished user workflows.
 
 ## Tests
 

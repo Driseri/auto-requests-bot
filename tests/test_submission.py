@@ -446,7 +446,7 @@ def test_all_working_sheet_schemas_use_typed_submission_date(schema, date_index)
 
 def test_target_sheet_name_uses_week_or_integration():
     submitted_at = datetime(2026, 6, 3, 10, 59, 59, tzinfo=timezone.utc)
-    assert target_sheet_name(make_draft(), submitted_at=submitted_at) == "01.06 ср"
+    assert target_sheet_name(make_draft(), submitted_at=submitted_at) == "08.06 ср"
     assert (
         target_sheet_name(
             make_draft(
@@ -476,14 +476,14 @@ def test_target_sheet_name_uses_week_or_integration():
 @pytest.mark.parametrize(
     ("submitted_at", "expected"),
     [
-        (datetime(2026, 6, 1, 7, 0, tzinfo=timezone.utc), "01.06 ср"),
-        (datetime(2026, 6, 3, 10, 59, 59, tzinfo=timezone.utc), "01.06 ср"),
-        (datetime(2026, 6, 3, 11, 0, tzinfo=timezone.utc), "01.06 чт"),
-        (datetime(2026, 6, 4, 10, 59, 59, tzinfo=timezone.utc), "01.06 чт"),
-        (datetime(2026, 6, 4, 11, 0, tzinfo=timezone.utc), "08.06 ср"),
-        (datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc), "08.06 ср"),
-        (datetime(2026, 6, 7, 9, 0, tzinfo=timezone.utc), "08.06 ср"),
-        (datetime(2026, 12, 31, 11, 0, tzinfo=timezone.utc), "04.01 ср"),
+        (datetime(2026, 6, 1, 7, 0, tzinfo=timezone.utc), "08.06 ср"),
+        (datetime(2026, 6, 3, 10, 59, 59, tzinfo=timezone.utc), "08.06 ср"),
+        (datetime(2026, 6, 3, 11, 0, tzinfo=timezone.utc), "08.06 чт"),
+        (datetime(2026, 6, 4, 10, 59, 59, tzinfo=timezone.utc), "08.06 чт"),
+        (datetime(2026, 6, 4, 11, 0, tzinfo=timezone.utc), "15.06 ср"),
+        (datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc), "15.06 ср"),
+        (datetime(2026, 6, 7, 9, 0, tzinfo=timezone.utc), "15.06 ср"),
+        (datetime(2026, 12, 31, 11, 0, tzinfo=timezone.utc), "11.01 ср"),
     ],
 )
 def test_rollout_sheet_name_uses_moscow_cutoffs(submitted_at, expected):
@@ -502,21 +502,40 @@ def test_rollout_sheet_name_supports_custom_cutoffs():
             datetime(2026, 6, 3, 10, 29, 59, tzinfo=timezone.utc),
             schedule,
         )
-        == "01.06 ср"
+        == "08.06 ср"
     )
     assert (
         rollout_sheet_name(
             datetime(2026, 6, 3, 10, 30, tzinfo=timezone.utc),
             schedule,
         )
-        == "01.06 чт"
+        == "08.06 чт"
     )
     assert (
         rollout_sheet_name(
             datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc),
             schedule,
         )
+        == "15.06 ср"
+    )
+
+
+def test_rollout_sheet_name_applies_cutoffs_in_configured_timezone():
+    schedule = RolloutSchedule.from_strings(timezone_name="America/New_York")
+
+    assert (
+        rollout_sheet_name(
+            datetime(2026, 6, 3, 17, 59, 59, tzinfo=timezone.utc),
+            schedule,
+        )
         == "08.06 ср"
+    )
+    assert (
+        rollout_sheet_name(
+            datetime(2026, 6, 3, 18, 0, tzinfo=timezone.utc),
+            schedule,
+        )
+        == "08.06 чт"
     )
 
 
@@ -526,7 +545,7 @@ def test_target_sheet_name_prefixes_voicebot_rollout():
             make_draft(direction=Direction.VOICEBOT.value),
             submitted_at=datetime(2026, 6, 3, 11, 0, tzinfo=timezone.utc),
         )
-        == "VoiceBot 01.06 чт"
+        == "VoiceBot 08.06 чт"
     )
 
 
@@ -668,8 +687,8 @@ async def test_submit_creates_week_sheet_and_appends_row():
 
     assert result.success is True
     assert result.spreadsheet_id == FL_SPREADSHEET
-    assert result.sheet_name == "01.06 ср"
-    assert api.headers[(FL_SPREADSHEET, "01.06 ср")] == ["ADD"]
+    assert result.sheet_name == "08.06 ср"
+    assert api.headers[(FL_SPREADSHEET, "08.06 ср")] == ["ADD"]
     assert len(api.append_cells) == 1
     spreadsheet_id, append_cells = api.append_cells[0]
     assert spreadsheet_id == FL_SPREADSHEET
@@ -704,9 +723,9 @@ async def test_sectioned_week_sheet_writes_to_selected_section(
         SHEET_HEADERS,
     ]
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "01.06 ср"): ["ADD"]},
-        rows={(FL_SPREADSHEET, "01.06 ср"): rows},
+        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "08.06 ср"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 ср"): rows},
     )
     service = make_service(api)
 
@@ -734,9 +753,9 @@ async def test_empty_legacy_chips_section_is_upgraded_in_place():
         SHEET_HEADERS,
     ]
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "01.06 ср"): ["ADD"]},
-        rows={(FL_SPREADSHEET, "01.06 ср"): rows},
+        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "08.06 ср"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 ср"): rows},
     )
     service = make_service(api)
 
@@ -773,9 +792,9 @@ async def test_populated_legacy_chips_section_creates_and_uses_v2():
         legacy_chips_row,
     ]
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "01.06 ср"): ["ADD"]},
-        rows={(FL_SPREADSHEET, "01.06 ср"): rows},
+        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "08.06 ср"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 ср"): rows},
     )
     service = make_service(api)
 
@@ -789,8 +808,8 @@ async def test_populated_legacy_chips_section_creates_and_uses_v2():
     )
 
     assert result.success is True
-    assert api.rows[(FL_SPREADSHEET, "01.06 ср")][6] == legacy_chips_row
-    assert api.rows[(FL_SPREADSHEET, "01.06 ср")][7:9] == [
+    assert api.rows[(FL_SPREADSHEET, "08.06 ср")][6] == legacy_chips_row
+    assert api.rows[(FL_SPREADSHEET, "08.06 ср")][7:9] == [
         [CHIPS_V2_MARKER],
         CHIPS_WORKSHEET_HEADERS,
     ]
@@ -810,7 +829,7 @@ async def test_submit_routes_by_submission_time_not_draft_creation_time():
     )
 
     assert result.success is True
-    assert result.sheet_name == "08.06 ср"
+    assert result.sheet_name == "15.06 ср"
     assert result.submitted_at == "2026-06-04T11:00:00+00:00"
     date_cell = api.append_cells[0][1]["rows"][0]["values"][14]
     expected_serial = (
@@ -820,10 +839,30 @@ async def test_submit_routes_by_submission_time_not_draft_creation_time():
 
 
 @pytest.mark.asyncio
+async def test_submit_retry_keeps_previously_selected_sheet():
+    api = FakeSheetsApi()
+    service = make_service(
+        api,
+        clock=lambda: datetime(2026, 6, 4, 11, 0, tzinfo=timezone.utc),
+    )
+
+    result = await service.submit(
+        make_draft(
+            submission_spreadsheet_id=FL_SPREADSHEET,
+            submission_sheet_name="01.06 ср",
+        )
+    )
+
+    assert result.success is True
+    assert result.sheet_name == "01.06 ср"
+    assert (FL_SPREADSHEET, "01.06 ср") in api.headers
+
+
+@pytest.mark.asyncio
 async def test_existing_wrong_headers_return_error_and_do_not_append():
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "01.06 ср"): ["wrong"] * len(SHEET_HEADERS)},
+        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "08.06 ср"): ["wrong"] * len(SHEET_HEADERS)},
     )
     service = make_service(api)
 
@@ -873,9 +912,9 @@ async def test_idempotent_retry_does_not_rewrite_existing_submission_date():
     existing_row = [""] * len(SHEET_HEADERS)
     existing_row[11] = "A1B2C3D4"
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "01.06 ср"): SHEET_HEADERS.copy()},
-        rows={(FL_SPREADSHEET, "01.06 ср"): [SHEET_HEADERS, existing_row]},
+        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "08.06 ср"): SHEET_HEADERS.copy()},
+        rows={(FL_SPREADSHEET, "08.06 ср"): [SHEET_HEADERS, existing_row]},
     )
     service = make_service(api)
 
@@ -890,8 +929,8 @@ async def test_idempotent_retry_does_not_rewrite_existing_submission_date():
 @pytest.mark.asyncio
 async def test_existing_legacy_working_sheet_keeps_legacy_schema():
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "01.06 ср"): LEGACY_WORKSHEET_HEADERS.copy()},
+        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "08.06 ср"): LEGACY_WORKSHEET_HEADERS.copy()},
     )
     service = make_service(api)
 
@@ -906,8 +945,8 @@ async def test_existing_legacy_working_sheet_keeps_legacy_schema():
 @pytest.mark.asyncio
 async def test_existing_current_working_sheet_keeps_current_schema():
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "01.06 ср"): CURRENT_WORKSHEET_HEADERS.copy()},
+        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "08.06 ср"): CURRENT_WORKSHEET_HEADERS.copy()},
     )
     service = make_service(api)
 
@@ -1000,9 +1039,9 @@ def test_repair_dashboard_headers_rejects_ambiguous_or_foreign_schema():
 @pytest.mark.asyncio
 async def test_append_cells_contains_status_dropdown_and_source_rich_text():
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"01.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "01.06 ср"): SHEET_HEADERS.copy()},
-        rows={(FL_SPREADSHEET, "01.06 ср"): [SHEET_HEADERS]},
+        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
+        headers={(FL_SPREADSHEET, "08.06 ср"): SHEET_HEADERS.copy()},
+        rows={(FL_SPREADSHEET, "08.06 ср"): [SHEET_HEADERS]},
     )
     service = make_service(api)
     formatting_json = serialize_formatting_spans(

@@ -58,3 +58,28 @@ class CollectResponse(BaseModel):
     skipped: bool = False
     reason: str | None = None
     snapshot: Snapshot | None = None
+
+
+class ApplicationReport(BaseModel):
+    """Manager-facing read-only report with problematic application metadata."""
+
+    collected_at: str
+    source_host: str
+    collection_status: Literal["ok", "failed"]
+    collection_errors: list[str] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    lost: list[dict[str, Any]] = Field(default_factory=list)
+    urgent_without_final_answer: list[dict[str, Any]] = Field(default_factory=list)
+    without_owner: list[dict[str, Any]] = Field(default_factory=list)
+    needs_clarification: list[dict[str, Any]] = Field(default_factory=list)
+    stale_without_movement: list[dict[str, Any]] = Field(default_factory=list)
+    problematic_bulk_batches: list[dict[str, Any]] = Field(default_factory=list)
+    unfinished_workflows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ApplicationReportResponse(BaseModel):
+    """Response returned by the manual application report endpoint."""
+
+    skipped: bool = False
+    reason: str | None = None
+    report: ApplicationReport | None = None

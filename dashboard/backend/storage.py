@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from .schemas import CollectionState, Snapshot
+from .schemas import ApplicationReport, CollectionState, Snapshot
 
 
 class JsonStorage:
@@ -15,6 +15,9 @@ class JsonStorage:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir
         self.history_dir = data_dir / "history"
+        self.application_reports_dir = data_dir / "application-reports"
+        self.application_report_history_dir = self.application_reports_dir / "history"
+        self.application_report_latest_path = self.application_reports_dir / "latest.json"
         self.latest_path = data_dir / "latest.json"
         self.state_path = data_dir / "collector-state.json"
 
@@ -22,6 +25,7 @@ class JsonStorage:
         """Create local storage directories if they do not exist."""
 
         self.history_dir.mkdir(parents=True, exist_ok=True)
+        self.application_report_history_dir.mkdir(parents=True, exist_ok=True)
 
     def is_writable(self) -> bool:
         """Check that the local dashboard can write its JSON state."""
@@ -47,9 +51,32 @@ class JsonStorage:
 
         self.ensure_ready()
         payload = snapshot.model_dump(mode="json")
-        self._append_history(payload)
+        self._append_history(payload, history_dir=self.history_dir)
         if update_latest:
             self._atomic_write_json(self.latest_path, payload)
+
+    def load_latest_application_report(self) -> ApplicationReport | None:
+        """Load the latest application report without touching the VPS."""
+
+        if not self.application_report_latest_path.exists():
+            return None
+        return ApplicationReport.model_validate_json(
+            self.application_report_latest_path.read_text(encoding="utf-8")
+        )
+
+    def save_application_report(
+        self,
+        report: ApplicationReport,
+        *,
+        update_latest: bool = True,
+    ) -> None:
+        """Persist an application report and optionally replace latest atomically."""
+
+        self.ensure_ready()
+        payload = report.model_dump(mode="json")
+        self._append_history(payload, history_dir=self.application_report_history_dir)
+        if update_latest:
+            self._atomic_write_json(self.application_report_latest_path, payload)
 
     def load_state(self) -> CollectionState:
         """Load collector state; missing state means this is the first run."""
@@ -79,9 +106,10 @@ class JsonStorage:
                     return rows
         return rows
 
-    def _append_history(self, payload: dict[str, Any]) -> None:
+    def _append_history(self, payload: dict[str, Any], *, history_dir: Path) -> None:
         day = datetime.now(timezone.utc).date().isoformat()
-        path = self.history_dir / f"{day}.jsonl"
+        path = history_dir / f"{day}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             file.write("\n")

@@ -3,82 +3,176 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Alfa Auto Requests Bot Dashboard</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23e30613'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='Arial' font-size='42' font-weight='800' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>Мониторинг | Alfa Auto Requests Bot</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='8' fill='%23e30613'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='Arial' font-size='42' font-weight='800' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <div class="shell">
-      <header class="topbar">
-        <div class="brand">
-          <div class="brand-mark" aria-hidden="true">A</div>
-          <div>
-            <h1>Alfa Auto Requests Bot</h1>
-            <p>Локальный read-only мониторинг</p>
-          </div>
-        </div>
-        <dl class="status-strip" aria-label="Краткий статус">
-          <div><dt>APP_VERSION</dt><dd id="top-version">—</dd></div>
-          <div><dt>Режим</dt><dd id="top-mode" class="good">production</dd></div>
-          <div><dt>Uptime</dt><dd id="top-uptime">—</dd></div>
-          <div><dt>Restarts</dt><dd id="top-restarts">—</dd></div>
-          <div><dt>Контейнер</dt><dd id="top-container">—</dd></div>
-          <div><dt>Heartbeat</dt><dd id="top-heartbeat">—</dd></div>
-          <div><dt>External health</dt><dd id="top-external">—</dd></div>
-          <div><dt>Обновлено</dt><dd id="top-updated">—</dd></div>
-        </dl>
-        <div class="header-actions">
-          <span class="readonly" title="Dashboard не выполняет write-команды">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2m-9 0h8a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2Z"/></svg>
-            read-only
-          </span>
-          <button id="refresh-button" type="button" title="Безопасно перечитать данные по SSH">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-14.5 4.7M4 12A8 8 0 0 1 18.5 7.3M18 3v5h-5M6 21v-5h5"/></svg>
-            Обновить
+    <div class="app-shell">
+      <aside class="nav-rail" aria-label="Разделы дашборда">
+        <div class="brand-mark" aria-label="Alfa Auto Requests">A<span></span></div>
+
+        <nav class="rail-menu">
+          <button class="rail-item is-active" type="button" aria-current="page" aria-label="Мониторинг" data-tab="monitoring" data-tooltip="Мониторинг">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg>
           </button>
-        </div>
-      </header>
+          <button class="rail-item" type="button" aria-label="Заявки" data-tab="applications" data-tooltip="Заявки">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h12a2 2 0 0 1 2 2v16H4V5a2 2 0 0 1 2-2Z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
+          </button>
+          <button class="rail-item" type="button" disabled aria-label="Команда, скоро" data-tooltip="Команда - скоро">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>
+          </button>
+          <button class="rail-item" type="button" disabled aria-label="История, скоро" data-tooltip="История - скоро">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>
+          </button>
+          <button class="rail-item" type="button" disabled aria-label="Настройки, скоро" data-tooltip="Настройки - скоро">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
+          </button>
+        </nav>
 
-      <main>
-        <section id="empty-state" class="empty-state hidden">
-          <h2>Данных пока нет</h2>
-          <p>Backend работает, но snapshot еще не собран. Нажмите «Обновить» или дождитесь фонового сбора.</p>
-        </section>
+        <span class="rail-readonly" aria-label="Только чтение" data-tooltip="Только чтение">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2"/><rect x="5" y="10" width="14" height="11" rx="2"/></svg>
+        </span>
+      </aside>
 
-        <section class="grid top-grid" aria-label="Основные показатели">
-          <article class="card hero-status" id="card-summary"></article>
-          <article class="card" id="card-container"></article>
-          <article class="card" id="card-vps"></article>
-          <article class="card" id="card-polling"></article>
-          <article class="card" id="card-telegram"></article>
-          <article class="card" id="card-google"></article>
-        </section>
+      <div class="workspace">
+        <header class="topbar">
+          <div class="page-heading">
+            <h1 id="page-title">Мониторинг</h1>
+            <p id="page-subtitle">Alfa Auto Requests Bot</p>
+          </div>
+          <div class="overall-state" aria-label="Общее состояние">
+            <span class="state-dot" aria-hidden="true"></span>
+            <div><span>Общее состояние</span><strong id="top-overall">Ожидание данных</strong></div>
+          </div>
+          <span class="readonly">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2"/><rect x="5" y="10" width="14" height="11" rx="2"/></svg>
+            Только чтение
+          </span>
+          <div class="update-meta"><span>Обновлено</span><strong id="top-updated">-</strong></div>
+          <button id="refresh-button" class="refresh-button" type="button" title="Безопасно перечитать данные по SSH">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-14.5 4.7M4 12A8 8 0 0 1 18.5 7.3M18 3v5h-5M6 21v-5h5"/></svg>
+            <span>Обновить</span>
+          </button>
+        </header>
 
-        <section class="grid business-grid" aria-label="Бизнес-виджеты для менеджеров">
-          <article class="card manager-focus" id="card-manager-focus"></article>
-          <article class="card" id="card-business-today"></article>
-          <article class="card" id="card-team-load"></article>
-          <article class="card" id="card-directions"></article>
-        </section>
+        <dl class="status-strip" aria-label="Краткий статус системы">
+          <div><dt>Версия</dt><dd id="top-version">-</dd></div>
+          <div><dt>Режим</dt><dd id="top-mode" class="good">production</dd></div>
+          <div><dt>Запущен</dt><dd id="top-uptime">-</dd></div>
+          <div><dt>Перезапуски</dt><dd id="top-restarts">-</dd></div>
+          <div><dt>Контейнер</dt><dd id="top-container">-</dd></div>
+          <div><dt>Heartbeat</dt><dd id="top-heartbeat">-</dd></div>
+          <div><dt>External health</dt><dd id="top-external">-</dd></div>
+        </dl>
 
-        <section class="grid mid-grid" aria-label="Очереди и бизнес-состояние">
-          <article class="card" id="card-gigachat"></article>
-          <article class="card" id="card-dashboard-outbox"></article>
-          <article class="card wide" id="card-applications"></article>
-          <article class="card" id="card-bulk"></article>
-          <article class="card" id="card-urgent"></article>
-        </section>
+        <main>
+          <section id="view-monitoring" class="tab-view is-visible" data-view="monitoring">
+            <section id="empty-state" class="empty-state hidden">
+              <h2>Данных пока нет</h2>
+              <p>Backend работает, но snapshot еще не собран. Нажмите «Обновить» или дождитесь фонового сбора.</p>
+            </section>
 
-        <section class="grid lower-grid" aria-label="Последние проблемы">
-          <article class="card table-card" id="card-errors"></article>
-          <article class="card" id="card-notification"></article>
-        </section>
-      </main>
+            <section class="dashboard-section" aria-labelledby="systems-title">
+              <div class="section-heading"><h2 id="systems-title">Состояние системы</h2><span>Инфраструктура и внешние сервисы</span></div>
+              <div class="grid systems-grid">
+                <article class="card hero-status" id="card-summary"></article>
+                <article class="card" id="card-container"></article>
+                <article class="card" id="card-vps"></article>
+                <article class="card" id="card-polling"></article>
+                <article class="card" id="card-telegram"></article>
+                <article class="card" id="card-google"></article>
+              </div>
+            </section>
 
-      <footer>
-        <span>Часовой пояс: MSK (UTC+3)</span>
-        <span>Страница читает локальный cache каждые 30 секунд</span>
-      </footer>
+            <section class="dashboard-section" aria-labelledby="business-title">
+              <div class="section-heading"><h2 id="business-title">Работа команды</h2><span>Операционные показатели за сегодня</span></div>
+              <div class="grid business-grid">
+                <article class="card manager-focus" id="card-manager-focus"></article>
+                <article class="card" id="card-business-today"></article>
+                <article class="card" id="card-team-load"></article>
+                <article class="card" id="card-directions"></article>
+              </div>
+            </section>
+
+            <section class="dashboard-section" aria-labelledby="processes-title">
+              <div class="section-heading"><h2 id="processes-title">Процессы и очереди</h2><span>Состояние обработки заявок</span></div>
+              <div class="grid processes-grid">
+                <article class="card" id="card-gigachat"></article>
+                <article class="card" id="card-dashboard-outbox"></article>
+                <article class="card" id="card-applications"></article>
+                <article class="card" id="card-bulk"></article>
+                <article class="card" id="card-urgent"></article>
+              </div>
+            </section>
+
+            <section class="grid lower-grid" aria-label="Последние проблемы">
+              <article class="card table-card" id="card-errors"></article>
+              <article class="card" id="card-notification"></article>
+            </section>
+          </section>
+
+          <section id="view-applications" class="tab-view" data-view="applications">
+            <section class="applications-hero">
+              <div>
+                <h2>Заявки, требующие внимания</h2>
+                <p>Ручная read-only выборка из SQLite на VPS. Данные не собираются в фоне и не меняют production БД.</p>
+              </div>
+              <button id="applications-report-button" class="primary-button" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-14.5 4.7M4 12A8 8 0 0 1 18.5 7.3M18 3v5h-5M6 21v-5h5"/></svg>
+                <span>Получить актуальные заявки</span>
+              </button>
+            </section>
+
+            <section id="applications-report-empty" class="empty-state">
+              <h2>Отчет еще не собран</h2>
+              <p>Нажмите кнопку, чтобы получить актуальные проблемные заявки с VPS. Последующие открытия вкладки будут читать локальный cache.</p>
+            </section>
+
+            <section id="applications-report-error" class="empty-state error-state hidden">
+              <h2>Не удалось получить отчет</h2>
+              <p id="applications-report-error-text">-</p>
+            </section>
+
+            <section id="applications-report-content" class="hidden">
+              <div class="report-meta">
+                <span>Последний отчет: <strong id="applications-report-updated">-</strong></span>
+                <span id="applications-report-status" class="pill">-</span>
+              </div>
+
+              <div class="grid report-summary-grid">
+                <article class="card summary-tile"><span>Потерялись</span><strong id="report-lost-count">0</strong></article>
+                <article class="card summary-tile"><span>Срочные без финального</span><strong id="report-urgent-count">0</strong></article>
+                <article class="card summary-tile"><span>Без ответственного</span><strong id="report-owner-count">0</strong></article>
+                <article class="card summary-tile"><span>Долго без движения</span><strong id="report-stale-count">0</strong></article>
+              </div>
+
+              <section class="dashboard-section">
+                <div class="section-heading"><h2>Потерялись</h2><span>Polling не находит строку или уже были not_found</span></div>
+                <article class="card table-card report-card" id="report-lost-table"></article>
+              </section>
+
+              <section class="dashboard-section">
+                <div class="section-heading"><h2>Другие полезные выборки</h2><span>То, что помогает менеджеру быстро понять, где завис процесс</span></div>
+                <div class="grid report-detail-grid">
+                  <article class="card table-card report-card" id="report-urgent-table"></article>
+                  <article class="card table-card report-card" id="report-owner-table"></article>
+                  <article class="card table-card report-card" id="report-clarification-table"></article>
+                  <article class="card table-card report-card" id="report-stale-table"></article>
+                  <article class="card table-card report-card" id="report-bulk-table"></article>
+                  <article class="card table-card report-card" id="report-workflows-table"></article>
+                </div>
+              </section>
+            </section>
+          </section>
+        </main>
+
+        <footer>
+          <span>Часовой пояс: MSK (UTC+3)</span>
+          <span>Обычный мониторинг читает локальный cache каждые 30 секунд</span>
+        </footer>
+      </div>
     </div>
     <script src="/static/app.js" defer></script>
   </body>

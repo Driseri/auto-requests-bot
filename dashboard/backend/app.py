@@ -9,9 +9,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .application_report import ApplicationReportCollector
 from .collector import DashboardCollector
 from .config import DEFAULT_CONFIG_PATH, load_config, validate_config
-from .schemas import CollectResponse
+from .schemas import ApplicationReportResponse, CollectResponse
 from .storage import JsonStorage
 
 
@@ -19,6 +20,7 @@ def create_app(
     *,
     config_path: Path | str | None = None,
     collector: DashboardCollector | None = None,
+    application_report_collector: ApplicationReportCollector | None = None,
 ) -> FastAPI:
     """Create FastAPI app; tests can inject a collector to avoid real SSH."""
 
@@ -29,6 +31,10 @@ def create_app(
     storage = JsonStorage(config.storage.data_dir)
     storage.ensure_ready()
     active_collector = collector or DashboardCollector(config=config, storage=storage)
+    active_application_report_collector = application_report_collector or ApplicationReportCollector(
+        config=config,
+        storage=storage,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -49,6 +55,7 @@ def create_app(
     app.state.config_errors = validate_config(config)
     app.state.storage = storage
     app.state.collector = active_collector
+    app.state.application_report_collector = active_application_report_collector
     static_dir = Path(__file__).resolve().parents[1] / "static"
     if static_dir.exists():
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -102,6 +109,23 @@ def create_app(
         """Return recent local JSONL history, newest first."""
 
         return {"items": app.state.storage.load_history(limit=limit)}
+
+    @app.get("/api/applications/report/latest")
+    async def latest_application_report() -> dict[str, object]:
+        """Return the latest stored application report without SSH collection."""
+
+        report = app.state.storage.load_latest_application_report()
+        if report is None:
+            raise HTTPException(status_code=404, detail="No application report collected yet")
+        return report.model_dump(mode="json")
+
+    @app.post("/api/applications/report", response_model=ApplicationReportResponse)
+    async def collect_application_report() -> ApplicationReportResponse:
+        """Trigger one manual read-only application report collection."""
+
+        if app.state.config_errors:
+            raise HTTPException(status_code=400, detail=app.state.config_errors)
+        return await app.state.application_report_collector.collect()
 
     return app
 

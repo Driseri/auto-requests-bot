@@ -67,13 +67,13 @@ def rollout_sheet_name(
     )
 
     if local_moment < wednesday_cutoff:
-        target_monday = monday
+        target_monday = monday + timedelta(days=7)
         suffix = "ср"
     elif local_moment < thursday_cutoff:
-        target_monday = monday
+        target_monday = monday + timedelta(days=7)
         suffix = "чт"
     else:
-        target_monday = monday + timedelta(days=7)
+        target_monday = monday + timedelta(days=14)
         suffix = "ср"
     return f"{target_monday.strftime('%d.%m')} {suffix}"
 

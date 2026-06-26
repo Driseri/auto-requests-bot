@@ -121,7 +121,7 @@ def test_working_data_rows_reads_chips_v2_layout():
     assert layout["status"] == 9
     assert layout["editor"] == 10
     assert layout["comment"] == 7
-    assert layout["final_answer"] == -1
+    assert layout["final_answer"] == 8
 
 
 def test_working_data_rows_reads_mixed_urgent_sheet():
@@ -149,7 +149,7 @@ def test_working_data_rows_reads_mixed_urgent_sheet():
         (2, "URGADD01"),
         (5, "URGCHIP1"),
     ]
-    assert found[1][2]["final_answer"] == -1
+    assert found[1][2]["final_answer"] == 8
 
 
 class FakeRequest:
@@ -1547,6 +1547,267 @@ async def test_single_comment_is_sent_only_for_needs_clarification(tmp_path):
     await service.run_once()
 
     assert "комментарий: Уточните &lt;деталь&gt;" in notifier.messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_urgent_scriptwriter_response_notifies_editor_chat(tmp_path):
+    repository = DraftRepository(str(tmp_path / "urgent_scriptwriter_response.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="URGRESP1",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name="Срочные",
+        last_known_status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+        direction=Direction.FL.value,
+        answer_type=AnswerType.URGENT.value,
+        application_type=ApplicationType.SINGLE.value,
+        is_urgent=True,
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "URGRESP1": SheetApplicationStatus(
+                    application_id="URGRESP1",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name="Срочные",
+                    sheet_id=100,
+                    row_number=12,
+                    status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+                    editor_comment="Уточните детали",
+                    final_answer="Сценарист уточнил детали <важно>",
+                    editor="Редактор",
+                    direction=Direction.FL.value,
+                    answer_type=AnswerType.URGENT.value,
+                    is_urgent=True,
+                    scriptwriter="Петров Петр",
+                    intent="urgent.intent",
+                    end_column="X",
+                )
+            }
+        ),
+        notifier=notifier,
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await service.run_once()
+
+    assert len(notifier.messages) == 1
+    message = notifier.messages[0]
+    assert message["chat_id"] == -100123456
+    assert message["reply_markup"] is None
+    assert "Сценарист ответил по срочной заявке" in message["text"]
+    assert "Петров Петр" in message["text"]
+    assert "urgent.intent" in message["text"]
+    assert "Сценарист уточнил детали &lt;важно&gt;" in message["text"]
+    assert "Открыть заявку" in message["text"]
+    tracked = await repository.get_submitted_application("URGRESP1")
+    assert tracked is not None
+    assert tracked.last_seen_final_answer == "Сценарист уточнил детали <важно>"
+
+
+@pytest.mark.asyncio
+async def test_urgent_scriptwriter_response_is_not_duplicated(tmp_path):
+    repository = DraftRepository(str(tmp_path / "urgent_scriptwriter_dedupe.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="URGRESP2",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name="Срочные",
+        last_known_status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+        answer_type=AnswerType.URGENT.value,
+        application_type=ApplicationType.SINGLE.value,
+        is_urgent=True,
+    )
+    status_reader = FakeStatusReader(
+        {
+            "URGRESP2": SheetApplicationStatus(
+                application_id="URGRESP2",
+                spreadsheet_id=FL_SPREADSHEET,
+                sheet_name="Срочные",
+                sheet_id=100,
+                row_number=12,
+                status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+                editor_comment="",
+                final_answer="Один и тот же ответ",
+                answer_type=AnswerType.URGENT.value,
+                is_urgent=True,
+            )
+        }
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=status_reader,
+        notifier=notifier,
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await service.run_once()
+    await service.run_once()
+
+    assert len(notifier.messages) == 1
+    outbox = await repository.list_notification_outbox()
+    assert len(outbox) == 1
+
+
+@pytest.mark.asyncio
+async def test_changed_urgent_scriptwriter_response_notifies_again(tmp_path):
+    repository = DraftRepository(str(tmp_path / "urgent_scriptwriter_changed.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="URGRESP3",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name="Срочные",
+        last_known_status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+        answer_type=AnswerType.URGENT.value,
+        application_type=ApplicationType.SINGLE.value,
+        is_urgent=True,
+    )
+    current = SheetApplicationStatus(
+        application_id="URGRESP3",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name="Срочные",
+        sheet_id=100,
+        row_number=12,
+        status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+        editor_comment="",
+        final_answer="Первый ответ",
+        answer_type=AnswerType.URGENT.value,
+        is_urgent=True,
+    )
+    status_reader = FakeStatusReader({"URGRESP3": current})
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=status_reader,
+        notifier=notifier,
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await service.run_once()
+    current.final_answer = "Исправленный ответ"
+    await service.run_once()
+
+    assert len(notifier.messages) == 2
+    assert "Первый ответ" in notifier.messages[0]["text"]
+    assert "Исправленный ответ" in notifier.messages[1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_non_urgent_scriptwriter_response_does_not_notify_editor_chat(tmp_path):
+    repository = DraftRepository(str(tmp_path / "non_urgent_scriptwriter_response.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="REGRESP1",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+        answer_type=AnswerType.ROLLOUT.value,
+        application_type=ApplicationType.SINGLE.value,
+        is_urgent=False,
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "REGRESP1": SheetApplicationStatus(
+                    application_id="REGRESP1",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name=WEEK_SHEET,
+                    sheet_id=100,
+                    row_number=12,
+                    status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+                    editor_comment="",
+                    final_answer="Ответ по несрочной заявке",
+                    answer_type=AnswerType.ROLLOUT.value,
+                    is_urgent=False,
+                )
+            }
+        ),
+        notifier=notifier,
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await service.run_once()
+
+    assert notifier.messages == []
+    tracked = await repository.get_submitted_application("REGRESP1")
+    assert tracked is not None
+    assert tracked.last_seen_final_answer == "Ответ по несрочной заявке"
+
+
+@pytest.mark.asyncio
+async def test_urgent_chips_scriptwriter_response_notifies_editor_chat(tmp_path):
+    repository = DraftRepository(str(tmp_path / "urgent_chips_scriptwriter_response.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="CHIPRESP",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name="Срочные",
+        last_known_status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+        direction=Direction.FL.value,
+        answer_type=AnswerType.URGENT.value,
+        application_type=ApplicationType.SINGLE.value,
+        change_type=ChangeType.CHIPS.value,
+        is_urgent=True,
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "CHIPRESP": SheetApplicationStatus(
+                    application_id="CHIPRESP",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name="Срочные",
+                    sheet_id=100,
+                    row_number=12,
+                    status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+                    editor_comment="",
+                    final_answer="Ответ сценариста по CHIPS",
+                    direction=Direction.FL.value,
+                    answer_type=AnswerType.URGENT.value,
+                    is_urgent=True,
+                    change_type=ChangeType.CHIPS.value,
+                    scriptwriter="Петров Петр",
+                    intent="chips.intent",
+                    end_column="U",
+                )
+            }
+        ),
+        notifier=notifier,
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await service.run_once()
+
+    assert len(notifier.messages) == 1
+    assert notifier.messages[0]["chat_id"] == -100123456
+    assert notifier.messages[0]["reply_markup"] is None
+    assert "Ответ сценариста по CHIPS" in notifier.messages[0]["text"]
+    assert "chips.intent" in notifier.messages[0]["text"]
+    assert "Итоговый ответ" not in notifier.messages[0]["text"]
+    tracked = await repository.get_submitted_application("CHIPRESP")
+    assert tracked is not None
+    assert tracked.last_seen_final_answer == "Ответ сценариста по CHIPS"
 
 
 @pytest.mark.asyncio

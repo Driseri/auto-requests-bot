@@ -206,6 +206,10 @@ async def main() -> None:
                     notification_message_max_chars=(
                         settings.notification_message_max_chars
                     ),
+                    urgent_editor_notifications_enabled=(
+                        settings.urgent_editor_notifications_enabled
+                    ),
+                    editor_urgent_chat_id=settings.editor_urgent_chat_id,
                 ),
                 interval_seconds=settings.status_polling_interval_seconds,
                 heartbeat_path=settings.status_polling_heartbeat_path,

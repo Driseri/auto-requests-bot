@@ -56,6 +56,8 @@ from app.submission import (
 
 LOGGER = logging.getLogger(__name__)
 URGENT_EDITOR_NOTIFICATION_EVENT_TYPE = "urgent-editor-application-created"
+URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE = "urgent-editor-scriptwriter-response"
+SCRIPTWRITER_RESPONSE_PREVIEW_LIMIT = 1800
 SINGLE_IMPORTANT_STATUSES = {
     ApplicationStatus.NEEDS_CLARIFICATION.value,
     ApplicationStatus.FINAL_ANSWER_READY.value,
@@ -104,6 +106,8 @@ class SheetApplicationStatus:
     answer_type: str | None = None
     is_urgent: bool | None = None
     change_type: str | None = None
+    scriptwriter: str | None = None
+    intent: str | None = None
     end_column: str = "W"
 
 
@@ -870,6 +874,8 @@ class StatusNotificationService:
         notification_message_max_chars: int = 3500,
         status_not_found_threshold: int = 20,
         status_not_found_recheck_seconds: int = 3600,
+        urgent_editor_notifications_enabled: bool = False,
+        editor_urgent_chat_id: int | None = None,
         clock: Callable[[], float] = monotonic,
     ) -> None:
         self.repository = repository
@@ -896,6 +902,8 @@ class StatusNotificationService:
         self.notification_message_max_chars = notification_message_max_chars
         self.status_not_found_threshold = status_not_found_threshold
         self.status_not_found_recheck_seconds = status_not_found_recheck_seconds
+        self.urgent_editor_notifications_enabled = urgent_editor_notifications_enabled
+        self.editor_urgent_chat_id = editor_urgent_chat_id
         self.clock = clock
         self._last_dashboard_sync_at: float | None = None
         self._last_completed_bulk_scan_at: float | None = None
@@ -1014,18 +1022,6 @@ class StatusNotificationService:
                     and current.status == ApplicationStatus.FINAL_ANSWER_READY.value
                     and bool(current.final_answer)
                 )
-            if not status_changed and not final_answer_changed and not editor_changed:
-                non_notified_updates.append(
-                    StatusNotification(
-                        tracked=application,
-                        current=current,
-                        status_changed=False,
-                        final_answer_changed=False,
-                        editor_changed=False,
-                    )
-                )
-                continue
-
             notification = StatusNotification(
                 tracked=application,
                 current=current,
@@ -1033,7 +1029,44 @@ class StatusNotificationService:
                 final_answer_changed=final_answer_changed,
                 editor_changed=editor_changed,
             )
-            if self._should_notify(notification):
+            scriptwriter_response_event = self._urgent_scriptwriter_response_event(
+                notification
+            )
+            should_notify_user = self._should_notify(notification)
+            if scriptwriter_response_event is not None:
+                await self.repository.enqueue_notification_event(
+                    **scriptwriter_response_event,
+                    application_updates=(
+                        []
+                        if should_notify_user
+                        else [
+                            self._application_tracking_update(
+                                notification.tracked,
+                                notification.current,
+                            )
+                        ]
+                    ),
+                    dashboard_projections=(
+                        []
+                        if should_notify_user
+                        else self._tracking_dashboard_projections(
+                            [notification],
+                            scan_batches,
+                            current_batch_statuses,
+                            statuses,
+                            include_unchanged_singles=True,
+                        )
+                    ),
+                )
+                if not should_notify_user:
+                    continue
+            if not status_changed and not final_answer_changed and not editor_changed:
+                non_notified_updates.append(
+                    notification
+                )
+                continue
+
+            if should_notify_user:
                 notifications_by_user.setdefault(application.telegram_user_id, []).append(
                     notification
                 )
@@ -1236,6 +1269,62 @@ class StatusNotificationService:
         if notification.tracked.batch_id:
             return notification.current.status == BulkApplicationStatus.NEEDS_CLARIFICATION.value
         return notification.current.status in SINGLE_IMPORTANT_STATUSES
+
+    def _urgent_scriptwriter_response_event(
+        self,
+        notification: StatusNotification,
+    ) -> dict[str, Any] | None:
+        if not self.urgent_editor_notifications_enabled:
+            return None
+        if self.editor_urgent_chat_id is None:
+            return None
+        tracked = notification.tracked
+        current = notification.current
+        if tracked.batch_id or current.batch_id:
+            return None
+        is_urgent = (
+            current.answer_type == AnswerType.URGENT.value
+            or tracked.answer_type == AnswerType.URGENT.value
+            or current.is_urgent is True
+            or tracked.is_urgent is True
+        )
+        if not is_urgent:
+            return None
+        if current.status != ApplicationStatus.NEEDS_CLARIFICATION.value:
+            return None
+        scriptwriter_response = (current.final_answer or "").strip()
+        if not scriptwriter_response:
+            return None
+        if scriptwriter_response == (tracked.last_seen_final_answer or "").strip():
+            return None
+
+        response_hash = hashlib.sha256(
+            scriptwriter_response.encode("utf-8")
+        ).hexdigest()
+        snapshot = {
+            "application_id": tracked.application_id,
+            "direction": current.direction or tracked.direction or "",
+            "scriptwriter": current.scriptwriter or "",
+            "intent": current.intent or "",
+            "status": current.status,
+            "scriptwriter_response": scriptwriter_response,
+            "row_link": self._row_link(current),
+        }
+        snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        dedupe_key = (
+            f"{URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE}:"
+            f"{tracked.application_id}:{response_hash}"
+        )
+        return {
+            "telegram_user_id": self.editor_urgent_chat_id,
+            "event_type": URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE,
+            "dedupe_key": dedupe_key,
+            "snapshot_json": snapshot_json,
+            "chunks": _split_html_message(
+                _render_urgent_scriptwriter_response_notification(snapshot),
+                self.notification_message_max_chars,
+            ),
+        }
 
     async def _process_bulk_batch_statuses(
         self,
@@ -1707,7 +1796,10 @@ class StatusNotificationService:
         self,
         item: Any,
     ) -> Any | None:
-        if item.event_type == URGENT_EDITOR_NOTIFICATION_EVENT_TYPE:
+        if item.event_type in {
+            URGENT_EDITOR_NOTIFICATION_EVENT_TYPE,
+            URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE,
+        }:
             return None
         return await self._reply_markup_for_user(item.telegram_user_id)
 
@@ -1876,6 +1968,36 @@ def _fit_html_block(block: str, max_chars: int) -> str:
     return f"{shortened}{suffix}"
 
 
+def _render_urgent_scriptwriter_response_notification(snapshot: dict[str, Any]) -> str:
+    response = _truncate_text(
+        str(snapshot.get("scriptwriter_response") or ""),
+        SCRIPTWRITER_RESPONSE_PREVIEW_LIMIT,
+    )
+    lines = [
+        "💬 <b>Сценарист ответил по срочной заявке</b>",
+        "",
+        f"<b>Направление:</b> {escape(str(snapshot.get('direction') or '-'))}",
+        f"<b>Сценарист:</b> {escape(str(snapshot.get('scriptwriter') or '-'))}",
+        f"<b>Интент:</b> {escape(str(snapshot.get('intent') or '-'))}",
+        f"<b>Статус:</b> {escape(str(snapshot.get('status') or '-'))}",
+        "",
+        "<b>Ответ сценариста:</b>",
+        f"<blockquote>{escape(response)}</blockquote>",
+        "",
+        f'<a href="{escape(str(snapshot.get("row_link") or ""), quote=True)}">Открыть заявку</a>',
+    ]
+    return "\n".join(lines)
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return "…"
+    return f"{text[: limit - 1].rstrip()}…"
+
+
 def _status_from_working_row(
     *,
     application_id: str,
@@ -1897,6 +2019,8 @@ def _status_from_working_row(
         answer_type=_cell(row, layout["answer_type"]).strip() or None,
         is_urgent=_sheet_bool(_cell(row, layout["is_urgent"])),
         change_type=_cell(row, layout.get("change_type", -1)).strip() or None,
+        scriptwriter=_cell(row, layout.get("scriptwriter", -1)).strip() or None,
+        intent=_cell(row, layout.get("intent", -1)).strip() or None,
         status=_cell(row, layout["status"]).strip(),
         editor=_cell(row, layout["editor"]).strip(),
         editor_comment=_cell(row, layout["comment"]).strip(),
@@ -1918,8 +2042,10 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "status": 9,
             "editor": 10,
             "comment": 7,
-            "final_answer": -1,
+            "final_answer": 8,
             "change_type": 20,
+            "scriptwriter": 0,
+            "intent": 1,
             "end_column": "U",
         }
     if headers[: len(WORKSHEET_HEADERS)] == WORKSHEET_HEADERS:
@@ -1935,6 +2061,8 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "comment": 7,
             "final_answer": 5,
             "change_type": 23,
+            "scriptwriter": 0,
+            "intent": 1,
             "end_column": "X",
         }
     if headers[: len(CURRENT_WORKSHEET_HEADERS)] == CURRENT_WORKSHEET_HEADERS:
@@ -1950,6 +2078,8 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "comment": 17,
             "final_answer": 19,
             "change_type": 22,
+            "scriptwriter": 12,
+            "intent": 11,
             "end_column": "W",
         }
     if headers[: len(LEGACY_WORKSHEET_HEADERS)] == LEGACY_WORKSHEET_HEADERS:
@@ -1965,6 +2095,8 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "comment": 16,
             "final_answer": 18,
             "change_type": 21,
+            "scriptwriter": 11,
+            "intent": 10,
             "end_column": "V",
         }
     return None
