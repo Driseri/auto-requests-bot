@@ -52,7 +52,7 @@ def rollout_sheet_name(
     submitted_at: datetime,
     schedule: RolloutSchedule,
 ) -> str:
-    """Выбрать лист среды/четверга по фактическому времени отправки заявки."""
+    """Выбрать первое/второе недельное окно по времени отправки заявки."""
     local_moment = _as_aware(submitted_at).astimezone(schedule.timezone)
     monday = local_moment.date() - timedelta(days=local_moment.weekday())
     wednesday_cutoff = datetime.combine(
@@ -66,16 +66,20 @@ def rollout_sheet_name(
         tzinfo=schedule.timezone,
     )
 
+    # Rollout sheets keep the current Wed/Thu cutoffs, but sheet names expose
+    # only the first or second weekly window. New requests are planned one
+    # release week ahead; after Thursday cutoff the target moves to the first
+    # window of the week after next.
     if local_moment < wednesday_cutoff:
         target_monday = monday + timedelta(days=7)
-        suffix = "ср"
+        window = "1"
     elif local_moment < thursday_cutoff:
         target_monday = monday + timedelta(days=7)
-        suffix = "чт"
+        window = "2"
     else:
         target_monday = monday + timedelta(days=14)
-        suffix = "ср"
-    return f"{target_monday.strftime('%d.%m')} {suffix}"
+        window = "1"
+    return f"{target_monday.strftime('%d.%m')} ({window})"
 
 
 def cutoff_to_string(value: time) -> str:

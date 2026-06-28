@@ -143,6 +143,11 @@ class DraftRepository:
                     last_seen_editor TEXT,
                     last_seen_editor_comment TEXT,
                     last_seen_final_answer TEXT,
+                    last_seen_scriptwriter_response TEXT,
+                    pending_editor_comment TEXT,
+                    pending_editor_comment_seen_count INTEGER NOT NULL DEFAULT 0,
+                    pending_scriptwriter_response TEXT,
+                    pending_scriptwriter_response_seen_count INTEGER NOT NULL DEFAULT 0,
                     submitted_at TEXT,
                     polling_state TEXT NOT NULL DEFAULT 'ACTIVE',
                     not_found_count INTEGER NOT NULL DEFAULT 0,
@@ -162,6 +167,27 @@ class DraftRepository:
             await self._ensure_submitted_applications_column(db, "change_type", "TEXT")
             await self._ensure_submitted_applications_column(db, "is_urgent", "INTEGER")
             await self._ensure_submitted_applications_column(db, "last_seen_final_answer", "TEXT")
+            await self._ensure_submitted_applications_column(
+                db,
+                "last_seen_scriptwriter_response",
+                "TEXT",
+            )
+            await self._ensure_submitted_applications_column(db, "pending_editor_comment", "TEXT")
+            await self._ensure_submitted_applications_column(
+                db,
+                "pending_editor_comment_seen_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            await self._ensure_submitted_applications_column(
+                db,
+                "pending_scriptwriter_response",
+                "TEXT",
+            )
+            await self._ensure_submitted_applications_column(
+                db,
+                "pending_scriptwriter_response_seen_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
             await self._ensure_submitted_applications_column(db, "last_seen_editor", "TEXT")
             await self._ensure_submitted_applications_column(db, "submitted_at", "TEXT")
             await self._ensure_submitted_applications_column(
@@ -806,6 +832,11 @@ class DraftRepository:
                     last_seen_editor = excluded.last_seen_editor,
                     last_seen_editor_comment = excluded.last_seen_editor_comment,
                     last_seen_final_answer = excluded.last_seen_final_answer,
+                    last_seen_scriptwriter_response = NULL,
+                    pending_editor_comment = NULL,
+                    pending_editor_comment_seen_count = 0,
+                    pending_scriptwriter_response = NULL,
+                    pending_scriptwriter_response_seen_count = 0,
                     submitted_at = COALESCE(
                         submitted_applications.submitted_at,
                         excluded.submitted_at
@@ -898,6 +929,11 @@ class DraftRepository:
         spreadsheet_id: str | None = None,
         sheet_id: int | None = None,
         last_seen_final_answer: str | None = None,
+        last_seen_scriptwriter_response: str | None = None,
+        pending_editor_comment: str | None = None,
+        pending_editor_comment_seen_count: int = 0,
+        pending_scriptwriter_response: str | None = None,
+        pending_scriptwriter_response_seen_count: int = 0,
     ) -> None:
         async with self._connection() as db:
             await db.execute(
@@ -911,6 +947,11 @@ class DraftRepository:
                     last_seen_editor = ?,
                     last_seen_editor_comment = ?,
                     last_seen_final_answer = ?,
+                    last_seen_scriptwriter_response = ?,
+                    pending_editor_comment = ?,
+                    pending_editor_comment_seen_count = ?,
+                    pending_scriptwriter_response = ?,
+                    pending_scriptwriter_response_seen_count = ?,
                     polling_state = ?,
                     not_found_count = 0,
                     last_not_found_at = NULL,
@@ -927,6 +968,11 @@ class DraftRepository:
                     last_seen_editor,
                     last_seen_editor_comment,
                     last_seen_final_answer,
+                    last_seen_scriptwriter_response,
+                    pending_editor_comment,
+                    pending_editor_comment_seen_count,
+                    pending_scriptwriter_response,
+                    pending_scriptwriter_response_seen_count,
                     StatusPollingState.ACTIVE.value,
                     utc_now_iso(),
                     application_id,
@@ -2049,6 +2095,11 @@ class DraftRepository:
                 last_seen_editor = ?,
                 last_seen_editor_comment = ?,
                 last_seen_final_answer = ?,
+                last_seen_scriptwriter_response = ?,
+                pending_editor_comment = ?,
+                pending_editor_comment_seen_count = ?,
+                pending_scriptwriter_response = ?,
+                pending_scriptwriter_response_seen_count = ?,
                 change_type = COALESCE(?, change_type),
                 polling_state = ?,
                 not_found_count = 0,
@@ -2066,6 +2117,11 @@ class DraftRepository:
                 update.get("last_seen_editor"),
                 update.get("last_seen_editor_comment"),
                 update.get("last_seen_final_answer"),
+                update.get("last_seen_scriptwriter_response"),
+                update.get("pending_editor_comment"),
+                update.get("pending_editor_comment_seen_count", 0),
+                update.get("pending_scriptwriter_response"),
+                update.get("pending_scriptwriter_response_seen_count", 0),
                 update.get("change_type"),
                 StatusPollingState.ACTIVE.value,
                 now,
@@ -2157,6 +2213,13 @@ class DraftRepository:
             last_seen_editor=row["last_seen_editor"],
             last_seen_editor_comment=row["last_seen_editor_comment"],
             last_seen_final_answer=row["last_seen_final_answer"],
+            last_seen_scriptwriter_response=row["last_seen_scriptwriter_response"],
+            pending_editor_comment=row["pending_editor_comment"],
+            pending_editor_comment_seen_count=row["pending_editor_comment_seen_count"] or 0,
+            pending_scriptwriter_response=row["pending_scriptwriter_response"],
+            pending_scriptwriter_response_seen_count=(
+                row["pending_scriptwriter_response_seen_count"] or 0
+            ),
             submitted_at=row["submitted_at"],
             polling_state=row["polling_state"] or StatusPollingState.ACTIVE.value,
             not_found_count=row["not_found_count"] or 0,

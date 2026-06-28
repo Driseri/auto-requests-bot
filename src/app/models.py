@@ -367,6 +367,11 @@ class SubmittedApplication:
     last_seen_editor: str | None = None
     last_seen_editor_comment: str | None = None
     last_seen_final_answer: str | None = None
+    last_seen_scriptwriter_response: str | None = None
+    pending_editor_comment: str | None = None
+    pending_editor_comment_seen_count: int = 0
+    pending_scriptwriter_response: str | None = None
+    pending_scriptwriter_response_seen_count: int = 0
     submitted_at: str | None = None
     polling_state: str = StatusPollingState.ACTIVE.value
     not_found_count: int = 0

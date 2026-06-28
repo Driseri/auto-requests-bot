@@ -38,6 +38,7 @@ from app.submission import (
     GoogleSheetsSubmissionService,
     LEGACY_DASHBOARD_HEADERS,
     LEGACY_WORKSHEET_HEADERS,
+    PREVIOUS_WORKSHEET_HEADERS,
     SHEET_HEADERS,
     SheetConfigurationError,
     build_google_sheets_api,
@@ -70,6 +71,7 @@ def test_old_working_sheet_headers_remain_supported():
     assert "Причина изменений" in CURRENT_WORKSHEET_HEADERS
     assert _working_sheet_schema(LEGACY_WORKSHEET_HEADERS) == "legacy"
     assert _working_sheet_schema(CURRENT_WORKSHEET_HEADERS) == "current"
+    assert _working_sheet_schema(PREVIOUS_WORKSHEET_HEADERS) == "previous_new"
 
 
 def test_build_google_sheets_api_disables_discovery_cache(monkeypatch):
@@ -331,7 +333,7 @@ def test_draft_to_sheet_row_uses_new_direction_schema():
 
     assert row == [
         "Иван Иванов",
-        "intent.change_limit",
+        ApplicationStatus.NEW.value,
         "Изменились условия продукта",
         "Лаконичный текст изменений",
         "Исходный ответ",
@@ -339,8 +341,8 @@ def test_draft_to_sheet_row_uses_new_direction_schema():
         "",
         "",
         "",
-        ApplicationStatus.NEW.value,
         "Редактор не выбран",
+        "intent.change_limit",
         "A1B2C3D4",
         "",
         ApplicationType.SINGLE.value,
@@ -369,13 +371,14 @@ def test_chips_draft_to_sheet_row_uses_dedicated_schema():
 
     assert row[:6] == [
         draft.scriptwriter,
-        draft.intent,
+        ApplicationStatus.NEW.value,
         draft.reason,
         "before",
         "chip",
         "after",
     ]
-    assert row[9] == ApplicationStatus.NEW.value
+    assert row[9] == "Редактор не выбран"
+    assert row[10] == draft.intent
     assert row[11] == draft.application_id
     assert row[20] == ChangeType.CHIPS.value
 
@@ -446,7 +449,7 @@ def test_all_working_sheet_schemas_use_typed_submission_date(schema, date_index)
 
 def test_target_sheet_name_uses_week_or_integration():
     submitted_at = datetime(2026, 6, 3, 10, 59, 59, tzinfo=timezone.utc)
-    assert target_sheet_name(make_draft(), submitted_at=submitted_at) == "08.06 ср"
+    assert target_sheet_name(make_draft(), submitted_at=submitted_at) == "08.06 (1)"
     assert (
         target_sheet_name(
             make_draft(
@@ -459,7 +462,7 @@ def test_target_sheet_name_uses_week_or_integration():
     )
     assert (
         target_sheet_name(make_draft(answer_type=AnswerType.INTEGRATION.value))
-        == "Интеграционные"
+        == "Интеграции"
     )
     assert (
         target_sheet_name(
@@ -476,14 +479,14 @@ def test_target_sheet_name_uses_week_or_integration():
 @pytest.mark.parametrize(
     ("submitted_at", "expected"),
     [
-        (datetime(2026, 6, 1, 7, 0, tzinfo=timezone.utc), "08.06 ср"),
-        (datetime(2026, 6, 3, 10, 59, 59, tzinfo=timezone.utc), "08.06 ср"),
-        (datetime(2026, 6, 3, 11, 0, tzinfo=timezone.utc), "08.06 чт"),
-        (datetime(2026, 6, 4, 10, 59, 59, tzinfo=timezone.utc), "08.06 чт"),
-        (datetime(2026, 6, 4, 11, 0, tzinfo=timezone.utc), "15.06 ср"),
-        (datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc), "15.06 ср"),
-        (datetime(2026, 6, 7, 9, 0, tzinfo=timezone.utc), "15.06 ср"),
-        (datetime(2026, 12, 31, 11, 0, tzinfo=timezone.utc), "11.01 ср"),
+        (datetime(2026, 6, 1, 7, 0, tzinfo=timezone.utc), "08.06 (1)"),
+        (datetime(2026, 6, 3, 10, 59, 59, tzinfo=timezone.utc), "08.06 (1)"),
+        (datetime(2026, 6, 3, 11, 0, tzinfo=timezone.utc), "08.06 (2)"),
+        (datetime(2026, 6, 4, 10, 59, 59, tzinfo=timezone.utc), "08.06 (2)"),
+        (datetime(2026, 6, 4, 11, 0, tzinfo=timezone.utc), "15.06 (1)"),
+        (datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc), "15.06 (1)"),
+        (datetime(2026, 6, 7, 9, 0, tzinfo=timezone.utc), "15.06 (1)"),
+        (datetime(2026, 12, 31, 11, 0, tzinfo=timezone.utc), "11.01 (1)"),
     ],
 )
 def test_rollout_sheet_name_uses_moscow_cutoffs(submitted_at, expected):
@@ -502,21 +505,21 @@ def test_rollout_sheet_name_supports_custom_cutoffs():
             datetime(2026, 6, 3, 10, 29, 59, tzinfo=timezone.utc),
             schedule,
         )
-        == "08.06 ср"
+        == "08.06 (1)"
     )
     assert (
         rollout_sheet_name(
             datetime(2026, 6, 3, 10, 30, tzinfo=timezone.utc),
             schedule,
         )
-        == "08.06 чт"
+        == "08.06 (2)"
     )
     assert (
         rollout_sheet_name(
             datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc),
             schedule,
         )
-        == "15.06 ср"
+        == "15.06 (1)"
     )
 
 
@@ -528,14 +531,14 @@ def test_rollout_sheet_name_applies_cutoffs_in_configured_timezone():
             datetime(2026, 6, 3, 17, 59, 59, tzinfo=timezone.utc),
             schedule,
         )
-        == "08.06 ср"
+        == "08.06 (1)"
     )
     assert (
         rollout_sheet_name(
             datetime(2026, 6, 3, 18, 0, tzinfo=timezone.utc),
             schedule,
         )
-        == "08.06 чт"
+        == "08.06 (2)"
     )
 
 
@@ -545,7 +548,7 @@ def test_target_sheet_name_prefixes_voicebot_rollout():
             make_draft(direction=Direction.VOICEBOT.value),
             submitted_at=datetime(2026, 6, 3, 11, 0, tzinfo=timezone.utc),
         )
-        == "VoiceBot 08.06 чт"
+        == "VoiceBot 08.06 (2)"
     )
 
 
@@ -645,7 +648,12 @@ async def test_existing_urgent_sheet_gets_chips_section_without_changing_rows():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "headers",
-    [LEGACY_WORKSHEET_HEADERS, CURRENT_WORKSHEET_HEADERS, SHEET_HEADERS],
+    [
+        LEGACY_WORKSHEET_HEADERS,
+        CURRENT_WORKSHEET_HEADERS,
+        PREVIOUS_WORKSHEET_HEADERS,
+        SHEET_HEADERS,
+    ],
 )
 async def test_urgent_add_supports_all_existing_base_headers(headers):
     api = FakeSheetsApi(
@@ -687,17 +695,19 @@ async def test_submit_creates_week_sheet_and_appends_row():
 
     assert result.success is True
     assert result.spreadsheet_id == FL_SPREADSHEET
-    assert result.sheet_name == "08.06 ср"
-    assert api.headers[(FL_SPREADSHEET, "08.06 ср")] == ["ADD"]
+    assert result.sheet_name == "08.06 (1)"
+    assert api.headers[(FL_SPREADSHEET, "08.06 (1)")] == ["ADD"]
     assert len(api.append_cells) == 1
     spreadsheet_id, append_cells = api.append_cells[0]
     assert spreadsheet_id == FL_SPREADSHEET
     assert append_cells["sheetId"] == 100
     values = _append_cell_values(append_cells)
     assert values[0] == "Иван Иванов"
+    assert values[1] == ApplicationStatus.NEW.value
+    assert values[9] == "Редактор не выбран"
+    assert values[10] == "intent.change_limit"
     assert values[11] == "A1B2C3D4"
     assert values[15] == Direction.FL.value
-    assert values[9] == ApplicationStatus.NEW.value
 
 
 @pytest.mark.asyncio
@@ -723,9 +733,9 @@ async def test_sectioned_week_sheet_writes_to_selected_section(
         SHEET_HEADERS,
     ]
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "08.06 ср"): ["ADD"]},
-        rows={(FL_SPREADSHEET, "08.06 ср"): rows},
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): rows},
     )
     service = make_service(api)
 
@@ -753,9 +763,9 @@ async def test_empty_legacy_chips_section_is_upgraded_in_place():
         SHEET_HEADERS,
     ]
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "08.06 ср"): ["ADD"]},
-        rows={(FL_SPREADSHEET, "08.06 ср"): rows},
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): rows},
     )
     service = make_service(api)
 
@@ -792,9 +802,9 @@ async def test_populated_legacy_chips_section_creates_and_uses_v2():
         legacy_chips_row,
     ]
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "08.06 ср"): ["ADD"]},
-        rows={(FL_SPREADSHEET, "08.06 ср"): rows},
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): rows},
     )
     service = make_service(api)
 
@@ -808,8 +818,8 @@ async def test_populated_legacy_chips_section_creates_and_uses_v2():
     )
 
     assert result.success is True
-    assert api.rows[(FL_SPREADSHEET, "08.06 ср")][6] == legacy_chips_row
-    assert api.rows[(FL_SPREADSHEET, "08.06 ср")][7:9] == [
+    assert api.rows[(FL_SPREADSHEET, "08.06 (1)")][6] == legacy_chips_row
+    assert api.rows[(FL_SPREADSHEET, "08.06 (1)")][7:9] == [
         [CHIPS_V2_MARKER],
         CHIPS_WORKSHEET_HEADERS,
     ]
@@ -829,7 +839,7 @@ async def test_submit_routes_by_submission_time_not_draft_creation_time():
     )
 
     assert result.success is True
-    assert result.sheet_name == "15.06 ср"
+    assert result.sheet_name == "15.06 (1)"
     assert result.submitted_at == "2026-06-04T11:00:00+00:00"
     date_cell = api.append_cells[0][1]["rows"][0]["values"][14]
     expected_serial = (
@@ -861,8 +871,8 @@ async def test_submit_retry_keeps_previously_selected_sheet():
 @pytest.mark.asyncio
 async def test_existing_wrong_headers_return_error_and_do_not_append():
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "08.06 ср"): ["wrong"] * len(SHEET_HEADERS)},
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): ["wrong"] * len(SHEET_HEADERS)},
     )
     service = make_service(api)
 
@@ -912,9 +922,9 @@ async def test_idempotent_retry_does_not_rewrite_existing_submission_date():
     existing_row = [""] * len(SHEET_HEADERS)
     existing_row[11] = "A1B2C3D4"
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "08.06 ср"): SHEET_HEADERS.copy()},
-        rows={(FL_SPREADSHEET, "08.06 ср"): [SHEET_HEADERS, existing_row]},
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): SHEET_HEADERS.copy()},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): [SHEET_HEADERS, existing_row]},
     )
     service = make_service(api)
 
@@ -929,8 +939,8 @@ async def test_idempotent_retry_does_not_rewrite_existing_submission_date():
 @pytest.mark.asyncio
 async def test_existing_legacy_working_sheet_keeps_legacy_schema():
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "08.06 ср"): LEGACY_WORKSHEET_HEADERS.copy()},
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): LEGACY_WORKSHEET_HEADERS.copy()},
     )
     service = make_service(api)
 
@@ -945,8 +955,8 @@ async def test_existing_legacy_working_sheet_keeps_legacy_schema():
 @pytest.mark.asyncio
 async def test_existing_current_working_sheet_keeps_current_schema():
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "08.06 ср"): CURRENT_WORKSHEET_HEADERS.copy()},
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): CURRENT_WORKSHEET_HEADERS.copy()},
     )
     service = make_service(api)
 
@@ -1039,9 +1049,9 @@ def test_repair_dashboard_headers_rejects_ambiguous_or_foreign_schema():
 @pytest.mark.asyncio
 async def test_append_cells_contains_status_dropdown_and_source_rich_text():
     api = FakeSheetsApi(
-        sheets={FL_SPREADSHEET: {"08.06 ср": 42}},
-        headers={(FL_SPREADSHEET, "08.06 ср"): SHEET_HEADERS.copy()},
-        rows={(FL_SPREADSHEET, "08.06 ср"): [SHEET_HEADERS]},
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): SHEET_HEADERS.copy()},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): [SHEET_HEADERS]},
     )
     service = make_service(api)
     formatting_json = serialize_formatting_spans(
@@ -1061,13 +1071,13 @@ async def test_append_cells_contains_status_dropdown_and_source_rich_text():
 
     assert result.success is True
     cells = api.append_cells[0][1]["rows"][0]["values"]
-    status_cell = cells[9]
+    status_cell = cells[1]
     assert status_cell["userEnteredValue"] == {"stringValue": ApplicationStatus.NEW.value}
     assert [
         value["userEnteredValue"]
         for value in status_cell["dataValidation"]["condition"]["values"]
     ] == [status.value for status in ApplicationStatus]
-    editor_cell = cells[10]
+    editor_cell = cells[9]
     assert editor_cell["userEnteredValue"] == {"stringValue": "Редактор не выбран"}
     assert [
         value["userEnteredValue"]

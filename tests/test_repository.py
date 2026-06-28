@@ -301,6 +301,11 @@ async def test_submitted_applications_are_saved_listed_and_updated(tmp_path):
     assert first.last_seen_row_number == 5
     assert first.last_seen_editor == "редактор 1"
     assert first.last_seen_editor_comment == "Можно использовать"
+    assert first.last_seen_scriptwriter_response is None
+    assert first.pending_editor_comment is None
+    assert first.pending_editor_comment_seen_count == 0
+    assert first.pending_scriptwriter_response is None
+    assert first.pending_scriptwriter_response_seen_count == 0
     assert first.submitted_at == "2026-06-15T10:30:00+00:00"
     assert first.polling_state == "ACTIVE"
     assert first.not_found_count == 0

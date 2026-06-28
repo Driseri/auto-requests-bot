@@ -44,6 +44,8 @@ from app.submission import (
     CHIPS_WORKSHEET_HEADERS,
     DirectionSpreadsheetConfig,
     LEGACY_WORKSHEET_HEADERS,
+    PREVIOUS_CHIPS_WORKSHEET_HEADERS,
+    PREVIOUS_WORKSHEET_HEADERS,
     SHEET_HEADERS,
 )
 
@@ -107,8 +109,9 @@ def test_working_data_rows_reads_all_rollout_sections():
 def test_working_data_rows_reads_chips_v2_layout():
     chips_row = [""] * len(CHIPS_WORKSHEET_HEADERS)
     chips_row[7] = "Editor comment"
-    chips_row[9] = ApplicationStatus.NEEDS_CLARIFICATION.value
-    chips_row[10] = "Editor"
+    chips_row[1] = ApplicationStatus.NEEDS_CLARIFICATION.value
+    chips_row[9] = "Editor"
+    chips_row[10] = "intent.chip"
     chips_row[11] = "CHIPSV20"
     chips_row[20] = ChangeType.CHIPS.value
     rows = [["CHIPS V2"], CHIPS_WORKSHEET_HEADERS, chips_row]
@@ -118,18 +121,59 @@ def test_working_data_rows_reads_chips_v2_layout():
     assert len(found) == 1
     row_number, _, layout = found[0]
     assert row_number == 3
+    assert layout["status"] == 1
+    assert layout["editor"] == 9
+    assert layout["intent"] == 10
+    assert layout["comment"] == 7
+    assert layout["final_answer"] == -1
+    assert layout["scriptwriter_response"] == 8
+
+
+def test_working_data_rows_reads_previous_add_edit_layout():
+    row = [""] * len(PREVIOUS_WORKSHEET_HEADERS)
+    row[1] = "intent.old"
+    row[9] = ApplicationStatus.ACCEPTED.value
+    row[10] = "Editor"
+    row[11] = "OLDADD01"
+    row[23] = ChangeType.ADD.value
+    rows = [PREVIOUS_WORKSHEET_HEADERS, row]
+
+    found = _working_data_rows(rows)
+
+    assert len(found) == 1
+    row_number, _, layout = found[0]
+    assert row_number == 2
     assert layout["status"] == 9
     assert layout["editor"] == 10
-    assert layout["comment"] == 7
-    assert layout["final_answer"] == 8
+    assert layout["intent"] == 1
+
+
+def test_working_data_rows_reads_previous_chips_layout():
+    chips_row = [""] * len(PREVIOUS_CHIPS_WORKSHEET_HEADERS)
+    chips_row[7] = "Editor comment"
+    chips_row[9] = ApplicationStatus.NEEDS_CLARIFICATION.value
+    chips_row[10] = "Editor"
+    chips_row[11] = "CHIPOLD1"
+    chips_row[20] = ChangeType.CHIPS.value
+    rows = [["CHIPS V2"], PREVIOUS_CHIPS_WORKSHEET_HEADERS, chips_row]
+
+    found = _working_data_rows(rows)
+
+    assert len(found) == 1
+    row_number, _, layout = found[0]
+    assert row_number == 3
+    assert layout["status"] == 9
+    assert layout["editor"] == 10
+    assert layout["intent"] == 1
 
 
 def test_working_data_rows_reads_mixed_urgent_sheet():
     urgent_add = app_row("URGADD01")
     urgent_chips = [""] * len(CHIPS_WORKSHEET_HEADERS)
     urgent_chips[7] = "Need details"
-    urgent_chips[9] = ApplicationStatus.NEEDS_CLARIFICATION.value
-    urgent_chips[10] = "Editor"
+    urgent_chips[1] = ApplicationStatus.NEEDS_CLARIFICATION.value
+    urgent_chips[9] = "Editor"
+    urgent_chips[10] = "intent.chip"
     urgent_chips[11] = "URGCHIP1"
     urgent_chips[13] = ApplicationType.SINGLE.value
     urgent_chips[16] = AnswerType.URGENT.value
@@ -149,7 +193,8 @@ def test_working_data_rows_reads_mixed_urgent_sheet():
         (2, "URGADD01"),
         (5, "URGCHIP1"),
     ]
-    assert found[1][2]["final_answer"] == 8
+    assert found[1][2]["final_answer"] == -1
+    assert found[1][2]["scriptwriter_response"] == 8
 
 
 class FakeRequest:
@@ -398,8 +443,9 @@ def app_row(
     row[15] = direction
     row[16] = AnswerType.ROLLOUT.value
     row[17] = "Да"
-    row[9] = status
-    row[10] = "редактор 1"
+    row[1] = status
+    row[9] = "редактор 1"
+    row[10] = "intent.test"
     row[7] = comment
     row[5] = final_answer
     return row
@@ -1513,7 +1559,7 @@ async def test_chips_notifies_status_but_never_renders_final_answer(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_single_comment_is_sent_only_for_needs_clarification(tmp_path):
+async def test_single_editor_comment_is_sent_after_three_stable_polls(tmp_path):
     repository = DraftRepository(str(tmp_path / "clarification_comment.db"))
     await repository.init()
     await repository.save_submitted_application(
@@ -1535,7 +1581,7 @@ async def test_single_comment_is_sent_only_for_needs_clarification(tmp_path):
                     sheet_name=WEEK_SHEET,
                     sheet_id=100,
                     row_number=7,
-                    status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+                    status=ApplicationStatus.IN_PROGRESS.value,
                     editor_comment="Уточните <деталь>",
                     final_answer="",
                 )
@@ -1545,8 +1591,108 @@ async def test_single_comment_is_sent_only_for_needs_clarification(tmp_path):
     )
 
     await service.run_once()
+    first = await repository.get_submitted_application("A1B2C3D4")
+    await service.run_once()
+    second = await repository.get_submitted_application("A1B2C3D4")
+    await service.run_once()
 
-    assert "комментарий: Уточните &lt;деталь&gt;" in notifier.messages[0]["text"]
+    assert first is not None
+    assert first.pending_editor_comment == "Уточните <деталь>"
+    assert first.pending_editor_comment_seen_count == 1
+    assert second is not None
+    assert second.pending_editor_comment_seen_count == 2
+    assert len(notifier.messages) == 1
+    assert "Комментарий редактора по заявке" in notifier.messages[0]["text"]
+    assert "Уточните &lt;деталь&gt;" in notifier.messages[0]["text"]
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert tracked is not None
+    assert tracked.last_seen_editor_comment == "Уточните <деталь>"
+    assert tracked.pending_editor_comment is None
+    assert tracked.pending_editor_comment_seen_count == 0
+
+
+@pytest.mark.asyncio
+async def test_single_editor_comment_change_resets_stable_counter(tmp_path):
+    repository = DraftRepository(str(tmp_path / "clarification_comment_change.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+    )
+    current = SheetApplicationStatus(
+        application_id="A1B2C3D4",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name=WEEK_SHEET,
+        sheet_id=100,
+        row_number=7,
+        status=ApplicationStatus.IN_PROGRESS.value,
+        editor_comment="Черновик вопроса",
+        final_answer="",
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({"A1B2C3D4": current}),
+        notifier=notifier,
+    )
+
+    await service.run_once()
+    current.editor_comment = "Финальный вопрос"
+    await service.run_once()
+    second = await repository.get_submitted_application("A1B2C3D4")
+    await service.run_once()
+    await service.run_once()
+
+    assert second is not None
+    assert second.pending_editor_comment == "Финальный вопрос"
+    assert second.pending_editor_comment_seen_count == 1
+    assert len(notifier.messages) == 1
+    assert "Черновик вопроса" not in notifier.messages[0]["text"]
+    assert "Финальный вопрос" in notifier.messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_empty_editor_comment_clears_pending_without_notification(tmp_path):
+    repository = DraftRepository(str(tmp_path / "clarification_comment_empty.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+    )
+    current = SheetApplicationStatus(
+        application_id="A1B2C3D4",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name=WEEK_SHEET,
+        sheet_id=100,
+        row_number=7,
+        status=ApplicationStatus.IN_PROGRESS.value,
+        editor_comment="Черновик вопроса",
+        final_answer="",
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({"A1B2C3D4": current}),
+        notifier=notifier,
+    )
+
+    await service.run_once()
+    current.editor_comment = ""
+    await service.run_once()
+
+    tracked = await repository.get_submitted_application("A1B2C3D4")
+    assert notifier.messages == []
+    assert tracked is not None
+    assert tracked.pending_editor_comment is None
+    assert tracked.pending_editor_comment_seen_count == 0
 
 
 @pytest.mark.asyncio
@@ -1577,8 +1723,9 @@ async def test_urgent_scriptwriter_response_notifies_editor_chat(tmp_path):
                     sheet_id=100,
                     row_number=12,
                     status=ApplicationStatus.NEEDS_CLARIFICATION.value,
-                    editor_comment="Уточните детали",
-                    final_answer="Сценарист уточнил детали <важно>",
+                    editor_comment="",
+                    final_answer="",
+                    scriptwriter_response="Сценарист уточнил детали <важно>",
                     editor="Редактор",
                     direction=Direction.FL.value,
                     answer_type=AnswerType.URGENT.value,
@@ -1595,6 +1742,8 @@ async def test_urgent_scriptwriter_response_notifies_editor_chat(tmp_path):
     )
 
     await service.run_once()
+    await service.run_once()
+    await service.run_once()
 
     assert len(notifier.messages) == 1
     message = notifier.messages[0]
@@ -1607,7 +1756,7 @@ async def test_urgent_scriptwriter_response_notifies_editor_chat(tmp_path):
     assert "Открыть заявку" in message["text"]
     tracked = await repository.get_submitted_application("URGRESP1")
     assert tracked is not None
-    assert tracked.last_seen_final_answer == "Сценарист уточнил детали <важно>"
+    assert tracked.last_seen_scriptwriter_response == "Сценарист уточнил детали <важно>"
 
 
 @pytest.mark.asyncio
@@ -1635,7 +1784,8 @@ async def test_urgent_scriptwriter_response_is_not_duplicated(tmp_path):
                 row_number=12,
                 status=ApplicationStatus.NEEDS_CLARIFICATION.value,
                 editor_comment="",
-                final_answer="Один и тот же ответ",
+                final_answer="",
+                scriptwriter_response="Один и тот же ответ",
                 answer_type=AnswerType.URGENT.value,
                 is_urgent=True,
             )
@@ -1650,6 +1800,8 @@ async def test_urgent_scriptwriter_response_is_not_duplicated(tmp_path):
         editor_urgent_chat_id=-100123456,
     )
 
+    await service.run_once()
+    await service.run_once()
     await service.run_once()
     await service.run_once()
 
@@ -1681,7 +1833,8 @@ async def test_changed_urgent_scriptwriter_response_notifies_again(tmp_path):
         row_number=12,
         status=ApplicationStatus.NEEDS_CLARIFICATION.value,
         editor_comment="",
-        final_answer="Первый ответ",
+        final_answer="",
+        scriptwriter_response="Первый ответ",
         answer_type=AnswerType.URGENT.value,
         is_urgent=True,
     )
@@ -1696,7 +1849,11 @@ async def test_changed_urgent_scriptwriter_response_notifies_again(tmp_path):
     )
 
     await service.run_once()
-    current.final_answer = "Исправленный ответ"
+    await service.run_once()
+    await service.run_once()
+    current.scriptwriter_response = "Исправленный ответ"
+    await service.run_once()
+    await service.run_once()
     await service.run_once()
 
     assert len(notifier.messages) == 2
@@ -1732,7 +1889,8 @@ async def test_non_urgent_scriptwriter_response_does_not_notify_editor_chat(tmp_
                     row_number=12,
                     status=ApplicationStatus.NEEDS_CLARIFICATION.value,
                     editor_comment="",
-                    final_answer="Ответ по несрочной заявке",
+                    final_answer="",
+                    scriptwriter_response="Ответ по несрочной заявке",
                     answer_type=AnswerType.ROLLOUT.value,
                     is_urgent=False,
                 )
@@ -1744,11 +1902,13 @@ async def test_non_urgent_scriptwriter_response_does_not_notify_editor_chat(tmp_
     )
 
     await service.run_once()
+    await service.run_once()
+    await service.run_once()
 
     assert notifier.messages == []
     tracked = await repository.get_submitted_application("REGRESP1")
     assert tracked is not None
-    assert tracked.last_seen_final_answer == "Ответ по несрочной заявке"
+    assert tracked.last_seen_scriptwriter_response is None
 
 
 @pytest.mark.asyncio
@@ -1781,7 +1941,8 @@ async def test_urgent_chips_scriptwriter_response_notifies_editor_chat(tmp_path)
                     row_number=12,
                     status=ApplicationStatus.NEEDS_CLARIFICATION.value,
                     editor_comment="",
-                    final_answer="Ответ сценариста по CHIPS",
+                    final_answer="",
+                    scriptwriter_response="Ответ сценариста по CHIPS",
                     direction=Direction.FL.value,
                     answer_type=AnswerType.URGENT.value,
                     is_urgent=True,
@@ -1798,6 +1959,8 @@ async def test_urgent_chips_scriptwriter_response_notifies_editor_chat(tmp_path)
     )
 
     await service.run_once()
+    await service.run_once()
+    await service.run_once()
 
     assert len(notifier.messages) == 1
     assert notifier.messages[0]["chat_id"] == -100123456
@@ -1807,7 +1970,7 @@ async def test_urgent_chips_scriptwriter_response_notifies_editor_chat(tmp_path)
     assert "Итоговый ответ" not in notifier.messages[0]["text"]
     tracked = await repository.get_submitted_application("CHIPRESP")
     assert tracked is not None
-    assert tracked.last_seen_final_answer == "Ответ сценариста по CHIPS"
+    assert tracked.last_seen_scriptwriter_response == "Ответ сценариста по CHIPS"
 
 
 @pytest.mark.asyncio

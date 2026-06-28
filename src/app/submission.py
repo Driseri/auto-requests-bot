@@ -67,7 +67,7 @@ CURRENT_WORKSHEET_HEADERS = [
     "Редактор",
     *LEGACY_WORKSHEET_HEADERS[10:],
 ]
-WORKSHEET_HEADERS = [
+PREVIOUS_WORKSHEET_HEADERS = [
     "Закрепленный сценарист",
     "Интент",
     "Кейс или сообщения клиента",
@@ -93,7 +93,33 @@ WORKSHEET_HEADERS = [
     "LLM оценка",
     "Тип изменения",
 ]
-CHIPS_WORKSHEET_HEADERS = [
+WORKSHEET_HEADERS = [
+    "Закрепленный сценарист",
+    "Статус",
+    "Кейс или сообщения клиента",
+    "Суть изменений",
+    "Исходный текст",
+    "Итоговый ответ редактора",
+    "Комментарий качества",
+    "Вопросы/комментарии редактора",
+    "Ответ сценариста",
+    "Редактор",
+    "Интент",
+    "ID заявки",
+    "ID пачки",
+    "Тип заявки",
+    "Дата заявки",
+    "Направление",
+    "Тип ответа",
+    "Срочная",
+    "Автор заявки",
+    "Telegram ID",
+    "Исходная суть изменений",
+    "LLM статус",
+    "LLM оценка",
+    "Тип изменения",
+]
+PREVIOUS_CHIPS_WORKSHEET_HEADERS = [
     "Закрепленный сценарист",
     "Интент",
     "Причина",
@@ -105,6 +131,29 @@ CHIPS_WORKSHEET_HEADERS = [
     "Ответ сценариста",
     "Статус",
     "Редактор",
+    "ID заявки",
+    "ID пачки",
+    "Тип заявки",
+    "Дата заявки",
+    "Направление",
+    "Тип ответа",
+    "Срочная",
+    "Автор заявки",
+    "Telegram ID",
+    "Тип изменения",
+]
+CHIPS_WORKSHEET_HEADERS = [
+    "Закрепленный сценарист",
+    "Статус",
+    "Причина",
+    "Текст до чипса",
+    "Текст чипса",
+    "Текст после чипса",
+    "Комментарий качества",
+    "Вопросы/комментарии редактора",
+    "Ответ сценариста",
+    "Редактор",
+    "Интент",
     "ID заявки",
     "ID пачки",
     "Тип заявки",
@@ -153,7 +202,7 @@ CURRENT_SHEET_COLUMN_COUNT = len(CURRENT_WORKSHEET_HEADERS)
 SHEET_COLUMN_COUNT = len(WORKSHEET_HEADERS)
 DASHBOARD_SHEET_NAME = "Заявки"
 BATCH_DASHBOARD_SHEET_NAME = "Пачки"
-INTEGRATION_SHEET_NAME = "Интеграционные"
+INTEGRATION_SHEET_NAME = "Интеграции"
 URGENT_SHEET_NAME = "Срочные"
 ROLLOUT_SECTION_MARKERS = tuple(change_type.value for change_type in ChangeType)
 ALL_ROLLOUT_SECTION_MARKERS = (*ROLLOUT_SECTION_MARKERS, CHIPS_V2_MARKER)
@@ -765,6 +814,9 @@ class GoogleSheetsSubmissionService:
             raise SheetConfigurationError(
                 "Повреждена общая шапка листа срочных заявок."
             )
+        # Urgent sheets are mixed: ADD/EDIT rows stay in the top table, while
+        # CHIPS rows live in a dedicated lower section with a different schema.
+        # The marker is the boundary used when inserting ADD/EDIT before CHIPS.
         marker_positions = [
             index
             for index, row in enumerate(rows)
@@ -793,13 +845,18 @@ class GoogleSheetsSubmissionService:
                 marker_position,
                 len(CHIPS_WORKSHEET_HEADERS),
             )
+            chips_schema = "chips"
         else:
             marker_position = marker_positions[0]
             if (
                 marker_position == 0
                 or marker_position + 1 >= len(rows)
-                or not _is_chips_header(rows[marker_position + 1])
             ):
+                raise SheetConfigurationError(
+                    "Повреждена шапка секции CHIPS в листе срочных заявок."
+                )
+            chips_schema = _chips_sheet_schema(rows[marker_position + 1])
+            if chips_schema is None:
                 raise SheetConfigurationError(
                     "Повреждена шапка секции CHIPS в листе срочных заявок."
                 )
@@ -815,7 +872,7 @@ class GoogleSheetsSubmissionService:
             spreadsheetId=spreadsheet_id,
             body={"requests": formatting_requests},
         ).execute()
-        return "chips" if change_type == ChangeType.CHIPS else schema
+        return chips_schema if change_type == ChangeType.CHIPS else schema
 
     def _prepare_rollout_section(
         self,
@@ -838,17 +895,22 @@ class GoogleSheetsSubmissionService:
 
         if CHIPS_V2_MARKER in positions:
             position = positions[CHIPS_V2_MARKER]
-            if not _is_chips_header(rows[position + 1]):
+            schema = _chips_sheet_schema(rows[position + 1])
+            if schema is None:
                 raise SheetConfigurationError("Повреждена шапка секции CHIPS V2.")
-            return "chips", CHIPS_V2_MARKER
+            return schema, CHIPS_V2_MARKER
 
         position = positions[ChangeType.CHIPS.value]
         header = rows[position + 1]
-        if _is_chips_header(header):
-            return "chips", ChangeType.CHIPS.value
+        schema = _chips_sheet_schema(header)
+        if schema is not None:
+            return schema, ChangeType.CHIPS.value
         if _working_sheet_schema(header) is None:
             raise SheetConfigurationError("Повреждена шапка секции CHIPS.")
 
+        # Legacy rollout tabs used a regular ADD/EDIT header under the CHIPS
+        # marker. Empty legacy sections can be upgraded in place; non-empty
+        # sections keep their old rows and receive a new CHIPS V2 section.
         following_markers = sorted(
             marker_position
             for marker_position in positions.values()
@@ -1032,6 +1094,8 @@ class GoogleSheetsSubmissionService:
                 }
             ]
         else:
+            # ADD/EDIT urgent rows must be inserted above the CHIPS marker so
+            # the lower CHIPS section remains a clean independent table.
             row_number = marker_position + 1
             requests = [
                 {
@@ -1600,6 +1664,71 @@ def draft_to_sheet_row(
 ) -> list[Any]:
     return [
         draft.scriptwriter or "",
+        ApplicationStatus.NEW.value,
+        draft.reason or "",
+        draft.formatted_change_description or draft.raw_change_description or "",
+        draft.source_text or "",
+        "",
+        "",
+        "",
+        "",
+        EDITOR_NOT_SELECTED,
+        draft.intent or "",
+        draft.application_id or "",
+        batch_id,
+        draft.application_type or ApplicationType.SINGLE.value,
+        submitted_at or draft.created_at,
+        draft.direction or "",
+        draft.answer_type or "",
+        bool_to_sheet_value(draft.is_urgent),
+        draft.author_name or draft.scriptwriter or "",
+        draft.telegram_user_id,
+        draft.raw_change_description or "",
+        draft.llm_check_status or "",
+        draft.llm_score if draft.llm_score is not None else "",
+        draft.change_type or "",
+    ]
+
+
+def chips_draft_to_sheet_row(
+    draft: Draft,
+    *,
+    batch_id: str = "",
+    submitted_at: datetime | str | None = None,
+) -> list[Any]:
+    return [
+        draft.scriptwriter or "",
+        ApplicationStatus.NEW.value,
+        draft.reason or "",
+        draft.chip_text_before or "",
+        draft.chip_text or "",
+        draft.chip_text_after or "",
+        "",
+        "",
+        "",
+        EDITOR_NOT_SELECTED,
+        draft.intent or "",
+        draft.application_id or "",
+        batch_id,
+        draft.application_type or ApplicationType.SINGLE.value,
+        submitted_at or draft.created_at,
+        draft.direction or "",
+        draft.answer_type or "",
+        bool_to_sheet_value(draft.is_urgent),
+        draft.author_name or draft.scriptwriter or "",
+        draft.telegram_user_id,
+        ChangeType.CHIPS.value,
+    ]
+
+
+def _previous_draft_to_sheet_row(
+    draft: Draft,
+    *,
+    batch_id: str = "",
+    submitted_at: datetime | str | None = None,
+) -> list[Any]:
+    return [
+        draft.scriptwriter or "",
         draft.intent or "",
         draft.reason or "",
         draft.formatted_change_description or draft.raw_change_description or "",
@@ -1626,7 +1755,7 @@ def draft_to_sheet_row(
     ]
 
 
-def chips_draft_to_sheet_row(
+def _previous_chips_draft_to_sheet_row(
     draft: Draft,
     *,
     batch_id: str = "",
@@ -1888,8 +2017,20 @@ def _draft_to_row_data(
             batch_id=batch_id,
             submitted_at=submitted_at,
         )
+    elif schema == "previous_chips":
+        row = _previous_chips_draft_to_sheet_row(
+            draft,
+            batch_id=batch_id,
+            submitted_at=submitted_at,
+        )
     elif schema == "new":
         row = draft_to_sheet_row(
+            draft,
+            batch_id=batch_id,
+            submitted_at=submitted_at,
+        )
+    elif schema == "previous_new":
+        row = _previous_draft_to_sheet_row(
             draft,
             batch_id=batch_id,
             submitted_at=submitted_at,
@@ -1923,7 +2064,7 @@ def _draft_to_row_data(
             isinstance(layout["source_text"], tuple)
             and index in layout["source_text"]
         ):
-            if schema == "chips":
+            if schema in {"chips", "previous_chips"}:
                 formatting_by_index = {
                     3: draft.chip_text_before_formatting_json,
                     4: draft.chip_text_formatting_json,
@@ -1950,6 +2091,24 @@ def _worksheet_schema_layout(schema: str) -> dict[str, Any]:
     layouts = {
         "new": {
             "date": 14,
+            "status": 1,
+            "editor": 9,
+            "source_text": 4,
+            "telegram_id": 19,
+            "llm_score": 22,
+            "end_column": "X",
+        },
+        "chips": {
+            "date": 14,
+            "status": 1,
+            "editor": 9,
+            "source_text": (3, 4, 5),
+            "telegram_id": 19,
+            "llm_score": -1,
+            "end_column": "U",
+        },
+        "previous_new": {
+            "date": 14,
             "status": 9,
             "editor": 10,
             "source_text": 4,
@@ -1957,7 +2116,7 @@ def _worksheet_schema_layout(schema: str) -> dict[str, Any]:
             "llm_score": 22,
             "end_column": "X",
         },
-        "chips": {
+        "previous_chips": {
             "date": 14,
             "status": 9,
             "editor": 10,
@@ -2183,15 +2342,15 @@ def worksheet_formatting_requests(
         _basic_filter_request(sheet_id, SHEET_COLUMN_COUNT),
         _column_width_request(sheet_id, 0, SHEET_COLUMN_COUNT, 170),
         _column_width_request(sheet_id, 10, 19, 300),
-        _status_dropdown_request(sheet_id, status_column_index=9),
+        _status_dropdown_request(sheet_id, status_column_index=1),
         _editor_dropdown_request(
             sheet_id,
-            editor_column_index=10,
+            editor_column_index=9,
             application_editors=application_editors,
         ),
         _right_border_request(sheet_id, column_index=10),
     ]
-    requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=9))
+    requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=1))
     requests.append(_urgent_conditional_formatting_request(sheet_id))
     return requests
 
@@ -2203,6 +2362,12 @@ def sectioned_worksheet_formatting_requests(
     requests: list[dict[str, Any]] = [
         _column_width_request(sheet_id, 0, SHEET_COLUMN_COUNT, 170),
         _column_width_request(sheet_id, 10, 19, 300),
+        _status_dropdown_request(sheet_id, status_column_index=1),
+        _editor_dropdown_request(
+            sheet_id,
+            editor_column_index=9,
+            application_editors=application_editors,
+        ),
         _right_border_request(sheet_id, column_index=10),
     ]
     for marker_row_index in (0, 2, 4):
@@ -2259,7 +2424,7 @@ def sectioned_worksheet_formatting_requests(
                 }
             }
         )
-    requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=9))
+    requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=1))
     requests.append(_urgent_conditional_formatting_request(sheet_id))
     return requests
 
@@ -2638,6 +2803,8 @@ def _working_sheet_schema(header_row: list[Any]) -> str | None:
     headers = [str(value).strip() for value in header_row]
     if headers[: len(WORKSHEET_HEADERS)] == WORKSHEET_HEADERS:
         return "new"
+    if headers[: len(PREVIOUS_WORKSHEET_HEADERS)] == PREVIOUS_WORKSHEET_HEADERS:
+        return "previous_new"
     if headers[: len(CURRENT_WORKSHEET_HEADERS)] == CURRENT_WORKSHEET_HEADERS:
         return "current"
     if headers[: len(LEGACY_WORKSHEET_HEADERS)] == LEGACY_WORKSHEET_HEADERS:
@@ -2646,8 +2813,16 @@ def _working_sheet_schema(header_row: list[Any]) -> str | None:
 
 
 def _is_chips_header(header_row: list[Any]) -> bool:
+    return _chips_sheet_schema(header_row) is not None
+
+
+def _chips_sheet_schema(header_row: list[Any]) -> str | None:
     headers = [str(value).strip() for value in header_row]
-    return headers[: len(CHIPS_WORKSHEET_HEADERS)] == CHIPS_WORKSHEET_HEADERS
+    if headers[: len(CHIPS_WORKSHEET_HEADERS)] == CHIPS_WORKSHEET_HEADERS:
+        return "chips"
+    if headers[: len(PREVIOUS_CHIPS_WORKSHEET_HEADERS)] == PREVIOUS_CHIPS_WORKSHEET_HEADERS:
+        return "previous_chips"
+    return None
 
 
 def _rollout_marker_positions(rows: list[list[Any]]) -> dict[str, int]:

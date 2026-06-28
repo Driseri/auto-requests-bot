@@ -9,7 +9,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from time import monotonic
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape
 from typing import Any, Callable, Protocol
 
@@ -45,6 +45,8 @@ from app.submission import (
     DirectionSpreadsheetConfig,
     EDITOR_NOT_SELECTED,
     LEGACY_WORKSHEET_HEADERS,
+    PREVIOUS_CHIPS_WORKSHEET_HEADERS,
+    PREVIOUS_WORKSHEET_HEADERS,
     WORKSHEET_HEADERS,
     build_google_sheets_api,
     dashboard_bulk_batch_row,
@@ -58,8 +60,8 @@ LOGGER = logging.getLogger(__name__)
 URGENT_EDITOR_NOTIFICATION_EVENT_TYPE = "urgent-editor-application-created"
 URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE = "urgent-editor-scriptwriter-response"
 SCRIPTWRITER_RESPONSE_PREVIEW_LIMIT = 1800
+STABLE_NOTIFICATION_POLLS = 3
 SINGLE_IMPORTANT_STATUSES = {
-    ApplicationStatus.NEEDS_CLARIFICATION.value,
     ApplicationStatus.FINAL_ANSWER_READY.value,
     ApplicationStatus.ACCEPTED.value,
     ApplicationStatus.REJECTED.value,
@@ -76,6 +78,49 @@ def _unique_batches(batches: list[BulkBatch]) -> list[BulkBatch]:
         seen.add(batch.batch_id)
         result.append(batch)
     return result
+
+
+def _stable_text_field_change(
+    *,
+    current_value: str | None,
+    last_sent_value: str | None,
+    pending_value: str | None,
+    pending_seen_count: int,
+    pending_field: str,
+    pending_count_field: str,
+    last_sent_field: str,
+    stable_polls: int = STABLE_NOTIFICATION_POLLS,
+) -> StableFieldChange:
+    value = (current_value or "").strip()
+    last_sent = (last_sent_value or "").strip()
+    if not value or value == last_sent:
+        return StableFieldChange(
+            ready=False,
+            updates={
+                pending_field: None,
+                pending_count_field: 0,
+            },
+        )
+    if value == (pending_value or "").strip():
+        next_count = pending_seen_count + 1
+    else:
+        next_count = 1
+    if next_count >= stable_polls:
+        return StableFieldChange(
+            ready=True,
+            updates={
+                last_sent_field: value,
+                pending_field: None,
+                pending_count_field: 0,
+            },
+        )
+    return StableFieldChange(
+        ready=False,
+        updates={
+            pending_field: value,
+            pending_count_field: next_count,
+        },
+    )
 
 
 class TelegramNotifierProtocol(Protocol):
@@ -100,6 +145,7 @@ class SheetApplicationStatus:
     status: str
     editor_comment: str
     final_answer: str
+    scriptwriter_response: str = ""
     editor: str = ""
     batch_id: str | None = None
     direction: str | None = None
@@ -158,6 +204,14 @@ class StatusNotification:
     status_changed: bool
     final_answer_changed: bool
     editor_changed: bool = False
+    editor_comment_ready: bool = False
+    stable_tracking_updates: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class StableFieldChange:
+    ready: bool
+    updates: dict[str, Any]
 
 
 class GoogleSheetsStatusReader:
@@ -275,6 +329,10 @@ class GoogleSheetsStatusReader:
                         editor=_cell(row, layout["editor"]).strip(),
                         editor_comment=_cell(row, layout["comment"]).strip(),
                         final_answer=_cell(row, layout["final_answer"]).strip(),
+                        scriptwriter_response=_cell(
+                            row,
+                            layout.get("scriptwriter_response", -1),
+                        ).strip(),
                         end_column=layout["end_column"],
                     )
         return result
@@ -543,6 +601,10 @@ class GoogleSheetsStatusReader:
                 editor=_cell(row, layout["editor"]).strip(),
                 editor_comment=_cell(row, layout["comment"]).strip(),
                 final_answer=_cell(row, layout["final_answer"]).strip(),
+                scriptwriter_response=_cell(
+                    row,
+                    layout.get("scriptwriter_response", -1),
+                ).strip(),
                 end_column=layout["end_column"],
             )
 
@@ -979,6 +1041,10 @@ class StatusNotificationService:
         for application in tracked:
             current = statuses.get(application.application_id)
             if current is None:
+                # A missing row is meaningful only when its source was actually
+                # scanned in this polling iteration. Completed bulk batches are
+                # checked by the archive scan, so their child rows must not
+                # accumulate false not_found counters between archive passes.
                 if application.batch_id and application.batch_id not in scanned_batch_ids:
                     continue
                 if (
@@ -1014,6 +1080,9 @@ class StatusNotificationService:
                 ChangeType.normalize(current.change_type or application.change_type)
                 == ChangeType.CHIPS
             )
+            # CHIPS uses "Ответ сценариста" for clarification replies, not as
+            # the regular final-answer signal that triggers scenario-writer
+            # notifications for ADD/EDIT rows.
             if application.batch_id or is_chips:
                 final_answer_changed = False
             else:
@@ -1022,30 +1091,50 @@ class StatusNotificationService:
                     and current.status == ApplicationStatus.FINAL_ANSWER_READY.value
                     and bool(current.final_answer)
                 )
+            stable_updates: dict[str, Any] = {}
+            editor_comment_change = StableFieldChange(False, {})
+            scriptwriter_response_change = StableFieldChange(False, {})
+            if not application.batch_id:
+                editor_comment_change = _stable_text_field_change(
+                    current_value=current.editor_comment,
+                    last_sent_value=application.last_seen_editor_comment,
+                    pending_value=application.pending_editor_comment,
+                    pending_seen_count=application.pending_editor_comment_seen_count,
+                    pending_field="pending_editor_comment",
+                    pending_count_field="pending_editor_comment_seen_count",
+                    last_sent_field="last_seen_editor_comment",
+                )
+                stable_updates.update(editor_comment_change.updates)
+                scriptwriter_response_change = self._scriptwriter_response_change(
+                    application,
+                    current,
+                )
+                stable_updates.update(scriptwriter_response_change.updates)
             notification = StatusNotification(
                 tracked=application,
                 current=current,
                 status_changed=status_changed,
                 final_answer_changed=final_answer_changed,
                 editor_changed=editor_changed,
+                editor_comment_ready=editor_comment_change.ready,
+                stable_tracking_updates=stable_updates,
             )
-            scriptwriter_response_event = self._urgent_scriptwriter_response_event(
-                notification
+            scriptwriter_response_event = (
+                self._urgent_scriptwriter_response_event(notification)
+                if scriptwriter_response_change.ready
+                else None
             )
             should_notify_user = self._should_notify(notification)
             if scriptwriter_response_event is not None:
                 await self.repository.enqueue_notification_event(
                     **scriptwriter_response_event,
-                    application_updates=(
-                        []
-                        if should_notify_user
-                        else [
-                            self._application_tracking_update(
-                                notification.tracked,
-                                notification.current,
-                            )
-                        ]
-                    ),
+                    application_updates=[
+                        self._application_tracking_update(
+                            notification.tracked,
+                            notification.current,
+                            stable_updates=notification.stable_tracking_updates,
+                        )
+                    ],
                     dashboard_projections=(
                         []
                         if should_notify_user
@@ -1060,7 +1149,17 @@ class StatusNotificationService:
                 )
                 if not should_notify_user:
                     continue
-            if not status_changed and not final_answer_changed and not editor_changed:
+            tracking_fields_changed = self._stable_tracking_updates_changed(
+                application,
+                stable_updates,
+            )
+            if (
+                not status_changed
+                and not final_answer_changed
+                and not editor_changed
+                and not notification.editor_comment_ready
+                and not tracking_fields_changed
+            ):
                 non_notified_updates.append(
                     notification
                 )
@@ -1076,7 +1175,11 @@ class StatusNotificationService:
         if non_notified_updates:
             await self.repository.update_application_tracking_batch(
                 [
-                    self._application_tracking_update(item.tracked, item.current)
+                    self._application_tracking_update(
+                        item.tracked,
+                        item.current,
+                        stable_updates=item.stable_tracking_updates,
+                    )
                     for item in non_notified_updates
                 ],
                 dashboard_projections=self._tracking_dashboard_projections(
@@ -1103,7 +1206,11 @@ class StatusNotificationService:
                 snapshot_json=snapshot_json,
                 chunks=_split_html_message(text, self.notification_message_max_chars),
                 application_updates=[
-                    self._application_tracking_update(item.tracked, item.current)
+                    self._application_tracking_update(
+                        item.tracked,
+                        item.current,
+                        stable_updates=item.stable_tracking_updates,
+                    )
                     for item in notifications
                 ],
                 dashboard_projections=self._tracking_dashboard_projections(
@@ -1264,16 +1371,53 @@ class StatusNotificationService:
     def _should_notify(self, notification: StatusNotification) -> bool:
         if notification.final_answer_changed:
             return True
+        if notification.editor_comment_ready and not notification.tracked.batch_id:
+            return True
         if not notification.status_changed:
             return False
         if notification.tracked.batch_id:
             return notification.current.status == BulkApplicationStatus.NEEDS_CLARIFICATION.value
         return notification.current.status in SINGLE_IMPORTANT_STATUSES
 
+    @staticmethod
+    def _stable_tracking_updates_changed(
+        tracked: SubmittedApplication,
+        updates: dict[str, Any],
+    ) -> bool:
+        return any(getattr(tracked, key) != value for key, value in updates.items())
+
+    def _scriptwriter_response_change(
+        self,
+        tracked: SubmittedApplication,
+        current: SheetApplicationStatus,
+    ) -> StableFieldChange:
+        if not self.urgent_editor_notifications_enabled or self.editor_urgent_chat_id is None:
+            return StableFieldChange(False, {})
+        if tracked.batch_id or current.batch_id:
+            return StableFieldChange(False, {})
+        is_urgent = (
+            current.answer_type == AnswerType.URGENT.value
+            or tracked.answer_type == AnswerType.URGENT.value
+            or current.is_urgent is True
+            or tracked.is_urgent is True
+        )
+        if not is_urgent:
+            return StableFieldChange(False, {})
+        return _stable_text_field_change(
+            current_value=current.scriptwriter_response,
+            last_sent_value=tracked.last_seen_scriptwriter_response,
+            pending_value=tracked.pending_scriptwriter_response,
+            pending_seen_count=tracked.pending_scriptwriter_response_seen_count,
+            pending_field="pending_scriptwriter_response",
+            pending_count_field="pending_scriptwriter_response_seen_count",
+            last_sent_field="last_seen_scriptwriter_response",
+        )
+
     def _urgent_scriptwriter_response_event(
         self,
         notification: StatusNotification,
     ) -> dict[str, Any] | None:
+        """Build editor-chat event when a writer answers an urgent clarification."""
         if not self.urgent_editor_notifications_enabled:
             return None
         if self.editor_urgent_chat_id is None:
@@ -1290,12 +1434,10 @@ class StatusNotificationService:
         )
         if not is_urgent:
             return None
-        if current.status != ApplicationStatus.NEEDS_CLARIFICATION.value:
-            return None
-        scriptwriter_response = (current.final_answer or "").strip()
+        scriptwriter_response = (current.scriptwriter_response or "").strip()
         if not scriptwriter_response:
             return None
-        if scriptwriter_response == (tracked.last_seen_final_answer or "").strip():
+        if scriptwriter_response == (tracked.last_seen_scriptwriter_response or "").strip():
             return None
 
         response_hash = hashlib.sha256(
@@ -1642,7 +1784,10 @@ class StatusNotificationService:
     def _application_tracking_update(
         tracked: SubmittedApplication,
         current: SheetApplicationStatus,
+        *,
+        stable_updates: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        stable_updates = stable_updates or {}
         return {
             "application_id": tracked.application_id,
             "spreadsheet_id": current.spreadsheet_id,
@@ -1651,8 +1796,31 @@ class StatusNotificationService:
             "last_known_status": current.status or tracked.last_known_status,
             "last_seen_row_number": current.row_number,
             "last_seen_editor": current.editor or EDITOR_NOT_SELECTED,
-            "last_seen_editor_comment": current.editor_comment,
+            "last_seen_editor_comment": stable_updates.get(
+                "last_seen_editor_comment",
+                tracked.last_seen_editor_comment,
+            ),
             "last_seen_final_answer": current.final_answer,
+            "last_seen_scriptwriter_response": stable_updates.get(
+                "last_seen_scriptwriter_response",
+                tracked.last_seen_scriptwriter_response,
+            ),
+            "pending_editor_comment": stable_updates.get(
+                "pending_editor_comment",
+                tracked.pending_editor_comment,
+            ),
+            "pending_editor_comment_seen_count": stable_updates.get(
+                "pending_editor_comment_seen_count",
+                tracked.pending_editor_comment_seen_count,
+            ),
+            "pending_scriptwriter_response": stable_updates.get(
+                "pending_scriptwriter_response",
+                tracked.pending_scriptwriter_response,
+            ),
+            "pending_scriptwriter_response_seen_count": stable_updates.get(
+                "pending_scriptwriter_response_seen_count",
+                tracked.pending_scriptwriter_response_seen_count,
+            ),
             "change_type": current.change_type or tracked.change_type,
         }
 
@@ -1713,12 +1881,14 @@ class StatusNotificationService:
             result.append("")
             result.append(f"<b>Итоговый ответ по заявке {self._application_link(current)}</b>")
             result.append(_render_answer_block(current.final_answer, self._row_link(current)))
-        if (
-            current.editor_comment
-            and notification.status_changed
-            and current.status == ApplicationStatus.NEEDS_CLARIFICATION.value
-        ):
-            result[-1] += f"; комментарий: {escape(current.editor_comment)}"
+        if current.editor_comment and notification.editor_comment_ready:
+            result.append("")
+            result.append(
+                f"<b>Комментарий редактора по заявке {self._application_link(current)}</b>"
+            )
+            if current.status:
+                result.append(f"<b>Статус:</b> {escape(current.status)}")
+            result.append(f"<blockquote>{escape(current.editor_comment)}</blockquote>")
         return result
 
     async def _render_bulk_clarification_lines(
@@ -2025,6 +2195,7 @@ def _status_from_working_row(
         editor=_cell(row, layout["editor"]).strip(),
         editor_comment=_cell(row, layout["comment"]).strip(),
         final_answer=_cell(row, layout["final_answer"]).strip(),
+        scriptwriter_response=_cell(row, layout.get("scriptwriter_response", -1)).strip(),
         end_column=layout["end_column"],
     )
 
@@ -2039,10 +2210,29 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "direction": 15,
             "answer_type": 16,
             "is_urgent": 17,
+            "status": 1,
+            "editor": 9,
+            "comment": 7,
+            "final_answer": -1,
+            "scriptwriter_response": 8,
+            "change_type": 20,
+            "scriptwriter": 0,
+            "intent": 10,
+            "end_column": "U",
+        }
+    if headers[: len(PREVIOUS_CHIPS_WORKSHEET_HEADERS)] == PREVIOUS_CHIPS_WORKSHEET_HEADERS:
+        return {
+            "application_id": 11,
+            "batch_id": 12,
+            "application_type": 13,
+            "direction": 15,
+            "answer_type": 16,
+            "is_urgent": 17,
             "status": 9,
             "editor": 10,
             "comment": 7,
-            "final_answer": 8,
+            "final_answer": -1,
+            "scriptwriter_response": 8,
             "change_type": 20,
             "scriptwriter": 0,
             "intent": 1,
@@ -2056,10 +2246,29 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "direction": 15,
             "answer_type": 16,
             "is_urgent": 17,
+            "status": 1,
+            "editor": 9,
+            "comment": 7,
+            "final_answer": 5,
+            "scriptwriter_response": 8,
+            "change_type": 23,
+            "scriptwriter": 0,
+            "intent": 10,
+            "end_column": "X",
+        }
+    if headers[: len(PREVIOUS_WORKSHEET_HEADERS)] == PREVIOUS_WORKSHEET_HEADERS:
+        return {
+            "application_id": 11,
+            "batch_id": 12,
+            "application_type": 13,
+            "direction": 15,
+            "answer_type": 16,
+            "is_urgent": 17,
             "status": 9,
             "editor": 10,
             "comment": 7,
             "final_answer": 5,
+            "scriptwriter_response": 8,
             "change_type": 23,
             "scriptwriter": 0,
             "intent": 1,
@@ -2077,6 +2286,7 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "editor": 10,
             "comment": 17,
             "final_answer": 19,
+            "scriptwriter_response": 18,
             "change_type": 22,
             "scriptwriter": 12,
             "intent": 11,
@@ -2094,6 +2304,7 @@ def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
             "editor": -1,
             "comment": 16,
             "final_answer": 18,
+            "scriptwriter_response": 17,
             "change_type": 21,
             "scriptwriter": 11,
             "intent": 10,

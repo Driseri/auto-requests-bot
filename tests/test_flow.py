@@ -191,6 +191,24 @@ async def test_change_description_prompt_explains_expected_detail(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_source_text_prompt_uses_proposed_text_label(tmp_path):
+    flow, _, _, _ = await make_flow(tmp_path)
+    await flow.start_single(14)
+    await flow.select_direction(14, Direction.FL)
+    await flow.select_answer_type(14, AnswerType.ROLLOUT)
+    await flow.select_change_type(14, ChangeType.ADD)
+    await flow.handle_text(14, "intent.change_limit")
+    await flow.handle_text(14, "Иван Иванов")
+    await flow.handle_text(14, "Клиентское сообщение")
+
+    response = await flow.handle_text(14, "Обновить срок ответа")
+
+    assert response.keyboard == KeyboardKind.STEP
+    assert "Пришлите предлагаемый текст" in response.text
+    assert "Пришлите исходный текст" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_missing_reason_uses_client_case_label(tmp_path):
     flow, repository, _, _ = await make_flow(tmp_path)
     await fill_to_review(flow, 13)
@@ -661,6 +679,17 @@ async def test_edit_text_field_returns_to_review(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_edit_source_text_prompt_uses_proposed_text_label(tmp_path):
+    flow, _, _, _ = await make_flow(tmp_path)
+    await fill_to_review(flow, 151)
+
+    prompt = await flow.select_edit_field(151, FieldName.SOURCE_TEXT)
+
+    assert "Введите новый предлагаемый текст" in prompt.text
+    assert "Введите новый исходный текст" not in prompt.text
+
+
+@pytest.mark.asyncio
 async def test_edit_urgency_returns_to_review(tmp_path):
     flow, repository, _, _ = await make_flow(tmp_path)
     await fill_to_review(flow, 16)
@@ -1050,7 +1079,7 @@ async def test_incomplete_change_description_asks_one_clarification(tmp_path):
     second_response = await flow.handle_text(18, "Нужно указать 5 рабочих дней")
     draft = await repository.get_by_user_id(18)
 
-    assert "исходный текст" in second_response.text.lower()
+    assert "Пришлите предлагаемый текст" in second_response.text
     assert draft is not None
     assert draft.current_step == Step.SOURCE_TEXT
     assert draft.clarification_count == 1
