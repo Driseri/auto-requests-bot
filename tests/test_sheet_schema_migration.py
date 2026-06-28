@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.models import ApplicationStatus
 from app.sheet_schema_migration import (
+    _configured_spreadsheets,
     build_update_cells_request,
     find_sheet_schema_migrations,
 )
@@ -23,6 +24,21 @@ def row(values: list[str]) -> list[dict]:
 
 def values(cells: list[dict]) -> list[str]:
     return [item.get("userEnteredValue", {}).get("stringValue", "") for item in cells]
+
+
+def test_configured_spreadsheets_reads_settings_fields():
+    class Settings:
+        google_fl_spreadsheet_id = "fl-sheet"
+        google_sme_spreadsheet_id = "sme-sheet"
+        google_ai_spreadsheet_id = "ai-sheet"
+        google_voice_collection_spreadsheet_id = "voice-collection-sheet"
+
+    assert _configured_spreadsheets(Settings()) == {
+        "fl": "fl-sheet",
+        "sme": "sme-sheet",
+        "ai": "ai-sheet",
+        "voice_collection": "voice-collection-sheet",
+    }
 
 
 def test_find_sheet_schema_migrations_detects_previous_add_edit_and_chips_sections():

@@ -9,9 +9,7 @@ from typing import Any, Iterable
 
 from app.config import load_settings
 from app.google_api import execute_with_retry
-from app.models import Direction
 from app.submission import (
-    DirectionSpreadsheetConfig,
     PREVIOUS_CHIPS_WORKSHEET_HEADERS,
     PREVIOUS_WORKSHEET_HEADERS,
     build_google_sheets_api,
@@ -295,17 +293,11 @@ def _copy_cells(cells: list[dict[str, Any]], indexes: Iterable[int]) -> list[dic
 
 
 def _configured_spreadsheets(settings: Any) -> dict[str, str]:
-    config = DirectionSpreadsheetConfig(
-        fl_spreadsheet_id=settings.google_fl_spreadsheet_id,
-        sme_spreadsheet_id=settings.google_sme_spreadsheet_id,
-        ai_spreadsheet_id=settings.google_ai_spreadsheet_id,
-        voice_collection_spreadsheet_id=settings.google_voice_collection_spreadsheet_id,
-    )
     return {
-        "fl": config.for_direction(Direction.FL),
-        "sme": config.for_direction(Direction.SME),
-        "ai": config.for_direction(Direction.AI),
-        "voice_collection": config.for_direction(Direction.VOICEBOT),
+        "fl": settings.google_fl_spreadsheet_id,
+        "sme": settings.google_sme_spreadsheet_id,
+        "ai": settings.google_ai_spreadsheet_id,
+        "voice_collection": settings.google_voice_collection_spreadsheet_id,
     }
 
 
