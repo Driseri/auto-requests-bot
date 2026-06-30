@@ -13,6 +13,7 @@ from app.models import (
     ApplicationStatus,
     ApplicationType,
     BulkBatch,
+    BulkReservationState,
     ChangeType,
     DashboardOutboxItem,
     Direction,
@@ -54,6 +55,7 @@ from app.submission import (
     target_sheet_name,
     week_sheet_name,
 )
+from app.repository import DraftRepository
 
 
 FL_SPREADSHEET = "fl-spreadsheet"
@@ -303,6 +305,7 @@ def make_service(
     dashboard: bool = False,
     clock=None,
     rollout_schedule: RolloutSchedule | None = None,
+    repository: DraftRepository | None = None,
 ) -> GoogleSheetsSubmissionService:
     return GoogleSheetsSubmissionService(
         direction_spreadsheets=DirectionSpreadsheetConfig(
@@ -316,6 +319,7 @@ def make_service(
         sheets_api=api,
         clock=clock or (lambda: datetime(2026, 6, 3, 10, 59, 59, tzinfo=timezone.utc)),
         rollout_schedule=rollout_schedule or RolloutSchedule.from_strings(),
+        repository=repository,
     )
 
 
@@ -588,6 +592,117 @@ async def test_new_urgent_sheet_creates_chips_section_and_inserts_add_above_it()
     assert requests[1]["updateCells"]["range"]["startRowIndex"] == 1
     assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 2
     assert result.row_number == 2
+
+
+@pytest.mark.asyncio
+async def test_single_submission_returns_retry_message_when_section_lock_is_busy(tmp_path):
+    repository = DraftRepository(str(tmp_path / "single_section_lock_busy.db"))
+    await repository.init()
+    api = FakeSheetsApi()
+    service = make_service(api, repository=repository)
+    acquired = await repository.acquire_bulk_section_lock(
+        lock_key=f"{FL_SPREADSHEET}:Срочные:urgent:main",
+        owner="bulk:RES-BUSY",
+        ttl_seconds=600,
+    )
+
+    result = await service.submit(urgent_draft(ChangeType.ADD))
+
+    assert acquired is True
+    assert result.success is False
+    assert "другой пользователь вносит строки" in result.message
+    assert api.batch_updates == []
+
+
+@pytest.mark.asyncio
+async def test_single_submission_different_section_is_not_blocked_by_lock(tmp_path):
+    repository = DraftRepository(str(tmp_path / "single_section_lock_different.db"))
+    await repository.init()
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 42}},
+        headers={(FL_SPREADSHEET, "Срочные"): SHEET_HEADERS},
+        rows={
+            (FL_SPREADSHEET, "Срочные"): [
+                SHEET_HEADERS,
+                [ChangeType.CHIPS.value],
+                CHIPS_WORKSHEET_HEADERS,
+            ]
+        },
+    )
+    service = make_service(api, repository=repository)
+    acquired = await repository.acquire_bulk_section_lock(
+        lock_key=f"{FL_SPREADSHEET}:Срочные:urgent:main",
+        owner="bulk:RES-BUSY",
+        ttl_seconds=600,
+    )
+
+    result = await service.submit(urgent_draft(ChangeType.CHIPS))
+
+    assert acquired is True
+    assert result.success is True
+    assert result.row_number == 4
+
+
+@pytest.mark.asyncio
+async def test_single_submission_shift_rows_after_insert_dimension(tmp_path):
+    repository = DraftRepository(str(tmp_path / "single_shift_rows.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="EXISTING1",
+        telegram_user_id=200,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=42,
+        sheet_name="Срочные",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=5,
+    )
+    await repository.create_bulk_reservation(
+        reservation_id="RES-BELOW",
+        idempotency_key="RES-BELOW-key",
+        telegram_user_id=300,
+    )
+    await repository.update_bulk_reservation_step(
+        "RES-BELOW",
+        state=BulkReservationState.CREATED,
+        direction=Direction.FL.value,
+        target_kind="urgent",
+        change_type=ChangeType.CHIPS.value,
+        requested_count=3,
+    )
+    await repository.complete_bulk_reservation_creation(
+        "RES-BELOW",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=42,
+        sheet_name="Срочные",
+        start_row=7,
+        end_row=9,
+        insert_url="https://example.test",
+    )
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 42}},
+        headers={(FL_SPREADSHEET, "Срочные"): SHEET_HEADERS},
+        rows={
+            (FL_SPREADSHEET, "Срочные"): [
+                SHEET_HEADERS,
+                draft_to_sheet_row(urgent_draft(ChangeType.ADD, application_id="OLDROW001")),
+                [ChangeType.CHIPS.value],
+                CHIPS_WORKSHEET_HEADERS,
+            ]
+        },
+    )
+    service = make_service(api, repository=repository)
+
+    result = await service.submit(urgent_draft(ChangeType.EDIT, application_id="NEWEDIT1"))
+
+    assert result.success is True
+    assert result.row_number == 3
+    existing = await repository.get_submitted_application("EXISTING1")
+    reservation = await repository.get_bulk_reservation("RES-BELOW")
+    assert existing is not None
+    assert existing.last_seen_row_number == 6
+    assert reservation is not None
+    assert reservation.start_row == 8
+    assert reservation.end_row == 10
 
 
 @pytest.mark.asyncio
@@ -1136,6 +1251,24 @@ def test_chips_row_preserves_rich_text_in_all_three_fragments():
     assert cells[4]["textFormatRuns"][0]["startIndex"] == 0
     assert cells[4]["textFormatRuns"][1]["format"]["strikethrough"] is True
     assert cells[5]["textFormatRuns"][0]["format"]["bold"] is True
+
+
+def test_chips_row_status_has_no_background_fill():
+    row_data = _draft_to_row_data(
+        make_draft(
+            change_type=ChangeType.CHIPS.value,
+            chip_text_before="before",
+            chip_text="chip",
+            chip_text_after="after",
+        ),
+        schema="chips",
+    )
+
+    status_cell = row_data["values"][1]
+    assert status_cell["userEnteredValue"] == {"stringValue": ApplicationStatus.NEW.value}
+    assert "dataValidation" in status_cell
+    assert status_cell["userEnteredFormat"]["textFormat"]["bold"] is True
+    assert "backgroundColor" not in status_cell["userEnteredFormat"]
 
 
 @pytest.mark.asyncio

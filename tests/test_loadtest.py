@@ -10,6 +10,7 @@ from app.loadtest import (
     cleanup_sqlite,
     load_profile,
     parse_args,
+    sqlite_counts,
 )
 from app.models import LlmContext
 from app.loadtest import CompleteFakeLlm
@@ -48,9 +49,16 @@ def test_parse_args_defaults() -> None:
     )
 
     assert args.profile == "stress"
+    assert args.bulk_mode == "reservations"
     assert args.cleanup_sqlite is True
     assert args.concurrency == 7
     assert args.google_throttle_seconds == 0.5
+
+
+def test_parse_args_accepts_legacy_bulk_mode() -> None:
+    args = parse_args(["--profile", "pilot15", "--bulk-mode", "legacy"])
+
+    assert args.bulk_mode == "legacy"
 
 
 @pytest.mark.asyncio
@@ -109,6 +117,10 @@ def test_cleanup_sqlite_removes_only_current_run(tmp_path) -> None:
             telegram_user_id INTEGER,
             batch_id TEXT
         );
+        CREATE TABLE bulk_reservations (
+            reservation_id TEXT PRIMARY KEY,
+            telegram_user_id INTEGER
+        );
         CREATE TABLE dashboard_outbox (
             entity_type TEXT,
             entity_id TEXT,
@@ -133,6 +145,8 @@ def test_cleanup_sqlite_removes_only_current_run(tmp_path) -> None:
     conn.execute("INSERT INTO bulk_batches VALUES ('BATCH-1', 9100000001)")
     conn.execute("INSERT INTO bulk_batches VALUES ('BATCH-MISSED', 9100000001)")
     conn.execute("INSERT INTO bulk_batches VALUES ('BATCH-OTHER', 42)")
+    conn.execute("INSERT INTO bulk_reservations VALUES ('RES-1', 9100000001)")
+    conn.execute("INSERT INTO bulk_reservations VALUES ('RES-OTHER', 42)")
     conn.execute("INSERT INTO bulk_creation_requests VALUES ('KEY-1', 9100000001, 'BATCH-1')")
     conn.execute("INSERT INTO bulk_creation_requests VALUES ('KEY-MISSED', 9100000001, 'BATCH-MISSED')")
     conn.execute("INSERT INTO bulk_creation_requests VALUES ('KEY-2', 42, 'BATCH-OTHER')")
@@ -160,6 +174,7 @@ def test_cleanup_sqlite_removes_only_current_run(tmp_path) -> None:
         LoadtestState(
             application_ids=["APP-1"],
             batch_ids=["BATCH-1"],
+            reservation_ids=["RES-1"],
             user_ids=[9100000001],
         ),
     )
@@ -168,12 +183,35 @@ def test_cleanup_sqlite_removes_only_current_run(tmp_path) -> None:
     assert result["submitted_applications_by_batch"] == 0
     assert result["bulk_creation_requests"] == 2
     assert result["bulk_creation_requests_by_user"] == 0
+    assert result["bulk_reservations"] == 1
     conn = sqlite3.connect(db_path)
     assert conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM user_settings").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM submitted_applications").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM bulk_batches").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM bulk_reservations").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM bulk_creation_requests").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM dashboard_outbox").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
     conn.close()
+
+
+def test_sqlite_counts_handles_database_without_bulk_reservations(tmp_path) -> None:
+    db_path = tmp_path / "app.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE drafts (telegram_user_id INTEGER PRIMARY KEY);
+        CREATE TABLE submitted_applications (application_id TEXT PRIMARY KEY);
+        CREATE TABLE bulk_batches (batch_id TEXT PRIMARY KEY);
+        CREATE TABLE bulk_creation_requests (idempotency_key TEXT PRIMARY KEY);
+        CREATE TABLE notification_outbox (state TEXT);
+        CREATE TABLE dashboard_outbox (state TEXT);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    counts = sqlite_counts(str(db_path))
+
+    assert counts["bulk_reservations"] == 0

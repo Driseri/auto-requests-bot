@@ -10,6 +10,8 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     monkeypatch.setenv("BOT_TIMEZONE", "")
     monkeypatch.setenv("ROLLOUT_WEDNESDAY_CUTOFF", "")
     monkeypatch.setenv("ROLLOUT_THURSDAY_CUTOFF", "")
+    monkeypatch.setenv("URGENT_EDITOR_NOTIFICATIONS_ENABLED", "")
+    monkeypatch.setenv("EDITOR_URGENT_CHAT_ID", "")
 
     settings = load_settings()
 
@@ -18,7 +20,7 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert cutoff_to_string(settings.rollout_schedule.thursday_cutoff) == "14:00"
     assert settings.application_editors == ("редактор 1", "редактор 2")
     assert settings.dashboard_sync_interval_seconds == 300
-    assert settings.status_polling_memory_log_interval == 10
+    assert settings.status_polling_memory_log_interval == 40
     assert settings.status_not_found_threshold == 20
     assert settings.status_not_found_recheck_seconds == 3600
     assert settings.bulk_relocation_search_interval_seconds == 3600

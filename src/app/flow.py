@@ -607,17 +607,7 @@ class ApplicationFlow:
                 )
             await self.repository.fail_bulk_reservation(reservation_id, error=result.message)
             return BotResponse(text=result.message, keyboard=KeyboardKind.BULK_MENU)
-        saved = await self.repository.complete_bulk_reservation_creation_and_shift(
-            reservation_id,
-            spreadsheet_id=result.reservation.spreadsheet_id or "",
-            sheet_id=result.reservation.sheet_id or 0,
-            sheet_name=result.reservation.sheet_name or "",
-            start_row=result.reservation.start_row or 0,
-            end_row=result.reservation.end_row or 0,
-            insert_url=result.insert_url or "",
-            shifted_rows=result.reservation.requested_count or 0,
-        )
-        return self._bulk_reservation_response(saved)
+        return self._bulk_reservation_response(result.reservation)
 
     async def confirm_bulk_reservation_filled(
         self,

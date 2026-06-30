@@ -1855,8 +1855,26 @@ class StatusNotificationService:
         lines: list[str] = []
         if regular_notifications:
             lines.append("<b>Изменения по заявкам</b>")
+            grouped_regular: dict[str, dict[str, list[StatusNotification]]] = {}
             for notification in regular_notifications:
-                lines.extend(self._render_regular_lines(notification))
+                direction = (
+                    notification.current.direction
+                    or notification.tracked.direction
+                    or "Без направления"
+                )
+                group_key = _notification_type_group(notification)
+                grouped_regular.setdefault(direction, {}).setdefault(
+                    group_key,
+                    [],
+                ).append(notification)
+
+            for direction in sorted(grouped_regular):
+                lines.append("")
+                lines.append(f"<b>{escape(direction)}</b>")
+                for group_key in sorted(grouped_regular[direction]):
+                    lines.append(f"<b>{escape(group_key)}</b>")
+                    for notification in grouped_regular[direction][group_key]:
+                        lines.extend(self._render_regular_lines(notification))
 
         for batch_id, batch_notifications in bulk_notifications.items():
             if lines:
@@ -1873,17 +1891,13 @@ class StatusNotificationService:
     def _render_regular_lines(self, notification: StatusNotification) -> list[str]:
         current = notification.current
         result: list[str] = []
-        if notification.status_changed:
-            result.append(
-                f'{self._application_link(current)}: '
-                f"{escape(notification.tracked.last_known_status)} -> {escape(current.status)}"
-            )
+        summary = _regular_notification_summary(notification)
+        if summary:
+            result.append(f"• {self._application_link(current)}: {summary}")
         if notification.final_answer_changed:
-            result.append("")
             result.append(f"<b>Итоговый ответ по заявке {self._application_link(current)}</b>")
             result.append(_render_answer_block(current.final_answer, self._row_link(current)))
         if current.editor_comment and notification.editor_comment_ready:
-            result.append("")
             result.append(
                 f"<b>Комментарий редактора по заявке {self._application_link(current)}</b>"
             )
@@ -2004,7 +2018,7 @@ async def run_status_polling_loop(
     service: StatusNotificationService,
     interval_seconds: float,
     heartbeat_path: str | None = None,
-    memory_log_interval: int = 10,
+    memory_log_interval: int = 40,
 ) -> None:
     """Запускать polling постоянно и писать heartbeat только после успеха."""
     consecutive_errors = 0
@@ -2096,6 +2110,38 @@ def _render_answer_block(answer: str, row_link: str) -> str:
     if len(escaped) > 1000:
         escaped = escaped[:1000] + "..."
     return f"<blockquote expandable>{escaped}</blockquote>\n<a href=\"{escape(row_link, quote=True)}\">Открыть строку</a>"
+
+
+def _notification_type_group(notification: StatusNotification) -> str:
+    answer_type = (
+        notification.current.answer_type
+        or notification.tracked.answer_type
+        or "Тип ответа не указан"
+    )
+    change_type = (
+        notification.current.change_type
+        or notification.tracked.change_type
+        or "Тип изменения не указан"
+    )
+    return f"{answer_type} / {change_type}"
+
+
+def _regular_notification_summary(notification: StatusNotification) -> str:
+    parts: list[str] = []
+    if notification.status_changed:
+        parts.append(
+            "статус "
+            f"{escape(notification.tracked.last_known_status)} → "
+            f"{escape(notification.current.status)}"
+        )
+    if notification.final_answer_changed:
+        parts.append("готов итоговый ответ")
+    if notification.editor_comment_ready:
+        parts.append("комментарий редактора")
+    if notification.editor_changed:
+        editor = notification.current.editor or EDITOR_NOT_SELECTED
+        parts.append(f"редактор: {escape(editor)}")
+    return "; ".join(parts)
 
 
 def _split_html_message(text: str, max_chars: int) -> list[str]:

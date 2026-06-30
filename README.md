@@ -68,7 +68,7 @@ GIGACHAT_SHOW_RESPONSE_JSON=false
 
 STATUS_POLLING_ENABLED=true
 STATUS_POLLING_INTERVAL_SECONDS=30
-STATUS_POLLING_MEMORY_LOG_INTERVAL=10
+STATUS_POLLING_MEMORY_LOG_INTERVAL=40
 STATUS_POLLING_HEARTBEAT_PATH=/data/status-polling-heartbeat.json
 STATUS_NOT_FOUND_THRESHOLD=20
 STATUS_NOT_FOUND_RECHECK_SECONDS=3600
@@ -190,7 +190,7 @@ Google-таблицы создаются администратором вруч
 |---|---|
 | `STATUS_POLLING_ENABLED` | Для production оставлять `true`. При `false` бот не отслеживает изменения статусов, не отправляет фоновые уведомления и не обновляет дашборд по изменениям таблиц. |
 | `STATUS_POLLING_INTERVAL_SECONDS` | `30` для пилота. Меньшее значение быстрее обнаруживает изменения, но чаще обращается к Google API. |
-| `STATUS_POLLING_MEMORY_LOG_INTERVAL` | `10`: как часто писать RSS/VMS память polling-цикла в лог. `0` отключает этот лог. |
+| `STATUS_POLLING_MEMORY_LOG_INTERVAL` | `40`: как часто писать RSS/VMS память polling-цикла в лог. При polling 30 секунд это примерно раз в 20 минут. `0` отключает этот лог. |
 | `STATUS_POLLING_HEARTBEAT_PATH` | В Docker оставлять `/data/status-polling-heartbeat.json`. |
 | `STATUS_NOT_FOUND_THRESHOLD` | `20`: сколько последовательных polling-циклов заявка может не находиться в Google Sheets, прежде чем она уйдет в редкую перепроверку. |
 | `STATUS_NOT_FOUND_RECHECK_SECONDS` | `3600`: как часто повторно проверять долго не найденные заявки. Это снижает нагрузку и шум в логах, но сохраняет восстановление, если строка появится снова. |

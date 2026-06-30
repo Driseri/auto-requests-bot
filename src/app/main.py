@@ -110,6 +110,7 @@ async def main() -> None:
         application_editors=settings.application_editors,
         dashboard_sync=dashboard_sync,
         google_api_retry=settings.google_api_retry,
+        repository=repository,
     )
     bulk_reservation_service = GoogleSheetsBulkReservationService(
         submission_service=submission_service,

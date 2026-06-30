@@ -1112,8 +1112,16 @@ Rollback переключает код на старый image, но не отк
 | Профиль | Что делает |
 |---|---|
 | `baseline` | 5 пользователей, по 1 одиночной заявке, 5 polling cycles |
-| `pilot15` | 15 пользователей, по 10 одиночных заявок, 3 массовые пачки по 30 строк, 30 polling cycles |
-| `stress` | 30 пользователей, по 5 одиночных заявок, 5 массовых пачек по 30 строк, 60 polling cycles |
+| `pilot15` | 15 пользователей, по 10 одиночных заявок, 3 массовых резерва по 30 строк, 30 polling cycles |
+| `stress` | 30 пользователей, по 5 одиночных заявок, 5 массовых резервов по 30 строк, 60 polling cycles |
+
+По умолчанию loadtest проверяет новый workflow `bulk_reservations`: бот вставляет резерв строк в боевой лист, заполняет его тестовыми данными и регистрирует строки как обычные одиночные заявки.
+
+Для старого workflow с `bulk_batches` оставлен совместимый режим:
+
+```bash
+--bulk-mode legacy
+```
 
 ### Перед тестом
 
@@ -1140,6 +1148,7 @@ docker compose -f docker-compose.prod.yml run --rm \
   --entrypoint python bot \
   -m app.loadtest \
   --profile baseline \
+  --bulk-mode reservations \
   --run-id "$RUN_ID" \
   --cleanup-sqlite \
   --concurrency 5 \
@@ -1159,6 +1168,7 @@ docker compose -f docker-compose.prod.yml run --rm \
   --entrypoint python bot \
   -m app.loadtest \
   --profile pilot15 \
+  --bulk-mode reservations \
   --run-id "$RUN_ID" \
   --cleanup-sqlite \
   --concurrency 5 \
@@ -1178,6 +1188,7 @@ docker compose -f docker-compose.prod.yml run --rm \
   --entrypoint python bot \
   -m app.loadtest \
   --profile stress \
+  --bulk-mode reservations \
   --run-id "$RUN_ID" \
   --cleanup-sqlite \
   --concurrency 5 \
@@ -1214,7 +1225,8 @@ cat loadtest-reports/loadtest-LOADTEST-YYYYMMDD-HHMMSS.json
 
 - `errors` должен быть пустым;
 - `counts.single_created` соответствует профилю;
-- `counts.bulk_batches_created` соответствует профилю;
+- `counts.bulk_reservations_created` соответствует профилю при `--bulk-mode reservations`;
+- `counts.bulk_batches_created` используется только для `--bulk-mode legacy`;
 - `counts.bulk_rows_registered` соответствует профилю;
 - `sqlite.cleanup` показывает удаление тестовых записей;
 - `manual_google_cleanup.ranges` содержит диапазоны, которые нужно удалить из Google Sheets вручную;

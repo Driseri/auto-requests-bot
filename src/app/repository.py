@@ -2555,6 +2555,12 @@ class DraftRepository:
         tracking: list[dict[str, Any]],
         dashboard_projections: list[dict[str, Any]],
         notification_event: dict[str, Any] | None = None,
+        spreadsheet_id: str | None = None,
+        sheet_id: int | None = None,
+        sheet_name: str | None = None,
+        start_row: int | None = None,
+        end_row: int | None = None,
+        insert_url: str | None = None,
     ) -> None:
         now = utc_now_iso()
         async with self._connection() as db:
@@ -2583,6 +2589,12 @@ class DraftRepository:
                 """
                 UPDATE bulk_reservations
                 SET state = ?, registered_count = ?, registered_at = ?,
+                    spreadsheet_id = COALESCE(?, spreadsheet_id),
+                    sheet_id = COALESCE(?, sheet_id),
+                    sheet_name = COALESCE(?, sheet_name),
+                    start_row = COALESCE(?, start_row),
+                    end_row = COALESCE(?, end_row),
+                    insert_url = COALESCE(?, insert_url),
                     started_at = NULL, last_error = NULL, updated_at = ?
                 WHERE reservation_id = ?
                 """,
@@ -2590,6 +2602,12 @@ class DraftRepository:
                     BulkReservationState.REGISTERED.value,
                     registered_count,
                     now,
+                    spreadsheet_id,
+                    sheet_id,
+                    sheet_name,
+                    start_row,
+                    end_row,
+                    insert_url,
                     now,
                     reservation_id,
                 ),

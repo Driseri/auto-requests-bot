@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 from html import escape
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,17 +44,23 @@ from app.submission import (
     build_google_sheets_api,
     quote_sheet_name,
     spreadsheet_row_link,
+    sheet_section_kind,
+    sheet_section_lock_key,
     _editor_data_validation_rule,
     _cell_data,
     _status_cell_data,
+    _status_data_validation_rule,
     _worksheet_schema_layout,
 )
 
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BULK_RESERVED_ROWS = 100
 DEFAULT_BULK_MAX_ROWS = 50
 BULK_BATCH_SPACING_ROWS = 2
 DEFAULT_BULK_REGISTRATION_STALE_SECONDS = 600
+BULK_RESERVATION_REQUIRED_BACKGROUND_COLOR = {"red": 1.0, "green": 0.97, "blue": 0.80}
+BULK_RESERVATION_SCRIPTWRITER_BACKGROUND_COLOR = {"red": 0.91, "green": 0.94, "blue": 1.0}
 _BATCH_HEADER_PATTERN = re.compile(r"^Пачка (BATCH-[0-9A-F]+)$")
 CURRENT_BULK_INPUT_HEADERS = [
     "Тип ответа",
@@ -136,6 +143,16 @@ class BulkReservationCreationResult:
     retry_allowed: bool = False
 
 
+class BulkReservationMetadataLookupError(RuntimeError):
+    """Metadata lookup failed, so reserve/register must fail closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class BulkReservationRange:
+    start_row: int
+    end_row: int
+
+
 class BulkBatchServiceProtocol(Protocol):
     async def create_batch(
         self,
@@ -193,6 +210,68 @@ class InMemoryBulkBatchService:
         )
 
 
+def _find_reservation_metadata_range(
+    api: Any,
+    *,
+    spreadsheet_id: str,
+    sheet_id: int,
+    reservation_id: str,
+    requested_count: int | None,
+) -> BulkReservationRange | None:
+    developer_metadata = getattr(api.spreadsheets(), "developerMetadata", None)
+    if developer_metadata is None:
+        raise BulkReservationMetadataLookupError(
+            "Google Sheets developerMetadata API is unavailable."
+        )
+    try:
+        result = developer_metadata().search(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "dataFilters": [
+                    {
+                        "developerMetadataLookup": {
+                            "metadataKey": "bulk_reservation_id",
+                            "metadataValue": reservation_id,
+                            "locationType": "ROW",
+                        }
+                    }
+                ]
+            },
+        ).execute()
+    except Exception as exc:
+        raise BulkReservationMetadataLookupError(
+            "Не удалось безопасно проверить, были ли строки уже созданы."
+        ) from exc
+    if not isinstance(result, dict):
+        raise BulkReservationMetadataLookupError(
+            "Google Sheets developerMetadata returned an unexpected response."
+        )
+    matches = result.get("matchedDeveloperMetadata", [])
+    if not isinstance(matches, list):
+        raise BulkReservationMetadataLookupError(
+            "Google Sheets developerMetadata returned malformed matches."
+        )
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        metadata = match.get("developerMetadata", match)
+        if not isinstance(metadata, dict):
+            continue
+        dimension_range = metadata.get("location", {}).get("dimensionRange", {})
+        if not isinstance(dimension_range, dict):
+            continue
+        if dimension_range.get("sheetId") != sheet_id:
+            continue
+        start_index = dimension_range.get("startIndex")
+        end_index = dimension_range.get("endIndex")
+        if start_index is None or end_index is None or end_index <= start_index:
+            continue
+        start_row = int(start_index) + 1
+        count = max(int(requested_count or 1), 1)
+        return BulkReservationRange(start_row=start_row, end_row=start_row + count - 1)
+    return None
+
+
 class GoogleSheetsBulkReservationService:
     """Создаёт резерв строк в боевых листах без отдельной batch-сущности."""
 
@@ -206,7 +285,7 @@ class GoogleSheetsBulkReservationService:
         self.repository = repository
         self.google_api_retry = google_api_retry
         self._submission = submission_service
-        self._section_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._section_locks: dict[str, asyncio.Lock] = {}
 
     async def create_reservation(
         self,
@@ -229,6 +308,26 @@ class GoogleSheetsBulkReservationService:
                 operation_id=f"bulk-reservation-create:{reservation.reservation_id}",
             )
             return result
+        except BulkReservationMetadataLookupError:
+            LOGGER.warning(
+                "Bulk reservation metadata lookup failed closed during creation: "
+                "reservation_id=%s telegram_user_id=%s direction=%s target_kind=%s "
+                "change_type=%s requested_count=%s",
+                reservation.reservation_id,
+                reservation.telegram_user_id,
+                reservation.direction,
+                reservation.target_kind,
+                reservation.change_type,
+                reservation.requested_count,
+            )
+            return BulkReservationCreationResult(
+                success=False,
+                message=(
+                    "Не удалось безопасно проверить, были ли строки уже созданы. "
+                    "Повторите действие через несколько минут."
+                ),
+                retry_allowed=True,
+            )
         except Exception as exc:
             return BulkReservationCreationResult(
                 success=False,
@@ -280,9 +379,23 @@ class GoogleSheetsBulkReservationService:
             spreadsheet_id=spreadsheet_id,
             sheet_id=sheet_id,
             reservation_id=reservation.reservation_id,
+            requested_count=reservation.requested_count,
         )
         if existing_range is not None:
-            start_row, end_row = existing_range
+            start_row, end_row = existing_range.start_row, existing_range.end_row
+            LOGGER.info(
+                "Bulk reservation creation reused metadata range: reservation_id=%s "
+                "telegram_user_id=%s spreadsheet_id=%s sheet_id=%s sheet_name=%s "
+                "start_row=%s end_row=%s requested_count=%s",
+                reservation.reservation_id,
+                reservation.telegram_user_id,
+                spreadsheet_id,
+                sheet_id,
+                sheet_name,
+                start_row,
+                end_row,
+                reservation.requested_count,
+            )
         else:
             start_row = self._insert_blank_rows(
                 api,
@@ -297,6 +410,21 @@ class GoogleSheetsBulkReservationService:
                 reservation_id=reservation.reservation_id,
             )
             end_row = start_row + (reservation.requested_count or 1) - 1
+            LOGGER.info(
+                "Bulk reservation rows inserted: reservation_id=%s telegram_user_id=%s "
+                "spreadsheet_id=%s sheet_id=%s sheet_name=%s target_kind=%s "
+                "change_type=%s start_row=%s end_row=%s requested_count=%s",
+                reservation.reservation_id,
+                reservation.telegram_user_id,
+                spreadsheet_id,
+                sheet_id,
+                sheet_name,
+                target_kind.value,
+                change_type.value,
+                start_row,
+                end_row,
+                reservation.requested_count,
+            )
         insert_url = spreadsheet_row_link(
             spreadsheet_id=spreadsheet_id,
             sheet_id=sheet_id,
@@ -334,38 +462,15 @@ class GoogleSheetsBulkReservationService:
         spreadsheet_id: str,
         sheet_id: int,
         reservation_id: str,
-    ) -> tuple[int, int] | None:
-        developer_metadata = getattr(api.spreadsheets(), "developerMetadata", None)
-        if developer_metadata is None:
-            return None
-        try:
-            result = developer_metadata().search(
-                spreadsheetId=spreadsheet_id,
-                body={
-                    "dataFilters": [
-                        {
-                            "developerMetadataLookup": {
-                                "metadataKey": "bulk_reservation_id",
-                                "metadataValue": reservation_id,
-                                "locationType": "ROW",
-                            }
-                        }
-                    ]
-                },
-            ).execute()
-        except Exception:
-            return None
-        for match in result.get("matchedDeveloperMetadata", []):
-            metadata = match.get("developerMetadata", match)
-            dimension_range = metadata.get("location", {}).get("dimensionRange", {})
-            if dimension_range.get("sheetId") != sheet_id:
-                continue
-            start_index = dimension_range.get("startIndex")
-            end_index = dimension_range.get("endIndex")
-            if start_index is None or end_index is None or end_index <= start_index:
-                continue
-            return int(start_index) + 1, int(end_index)
-        return None
+        requested_count: int | None,
+    ) -> BulkReservationRange | None:
+        return _find_reservation_metadata_range(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            reservation_id=reservation_id,
+            requested_count=requested_count,
+        )
 
     async def create_reservation_with_lock(
         self,
@@ -387,19 +492,30 @@ class GoogleSheetsBulkReservationService:
             updated_at=utc_now_iso(),
         )
         spreadsheet_id, sheet_name = self._submission.resolve_target(draft)
-        section_kind = _reservation_section_kind(target_kind, change_type)
-        lock = self._section_locks.setdefault(
-            (spreadsheet_id, sheet_name, section_kind),
-            asyncio.Lock(),
+        section_kind = sheet_section_kind(
+            answer_type=draft.answer_type,
+            change_type=change_type,
         )
+        lock_key = sheet_section_lock_key(
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=sheet_name,
+            section_kind=section_kind,
+        )
+        lock = self._section_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
-            lock_key = f"{spreadsheet_id}:{sheet_name}:{section_kind}"
             acquired = await self.repository.acquire_bulk_section_lock(
                 lock_key=lock_key,
                 owner=reservation.reservation_id,
                 ttl_seconds=600,
             )
             if not acquired:
+                LOGGER.info(
+                    "Bulk reservation section lock busy: reservation_id=%s "
+                    "telegram_user_id=%s lock_key=%s",
+                    reservation.reservation_id,
+                    reservation.telegram_user_id,
+                    lock_key,
+                )
                 return BulkReservationCreationResult(
                     success=False,
                     message=(
@@ -410,7 +526,26 @@ class GoogleSheetsBulkReservationService:
                     retry_allowed=True,
                 )
             try:
-                return await self.create_reservation(reservation)
+                result = await self.create_reservation(reservation)
+                if not result.success or result.reservation is None:
+                    return result
+                saved = await self.repository.complete_bulk_reservation_creation_and_shift(
+                    reservation.reservation_id,
+                    spreadsheet_id=result.reservation.spreadsheet_id or "",
+                    sheet_id=result.reservation.sheet_id or 0,
+                    sheet_name=result.reservation.sheet_name or "",
+                    start_row=result.reservation.start_row or 0,
+                    end_row=result.reservation.end_row or 0,
+                    insert_url=result.insert_url or "",
+                    shifted_rows=result.reservation.requested_count or 0,
+                )
+                return BulkReservationCreationResult(
+                    success=True,
+                    message=result.message,
+                    reservation=saved or result.reservation,
+                    insert_url=result.insert_url,
+                    retry_allowed=result.retry_allowed,
+                )
             finally:
                 await self.repository.release_bulk_section_lock(
                     lock_key=lock_key,
@@ -481,7 +616,7 @@ class GoogleSheetsBulkReservationService:
                                 "sheetId": sheet_id,
                                 "dimension": "ROWS",
                                 "startIndex": insert_index,
-                                "endIndex": insert_index + count,
+                                "endIndex": insert_index + 1,
                             }
                         },
                     }
@@ -877,6 +1012,21 @@ class BulkReservationRegistrar:
                     "Резерв ещё не создан в Google Sheets.",
                     insert_url=claim.insert_url,
                 )
+            LOGGER.info(
+                "Bulk reservation registration started: reservation_id=%s "
+                "telegram_user_id=%s spreadsheet_id=%s sheet_id=%s sheet_name=%s "
+                "start_row=%s end_row=%s requested_count=%s target_kind=%s change_type=%s",
+                claim.reservation_id,
+                telegram_user_id,
+                claim.spreadsheet_id,
+                claim.sheet_id,
+                claim.sheet_name,
+                claim.start_row,
+                claim.end_row,
+                claim.requested_count,
+                claim.target_kind,
+                claim.change_type,
+            )
             try:
                 result, tracking, projections = await execute_with_retry_async(
                     lambda: self._register_reservation_sync(claim),
@@ -894,12 +1044,72 @@ class BulkReservationRegistrar:
                     tracking=tracking,
                     dashboard_projections=projections,
                     notification_event=notification_event,
+                    spreadsheet_id=claim.spreadsheet_id,
+                    sheet_id=claim.sheet_id,
+                    sheet_name=claim.sheet_name,
+                    start_row=claim.start_row,
+                    end_row=claim.end_row,
+                    insert_url=claim.insert_url,
+                )
+                LOGGER.info(
+                    "Bulk reservation registration completed: reservation_id=%s "
+                    "telegram_user_id=%s registered_count=%s spreadsheet_id=%s "
+                    "sheet_id=%s sheet_name=%s start_row=%s end_row=%s "
+                    "google_requests_batch=1 dashboard_projections=%s notification_enqueued=%s",
+                    claim.reservation_id,
+                    telegram_user_id,
+                    result.registered_count,
+                    claim.spreadsheet_id,
+                    claim.sheet_id,
+                    claim.sheet_name,
+                    claim.start_row,
+                    claim.end_row,
+                    len(projections),
+                    notification_event is not None,
                 )
                 return result
+            except BulkReservationMetadataLookupError:
+                await self.repository.release_bulk_reservation_registration(
+                    reservation_id,
+                    error="metadata lookup failed",
+                )
+                LOGGER.warning(
+                    "Bulk reservation metadata lookup failed closed during registration: "
+                    "reservation_id=%s telegram_user_id=%s spreadsheet_id=%s sheet_id=%s "
+                    "sheet_name=%s start_row=%s end_row=%s",
+                    claim.reservation_id,
+                    telegram_user_id,
+                    claim.spreadsheet_id,
+                    claim.sheet_id,
+                    claim.sheet_name,
+                    claim.start_row,
+                    claim.end_row,
+                )
+                return BulkRegistrationResult(
+                    False,
+                    (
+                        "Не удалось безопасно проверить актуальное расположение резерва. "
+                        "Повторите действие через несколько минут."
+                    ),
+                    insert_url=claim.insert_url,
+                )
             except Exception as exc:
                 await self.repository.release_bulk_reservation_registration(
                     reservation_id,
                     error=str(exc),
+                )
+                LOGGER.warning(
+                    "Bulk reservation registration failed: reservation_id=%s "
+                    "telegram_user_id=%s spreadsheet_id=%s sheet_id=%s sheet_name=%s "
+                    "start_row=%s end_row=%s error=%r",
+                    claim.reservation_id,
+                    telegram_user_id,
+                    claim.spreadsheet_id,
+                    claim.sheet_id,
+                    claim.sheet_name,
+                    claim.start_row,
+                    claim.end_row,
+                    exc,
                 )
                 return BulkRegistrationResult(
                     False,
@@ -974,6 +1184,39 @@ class BulkReservationRegistrar:
             raise ValueError("У резерва не сохранён тип изменения.")
         schema = "chips" if change_type == ChangeType.CHIPS else "new"
         headers = CHIPS_WORKSHEET_HEADERS if schema == "chips" else WORKSHEET_HEADERS
+        metadata_range = _find_reservation_metadata_range(
+            self._get_sheets_api(),
+            spreadsheet_id=reservation.spreadsheet_id,
+            sheet_id=reservation.sheet_id,
+            reservation_id=reservation.reservation_id,
+            requested_count=reservation.requested_count,
+        )
+        if metadata_range is not None:
+            if (
+                metadata_range.start_row != reservation.start_row
+                or metadata_range.end_row != reservation.end_row
+            ):
+                LOGGER.info(
+                    "Bulk reservation metadata range adjusted before registration: "
+                    "reservation_id=%s spreadsheet_id=%s sheet_id=%s sheet_name=%s "
+                    "old_start_row=%s old_end_row=%s new_start_row=%s new_end_row=%s",
+                    reservation.reservation_id,
+                    reservation.spreadsheet_id,
+                    reservation.sheet_id,
+                    reservation.sheet_name,
+                    reservation.start_row,
+                    reservation.end_row,
+                    metadata_range.start_row,
+                    metadata_range.end_row,
+                )
+            reservation.start_row = metadata_range.start_row
+            reservation.end_row = metadata_range.end_row
+            reservation.insert_url = spreadsheet_row_link(
+                spreadsheet_id=reservation.spreadsheet_id,
+                sheet_id=reservation.sheet_id,
+                row_number=metadata_range.start_row,
+                end_column=_worksheet_schema_layout(schema)["end_column"],
+            )
         rows = self._read_range(
             reservation.spreadsheet_id,
             reservation.sheet_name,
@@ -1005,6 +1248,7 @@ class BulkReservationRegistrar:
         submitted_at = self.clock()
         tracking: list[dict[str, Any]] = []
         projections: list[dict[str, Any]] = []
+        update_requests: list[dict[str, Any]] = []
         registered_row_numbers = [row_number for row_number, _ in filled]
         registered_row_set = set(registered_row_numbers)
         for row_number, row in filled:
@@ -1017,11 +1261,27 @@ class BulkReservationRegistrar:
                 reservation=reservation,
                 submitted_at=submitted_at,
             )
-            self._update_registered_row(
-                reservation,
-                row_number=row_number,
-                row=full_row,
-                schema=schema,
+            update_requests.append(
+                self._registered_row_update_request(
+                    reservation,
+                    row_number=row_number,
+                    row=full_row,
+                    schema=schema,
+                )
+            )
+            update_requests.append(
+                self._registered_row_editor_validation_request(
+                    reservation,
+                    row_number=row_number,
+                    schema=schema,
+                )
+            )
+            update_requests.append(
+                self._registered_row_status_validation_request(
+                    reservation,
+                    row_number=row_number,
+                    schema=schema,
+                )
             )
             tracking.append(
                 {
@@ -1067,6 +1327,7 @@ class BulkReservationRegistrar:
             spreadsheetId=reservation.spreadsheet_id,
             body={
                 "requests": [
+                    *update_requests,
                     *_registered_reservation_border_requests(
                         sheet_id=reservation.sheet_id,
                         first_row=min(registered_row_numbers),
@@ -1111,41 +1372,87 @@ class BulkReservationRegistrar:
         ).execute()
         return result.get("values", [])
 
-    def _update_registered_row(
+    def _registered_row_update_request(
         self,
         reservation: BulkReservation,
         *,
         row_number: int,
         row: list[Any],
         schema: str,
-    ) -> None:
+    ) -> dict[str, Any]:
         layout = _worksheet_schema_layout(schema)
         cells = [_cell_data(value) for value in row]
+        cells[0].setdefault("userEnteredFormat", {})["backgroundColor"] = (
+            BULK_RESERVATION_SCRIPTWRITER_BACKGROUND_COLOR
+        )
         cells[layout["status"]] = _status_cell_data(ApplicationStatus.NEW.value)
         cells[layout["date"]] = google_sheets_date_cell(
             row[layout["date"]],
             timezone_name=self.timezone_name,
         )
-        self._get_sheets_api().spreadsheets().batchUpdate(
-            spreadsheetId=reservation.spreadsheet_id,
-            body={
-                "requests": [
-                    {
-                        "updateCells": {
-                            "range": {
-                                "sheetId": reservation.sheet_id,
-                                "startRowIndex": row_number - 1,
-                                "endRowIndex": row_number,
-                                "startColumnIndex": 0,
-                                "endColumnIndex": len(cells),
-                            },
-                            "rows": [{"values": cells}],
-                            "fields": "userEnteredValue,userEnteredFormat,dataValidation",
-                        }
-                    }
-                ]
-            },
-        ).execute()
+        return {
+            "updateCells": {
+                "range": {
+                    "sheetId": reservation.sheet_id,
+                    "startRowIndex": row_number - 1,
+                    "endRowIndex": row_number,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(cells),
+                },
+                "rows": [{"values": cells}],
+                "fields": "userEnteredValue,userEnteredFormat",
+            }
+        }
+
+    def _registered_row_editor_validation_request(
+        self,
+        reservation: BulkReservation,
+        *,
+        row_number: int,
+        schema: str,
+    ) -> dict[str, Any]:
+        layout = _worksheet_schema_layout(schema)
+        editor_column = layout["editor"]
+        return {
+            "repeatCell": {
+                "range": {
+                    "sheetId": reservation.sheet_id,
+                    "startRowIndex": row_number - 1,
+                    "endRowIndex": row_number,
+                    "startColumnIndex": editor_column,
+                    "endColumnIndex": editor_column + 1,
+                },
+                "cell": {
+                    "dataValidation": _editor_data_validation_rule(
+                        self.application_editors
+                    )
+                },
+                "fields": "dataValidation",
+            }
+        }
+
+    def _registered_row_status_validation_request(
+        self,
+        reservation: BulkReservation,
+        *,
+        row_number: int,
+        schema: str,
+    ) -> dict[str, Any]:
+        layout = _worksheet_schema_layout(schema)
+        status_column = layout["status"]
+        return {
+            "repeatCell": {
+                "range": {
+                    "sheetId": reservation.sheet_id,
+                    "startRowIndex": row_number - 1,
+                    "endRowIndex": row_number,
+                    "startColumnIndex": status_column,
+                    "endColumnIndex": status_column + 1,
+                },
+                "cell": {"dataValidation": _status_data_validation_rule()},
+                "fields": "dataValidation",
+            }
+        }
 
 
 class BulkApplicationRegistrar:
@@ -2085,17 +2392,6 @@ def _answer_type_for_bulk_target(target_kind: BulkTargetKind) -> str:
     return AnswerType.ROLLOUT.value
 
 
-def _reservation_section_kind(
-    target_kind: BulkTargetKind,
-    change_type: ChangeType | None,
-) -> str:
-    if target_kind == BulkTargetKind.ROLLOUT:
-        return f"{target_kind.value}:{(change_type or ChangeType.ADD).value}"
-    if change_type == ChangeType.CHIPS:
-        return f"{target_kind.value}:chips"
-    return f"{target_kind.value}:main"
-
-
 def _sectioned_bulk_insert_row(
     rows: list[list[Any]],
     change_type: ChangeType,
@@ -2146,7 +2442,6 @@ def _required_input_columns_format_requests(
     end_row: int,
     schema: str,
 ) -> list[dict[str, Any]]:
-    color = {"red": 1.0, "green": 0.97, "blue": 0.80}
     return [
         {
             "repeatCell": {
@@ -2157,7 +2452,15 @@ def _required_input_columns_format_requests(
                     "startColumnIndex": column_index,
                     "endColumnIndex": column_index + 1,
                 },
-                "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": (
+                            BULK_RESERVATION_SCRIPTWRITER_BACKGROUND_COLOR
+                            if column_index == 0
+                            else BULK_RESERVATION_REQUIRED_BACKGROUND_COLOR
+                        )
+                    }
+                },
                 "fields": "userEnteredFormat.backgroundColor",
             }
         }

@@ -89,33 +89,46 @@ class FakeBulkRegistrar:
 
 
 class FakeBulkReservationService:
-    def __init__(self) -> None:
+    def __init__(self, repository: DraftRepository | None = None) -> None:
         self.calls: list[BulkReservation] = []
+        self.repository = repository
 
     async def create_reservation(self, reservation: BulkReservation):
         return await self.create_reservation_with_lock(reservation)
 
     async def create_reservation_with_lock(self, reservation: BulkReservation):
         self.calls.append(reservation)
+        saved_reservation = BulkReservation(
+            reservation_id=reservation.reservation_id,
+            idempotency_key=reservation.idempotency_key,
+            telegram_user_id=reservation.telegram_user_id,
+            state=BulkReservationState.CREATED.value,
+            direction=reservation.direction,
+            target_kind=reservation.target_kind,
+            change_type=reservation.change_type,
+            requested_count=reservation.requested_count,
+            spreadsheet_id="spreadsheet",
+            sheet_id=123,
+            sheet_name="29.06 (1)",
+            start_row=10,
+            end_row=14,
+            insert_url="https://docs.google.com/spreadsheets/d/spreadsheet/edit#gid=123&range=A10:X14",
+        )
+        if self.repository is not None:
+            saved_reservation = await self.repository.complete_bulk_reservation_creation_and_shift(
+                reservation.reservation_id,
+                spreadsheet_id=saved_reservation.spreadsheet_id or "",
+                sheet_id=saved_reservation.sheet_id or 0,
+                sheet_name=saved_reservation.sheet_name or "",
+                start_row=saved_reservation.start_row or 0,
+                end_row=saved_reservation.end_row or 0,
+                insert_url=saved_reservation.insert_url or "",
+                shifted_rows=saved_reservation.requested_count or 0,
+            ) or saved_reservation
         return BulkReservationCreationResult(
             success=True,
             message="ok",
-            reservation=BulkReservation(
-                reservation_id=reservation.reservation_id,
-                idempotency_key=reservation.idempotency_key,
-                telegram_user_id=reservation.telegram_user_id,
-                state=BulkReservationState.CREATED.value,
-                direction=reservation.direction,
-                target_kind=reservation.target_kind,
-                change_type=reservation.change_type,
-                requested_count=reservation.requested_count,
-                spreadsheet_id="spreadsheet",
-                sheet_id=123,
-                sheet_name="29.06 (1)",
-                start_row=10,
-                end_row=14,
-                insert_url="https://docs.google.com/spreadsheets/d/spreadsheet/edit#gid=123&range=A10:X14",
-            ),
+            reservation=saved_reservation,
             insert_url="https://docs.google.com/spreadsheets/d/spreadsheet/edit#gid=123&range=A10:X14",
         )
 
@@ -859,7 +872,7 @@ async def test_notification_menu_restores_unregistered_bulk_batch(tmp_path):
 async def test_bulk_reservation_flow_creates_rows_after_confirmation(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk_reservation_flow.db"))
     await repository.init()
-    service = FakeBulkReservationService()
+    service = FakeBulkReservationService(repository)
     flow = ApplicationFlow(
         repository,
         FakeLlmClient(),

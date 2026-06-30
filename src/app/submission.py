@@ -27,6 +27,7 @@ from app.models import (
     SubmittedApplication,
     SubmissionResult,
 )
+from app.repository import DraftRepository
 from app.scheduling import (
     DEFAULT_TIMEZONE,
     DEFAULT_ROLLOUT_SCHEDULE,
@@ -37,6 +38,7 @@ from app.sheet_dates import google_sheets_date_cell, utc_iso
 
 LOGGER = logging.getLogger(__name__)
 EDITOR_NOT_SELECTED = "Редактор не выбран"
+SECTION_LOCK_TTL_SECONDS = 600
 
 LEGACY_WORKSHEET_HEADERS = [
     "ID заявки",
@@ -285,6 +287,18 @@ class SheetConfigurationError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _SubmissionWriteResult:
+    result: SubmissionResult
+    shift_from_row: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _InsertedRow:
+    row_number: int
+    shift_from_row: int | None = None
+
+
 class GoogleSheetsSubmissionService:
     """Идемпотентно записывает одиночные заявки в таблицы направлений."""
 
@@ -301,6 +315,7 @@ class GoogleSheetsSubmissionService:
         application_editors: tuple[str, ...] = ("редактор 1", "редактор 2"),
         dashboard_sync: DashboardSyncService | None = None,
         google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
+        repository: DraftRepository | None = None,
         # Legacy constructor args kept temporarily for tests/old wiring.
         spreadsheet_id: str = "",
         high_priority_sheet_name: str = "",
@@ -321,10 +336,12 @@ class GoogleSheetsSubmissionService:
         self.timezone_name = timezone_name
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.application_editors = application_editors
+        self.repository = repository
         self._prepared_sheets: dict[
             tuple[str, str, str], tuple[str, str | None]
         ] = {}
         self._sheet_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._section_locks: dict[str, asyncio.Lock] = {}
         self._dashboard = dashboard_sync or DashboardSyncService(
             spreadsheet_id=dashboard_spreadsheet_id,
             credentials_path=credentials_path,
@@ -366,23 +383,66 @@ class GoogleSheetsSubmissionService:
             application,
             submitted_at=submitted_at,
         )
-        lock = self._sheet_locks.setdefault(
-            (spreadsheet_id, sheet_name),
-            asyncio.Lock(),
+        section_kind = sheet_section_kind(
+            answer_type=application.answer_type,
+            change_type=ChangeType.normalize(application.change_type),
         )
+        lock_key = sheet_section_lock_key(
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=sheet_name,
+            section_kind=section_kind,
+        )
+        lock = self._section_locks.setdefault(lock_key, asyncio.Lock())
+        owner = f"single:{application.application_id or application.telegram_user_id}"
         try:
             async with lock:
-                result = await execute_with_retry_async(
-                    lambda: self._submit_sync(
-                        application,
-                        submitted_at,
-                        spreadsheet_id=spreadsheet_id,
-                        sheet_name=sheet_name,
-                    ),
-                    config=self.google_api_retry,
-                    operation_id=f"submit:{application.application_id or 'unknown'}",
-                    reset_client=self._reset_sheets_api,
-                )
+                acquired = True
+                if self.repository is not None:
+                    acquired = await self.repository.acquire_bulk_section_lock(
+                        lock_key=lock_key,
+                        owner=owner,
+                        ttl_seconds=SECTION_LOCK_TTL_SECONDS,
+                    )
+                if not acquired:
+                    return SubmissionResult(
+                        success=False,
+                        message=(
+                            "Сейчас другой пользователь вносит строки в этот раздел. "
+                            "Повторите отправку через несколько секунд."
+                        ),
+                    )
+                try:
+                    write_result = await execute_with_retry_async(
+                        lambda: self._submit_sync(
+                            application,
+                            submitted_at,
+                            spreadsheet_id=spreadsheet_id,
+                            sheet_name=sheet_name,
+                        ),
+                        config=self.google_api_retry,
+                        operation_id=f"submit:{application.application_id or 'unknown'}",
+                        reset_client=self._reset_sheets_api,
+                    )
+                    if (
+                        self.repository is not None
+                        and write_result.result.success
+                        and write_result.shift_from_row is not None
+                        and write_result.result.spreadsheet_id
+                        and write_result.result.sheet_id is not None
+                    ):
+                        await self.repository.shift_rows_after_insert(
+                            spreadsheet_id=write_result.result.spreadsheet_id,
+                            sheet_id=write_result.result.sheet_id,
+                            from_row=write_result.shift_from_row,
+                            delta=1,
+                        )
+                    result = write_result.result
+                finally:
+                    if self.repository is not None and acquired:
+                        await self.repository.release_bulk_section_lock(
+                            lock_key=lock_key,
+                            owner=owner,
+                        )
         except Exception as exc:
             if is_google_rate_limit_error(exc):
                 return SubmissionResult(
@@ -416,7 +476,7 @@ class GoogleSheetsSubmissionService:
         *,
         spreadsheet_id: str,
         sheet_name: str,
-    ) -> SubmissionResult:
+    ) -> _SubmissionWriteResult:
         """Сверить application_id и добавить строку только при его отсутствии."""
         if not spreadsheet_id:
             raise SheetConfigurationError(
@@ -446,18 +506,20 @@ class GoogleSheetsSubmissionService:
             application.application_id,
         )
         if existing_row is not None:
-            return SubmissionResult(
-                success=True,
-                message="Заявка уже отправлена в таблицу.",
-                spreadsheet_id=spreadsheet_id,
-                sheet_id=sheet_id,
-                sheet_name=sheet_name,
-                row_number=existing_row,
-                row_link=spreadsheet_row_link(
+            return _SubmissionWriteResult(
+                SubmissionResult(
+                    success=True,
+                    message="Заявка уже отправлена в таблицу.",
                     spreadsheet_id=spreadsheet_id,
                     sheet_id=sheet_id,
+                    sheet_name=sheet_name,
                     row_number=existing_row,
-                    end_column=_worksheet_schema_layout(schema)["end_column"],
+                    row_link=spreadsheet_row_link(
+                        spreadsheet_id=spreadsheet_id,
+                        sheet_id=sheet_id,
+                        row_number=existing_row,
+                        end_column=_worksheet_schema_layout(schema)["end_column"],
+                    ),
                 ),
             )
         row_data = _draft_to_row_data(
@@ -468,7 +530,7 @@ class GoogleSheetsSubmissionService:
             schema=schema,
         )
         if layout.startswith("sectioned:"):
-            row_number = self._insert_section_row(
+            insert_result = self._insert_section_row(
                 api,
                 spreadsheet_id,
                 sheet_id,
@@ -477,8 +539,10 @@ class GoogleSheetsSubmissionService:
                 row_data,
                 target_marker=section_marker,
             )
+            row_number = insert_result.row_number
+            shift_from_row = insert_result.shift_from_row
         elif layout.startswith("urgent:"):
-            row_number = self._insert_urgent_row(
+            insert_result = self._insert_urgent_row(
                 api,
                 spreadsheet_id,
                 sheet_id,
@@ -486,8 +550,11 @@ class GoogleSheetsSubmissionService:
                 change_type,
                 row_data,
             )
+            row_number = insert_result.row_number
+            shift_from_row = insert_result.shift_from_row
         else:
             row_number = self._next_row_number(api, spreadsheet_id, sheet_name)
+            shift_from_row = None
             api.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={
@@ -512,15 +579,18 @@ class GoogleSheetsSubmissionService:
             end_column=_worksheet_schema_layout(schema)["end_column"],
         )
 
-        return SubmissionResult(
-            success=True,
-            message="Заявка отправлена в таблицу.",
-            spreadsheet_id=spreadsheet_id,
-            sheet_id=sheet_id,
-            sheet_name=sheet_name,
-            row_number=row_number,
-            row_link=row_link,
-            submitted_at=utc_iso(submitted_at),
+        return _SubmissionWriteResult(
+            SubmissionResult(
+                success=True,
+                message="Заявка отправлена в таблицу.",
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+                sheet_name=sheet_name,
+                row_number=row_number,
+                row_link=row_link,
+                submitted_at=utc_iso(submitted_at),
+            ),
+            shift_from_row=shift_from_row,
         )
 
     def _find_application_row(
@@ -963,7 +1033,7 @@ class GoogleSheetsSubmissionService:
         row_data: dict[str, Any],
         *,
         target_marker: str | None = None,
-    ) -> int:
+    ) -> _InsertedRow:
         if change_type is None:
             raise SheetConfigurationError(
                 "Для раскатки не выбран тип изменения ADD, EDIT или CHIPS."
@@ -997,6 +1067,7 @@ class GoogleSheetsSubmissionService:
         following_rows = sorted(row for row in marker_rows.values() if row > selected_row)
         if following_rows:
             row_number = following_rows[0]
+            shift_from_row = row_number
             insert_index = row_number - 1
             requests = [
                 {
@@ -1029,6 +1100,7 @@ class GoogleSheetsSubmissionService:
             ]
         else:
             row_number = len(rows) + 1
+            shift_from_row = None
             requests = [
                 {
                     "appendCells": {
@@ -1045,7 +1117,7 @@ class GoogleSheetsSubmissionService:
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
         ).execute()
-        return row_number
+        return _InsertedRow(row_number=row_number, shift_from_row=shift_from_row)
 
     def _insert_urgent_row(
         self,
@@ -1055,7 +1127,7 @@ class GoogleSheetsSubmissionService:
         sheet_name: str,
         change_type: ChangeType | None,
         row_data: dict[str, Any],
-    ) -> int:
+    ) -> _InsertedRow:
         if change_type is None:
             raise SheetConfigurationError(
                 "Для срочной заявки не выбран тип изменения ADD, EDIT или CHIPS."
@@ -1081,6 +1153,7 @@ class GoogleSheetsSubmissionService:
 
         if change_type == ChangeType.CHIPS:
             row_number = len(rows) + 1
+            shift_from_row = None
             requests = [
                 {
                     "appendCells": {
@@ -1097,6 +1170,7 @@ class GoogleSheetsSubmissionService:
             # ADD/EDIT urgent rows must be inserted above the CHIPS marker so
             # the lower CHIPS section remains a clean independent table.
             row_number = marker_position + 1
+            shift_from_row = row_number
             requests = [
                 {
                     "insertDimension": {
@@ -1135,7 +1209,7 @@ class GoogleSheetsSubmissionService:
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
         ).execute()
-        return row_number
+        return _InsertedRow(row_number=row_number, shift_from_row=shift_from_row)
 
     def _get_sheets_api(self) -> Any:
         if self._sheets_api is None:
@@ -1650,6 +1724,27 @@ def target_sheet_name(
     return week_name
 
 
+def sheet_section_kind(
+    *,
+    answer_type: str | None,
+    change_type: ChangeType | None,
+) -> str:
+    if answer_type == AnswerType.ROLLOUT.value:
+        return f"rollout:{(change_type or ChangeType.ADD).value}"
+    if answer_type == AnswerType.URGENT.value:
+        return "urgent:chips" if change_type == ChangeType.CHIPS else "urgent:main"
+    return "flat:main"
+
+
+def sheet_section_lock_key(
+    *,
+    spreadsheet_id: str,
+    sheet_name: str,
+    section_kind: str,
+) -> str:
+    return f"{spreadsheet_id}:{sheet_name}:{section_kind}"
+
+
 def week_sheet_name(created_at: str | None = None) -> str:
     moment = _parse_datetime(created_at) if created_at else datetime.now(timezone.utc)
     monday = moment.date() - timedelta(days=moment.weekday())
@@ -2059,7 +2154,12 @@ def _draft_to_row_data(
                 )
             )
         elif index == layout["status"]:
-            cells.append(_status_cell_data(ApplicationStatus.NEW.value))
+            cells.append(
+                _status_cell_data(
+                    ApplicationStatus.NEW.value,
+                    include_background=schema not in {"chips", "previous_chips"},
+                )
+            )
         elif index == layout["source_text"] or (
             isinstance(layout["source_text"], tuple)
             and index in layout["source_text"]
@@ -2147,15 +2247,15 @@ def _worksheet_schema_layout(schema: str) -> dict[str, Any]:
     return layouts[schema]
 
 
-def _status_cell_data(status: str) -> dict[str, Any]:
-    return {
+def _status_cell_data(status: str, *, include_background: bool = True) -> dict[str, Any]:
+    cell = {
         "userEnteredValue": {"stringValue": status},
         "dataValidation": _status_data_validation_rule(),
-        "userEnteredFormat": {
-            "backgroundColor": _status_color(status),
-            "textFormat": {"bold": True},
-        },
+        "userEnteredFormat": {"textFormat": {"bold": True}},
     }
+    if include_background:
+        cell["userEnteredFormat"]["backgroundColor"] = _status_color(status)
+    return cell
 
 
 def _editor_cell_data(

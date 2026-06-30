@@ -97,6 +97,9 @@ def is_retryable_google_error(exc: Exception) -> bool:
     status = _http_status(exc)
     if status is not None:
         return status in RETRYABLE_HTTP_STATUSES
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, Exception):
+        return is_retryable_google_error(cause)
     return isinstance(
         exc,
         (

@@ -1486,6 +1486,9 @@ async def test_notification_service_sends_status_and_final_answer(tmp_path):
                     sheet_name=WEEK_SHEET,
                     sheet_id=100,
                     row_number=7,
+                    direction=Direction.FL.value,
+                    answer_type=AnswerType.ROLLOUT.value,
+                    change_type=ChangeType.ADD.value,
                     status=ApplicationStatus.FINAL_ANSWER_READY.value,
                     editor_comment="Уточните <деталь>",
                     final_answer="Можно использовать финальный текст",
@@ -1502,9 +1505,12 @@ async def test_notification_service_sends_status_and_final_answer(tmp_path):
     assert message["chat_id"] == 100
     assert message["parse_mode"] == "HTML"
     assert message["link_preview_options"].is_disabled is True
+    assert "<b>ФЛ</b>" in message["text"]
+    assert f"<b>{AnswerType.ROLLOUT.value} / {ChangeType.ADD.value}</b>" in message["text"]
     assert (
-        '<a href="https://docs.google.com/spreadsheets/d/fl-spreadsheet/edit#gid=100&amp;range=A7:W7">A1B2C3D4</a>: '
-        f"{ApplicationStatus.NEW.value} -> {ApplicationStatus.FINAL_ANSWER_READY.value}"
+        '• <a href="https://docs.google.com/spreadsheets/d/fl-spreadsheet/edit#gid=100&amp;range=A7:W7">A1B2C3D4</a>: '
+        f"статус {ApplicationStatus.NEW.value} → {ApplicationStatus.FINAL_ANSWER_READY.value}; "
+        "готов итоговый ответ"
         in message["text"]
     )
     assert "Итоговый ответ по заявке" in message["text"]
@@ -1515,6 +1521,103 @@ async def test_notification_service_sends_status_and_final_answer(tmp_path):
     assert tracked is not None
     assert tracked.last_known_status == ApplicationStatus.FINAL_ANSWER_READY.value
     assert tracked.last_seen_final_answer == "Можно использовать финальный текст"
+
+
+@pytest.mark.asyncio
+async def test_notification_service_groups_regular_notifications_by_direction_and_type(tmp_path):
+    repository = DraftRepository(str(tmp_path / "grouped_regular_notifications.db"))
+    await repository.init()
+    applications = [
+        (
+            "FLADD001",
+            Direction.FL.value,
+            AnswerType.ROLLOUT.value,
+            ChangeType.ADD.value,
+            ApplicationStatus.ACCEPTED.value,
+            FL_SPREADSHEET,
+            100,
+            5,
+        ),
+        (
+            "FLCHIP01",
+            Direction.FL.value,
+            AnswerType.URGENT.value,
+            ChangeType.CHIPS.value,
+            ApplicationStatus.POSTPONED.value,
+            FL_SPREADSHEET,
+            100,
+            6,
+        ),
+        (
+            "SMEEDIT1",
+            Direction.SME.value,
+            AnswerType.INTEGRATION.value,
+            ChangeType.EDIT.value,
+            ApplicationStatus.REJECTED.value,
+            SME_SPREADSHEET,
+            200,
+            7,
+        ),
+    ]
+    statuses = {}
+    for (
+        application_id,
+        direction,
+        answer_type,
+        change_type,
+        status,
+        spreadsheet_id,
+        sheet_id,
+        row_number,
+    ) in applications:
+        await repository.save_submitted_application(
+            application_id=application_id,
+            telegram_user_id=100,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            sheet_name=WEEK_SHEET,
+            last_known_status=ApplicationStatus.NEW.value,
+            direction=direction,
+            answer_type=answer_type,
+            change_type=change_type,
+        )
+        statuses[application_id] = SheetApplicationStatus(
+            application_id=application_id,
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=WEEK_SHEET,
+            sheet_id=sheet_id,
+            row_number=row_number,
+            direction=direction,
+            answer_type=answer_type,
+            change_type=change_type,
+            status=status,
+            editor_comment="",
+            final_answer="",
+        )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(statuses),
+        notifier=notifier,
+    )
+
+    await service.run_once()
+
+    assert len(notifier.messages) == 1
+    text = notifier.messages[0]["text"]
+    assert text.count("<b>Изменения по заявкам</b>") == 1
+    assert "<b>ФЛ</b>" in text
+    assert "<b>SME</b>" in text
+    assert f"<b>{AnswerType.ROLLOUT.value} / {ChangeType.ADD.value}</b>" in text
+    assert f"<b>{AnswerType.URGENT.value} / {ChangeType.CHIPS.value}</b>" in text
+    assert f"<b>{AnswerType.INTEGRATION.value} / {ChangeType.EDIT.value}</b>" in text
+    assert "• " in text
+    assert "FLADD001" in text
+    assert "FLCHIP01" in text
+    assert "SMEEDIT1" in text
+    outbox = await repository.list_notification_outbox()
+    assert len(outbox) == 1
+    assert outbox[0].event_type == "application-status"
 
 
 @pytest.mark.asyncio

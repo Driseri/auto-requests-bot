@@ -14,12 +14,18 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from app.bulk import BulkApplicationRegistrar, GoogleSheetsBulkBatchService
+from app.bulk import (
+    BulkApplicationRegistrar,
+    BulkReservationRegistrar,
+    GoogleSheetsBulkBatchService,
+    GoogleSheetsBulkReservationService,
+)
 from app.config import load_settings
 from app.flow import ApplicationFlow
 from app.google_api import execute_with_retry_async
 from app.models import (
     AnswerType,
+    BulkTargetKind,
     ChangeType,
     Direction,
     LlmContext,
@@ -82,6 +88,7 @@ PROFILES: dict[str, LoadProfile] = {
 class LoadtestState:
     application_ids: list[str] = field(default_factory=list)
     batch_ids: list[str] = field(default_factory=list)
+    reservation_ids: list[str] = field(default_factory=list)
     user_ids: list[int] = field(default_factory=list)
     google_ranges: list[dict[str, Any]] = field(default_factory=list)
 
@@ -195,11 +202,15 @@ def sqlite_counts(sqlite_path: str) -> dict[str, Any]:
             "submitted_applications",
             "bulk_batches",
             "bulk_creation_requests",
+            "bulk_reservations",
             "notification_outbox",
             "dashboard_outbox",
         ]
         counts: dict[str, Any] = {}
         for table in tables:
+            if not _has_table(connection, table):
+                counts[table] = 0
+                continue
             counts[table] = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         counts["notification_outbox_states"] = dict(
             connection.execute(
@@ -252,6 +263,18 @@ def cleanup_sqlite(sqlite_path: str, run_id: str, state: LoadtestState) -> dict[
                 ),
             ]
         )
+        reservation_ids = _unique(
+            [
+                *state.reservation_ids,
+                *_select_in(
+                    connection,
+                    "bulk_reservations",
+                    "reservation_id",
+                    "telegram_user_id",
+                    state.user_ids,
+                ),
+            ]
+        )
 
         result["dashboard_outbox_applications"] = _delete_in(
             connection,
@@ -288,6 +311,11 @@ def cleanup_sqlite(sqlite_path: str, run_id: str, state: LoadtestState) -> dict[
             connection,
             "DELETE FROM bulk_batches WHERE batch_id IN ({})",
             batch_ids,
+        )
+        result["bulk_reservations"] = _delete_in(
+            connection,
+            "DELETE FROM bulk_reservations WHERE reservation_id IN ({})",
+            reservation_ids,
         )
         result["drafts"] = _delete_in(
             connection,
@@ -370,8 +398,20 @@ def _select_in(
 
 
 def _has_column(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    if not _has_table(connection, table):
+        return False
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     return any(row[1] == column for row in rows)
+
+
+def _has_table(connection: sqlite3.Connection, table: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
 
 
 def _unique(values: list[Any]) -> list[Any]:
@@ -392,6 +432,7 @@ async def run_loadtest(
     cleanup: bool,
     report_path: str | None,
     google_throttle_seconds: float = 0.2,
+    bulk_mode: str = "reservations",
 ) -> dict[str, Any]:
     settings = load_settings()
     repository = DraftRepository(settings.sqlite_path)
@@ -441,13 +482,31 @@ async def run_loadtest(
         registration_stale_seconds=settings.bulk_registration_stale_seconds,
         google_api_retry=settings.google_api_retry,
     )
+    bulk_reservation_service = GoogleSheetsBulkReservationService(
+        submission_service=submission_service,
+        repository=repository,
+        google_api_retry=settings.google_api_retry,
+    )
+    bulk_reservation_registrar = BulkReservationRegistrar(
+        repository=repository,
+        credentials_path=settings.google_credentials_path,
+        application_editors=settings.application_editors,
+        urgent_editor_notifications_enabled=settings.urgent_editor_notifications_enabled,
+        editor_urgent_chat_id=settings.editor_urgent_chat_id,
+        registration_stale_seconds=settings.bulk_registration_stale_seconds,
+        google_api_retry=settings.google_api_retry,
+        timezone_name=settings.rollout_schedule.timezone_name,
+    )
     flow = ApplicationFlow(
         repository=repository,
         llm_client=CompleteFakeLlm(),  # type: ignore[arg-type]
         submission_service=submission_service,
         bulk_service=bulk_service,
         bulk_registrar=bulk_registrar,
+        bulk_reservation_service=bulk_reservation_service,
+        bulk_reservation_registrar=bulk_reservation_registrar,
         bulk_reserved_rows=settings.bulk_reserved_rows,
+        bulk_max_rows=settings.bulk_max_rows,
         bulk_creation_stale_seconds=settings.bulk_creation_stale_seconds,
         dashboard_enabled=bool(settings.google_dashboard_spreadsheet_id),
     )
@@ -507,23 +566,41 @@ async def run_loadtest(
         await asyncio.gather(*single_tasks)
     memory_checkpoints["after_singles"] = memory_cleanup()
 
-    bulk_tasks = [
-        _guarded_bulk(
-            semaphore,
-            flow,
-            repository,
-            state,
-            metrics,
-            run_id,
-            user_id=state.user_ids[index % len(state.user_ids)],
-            batch_index=index + 1,
-            rows=profile.bulk_rows,
-            credentials_path=settings.google_credentials_path,
-            google_api_retry=settings.google_api_retry,
-            google_throttle_seconds=google_throttle_seconds,
-        )
-        for index in range(profile.bulk_batches)
-    ]
+    bulk_tasks = []
+    for index in range(profile.bulk_batches):
+        common = {
+            "user_id": state.user_ids[index % len(state.user_ids)],
+            "rows": profile.bulk_rows,
+            "credentials_path": settings.google_credentials_path,
+            "google_api_retry": settings.google_api_retry,
+            "google_throttle_seconds": google_throttle_seconds,
+        }
+        if bulk_mode == "reservations":
+            bulk_tasks.append(
+                _guarded_bulk_reservation(
+                    semaphore,
+                    flow,
+                    repository,
+                    state,
+                    metrics,
+                    run_id,
+                    reservation_index=index + 1,
+                    **common,
+                )
+            )
+        else:
+            bulk_tasks.append(
+                _guarded_bulk(
+                semaphore,
+                flow,
+                repository,
+                state,
+                metrics,
+                run_id,
+                    batch_index=index + 1,
+                    **common,
+                )
+            )
     if bulk_tasks:
         await asyncio.gather(*bulk_tasks)
     memory_checkpoints["after_bulk"] = memory_cleanup()
@@ -563,6 +640,7 @@ async def run_loadtest(
             "single_created": len(state.application_ids)
             - sum(1 for item in state.application_ids if item.startswith("BULK:")),
             "bulk_batches_created": len(state.batch_ids),
+            "bulk_reservations_created": len(state.reservation_ids),
             "bulk_rows_registered": sum(
                 1 for item in state.application_ids if item.startswith("BULK:")
             ),
@@ -595,8 +673,10 @@ async def run_loadtest(
                 item.removeprefix("BULK:") for item in state.application_ids if item.startswith("BULK:")
             ],
             "batch_ids": state.batch_ids,
+            "reservation_ids": state.reservation_ids,
             "google_ranges": state.google_ranges,
         },
+        "bulk_mode": bulk_mode,
         "errors": [asdict(error) for error in metrics.errors],
         "manual_google_cleanup": {
             "required": True,
@@ -759,6 +839,125 @@ async def _guarded_bulk(
         metrics.bulk_seconds.append(time.perf_counter() - started)
 
 
+async def _guarded_bulk_reservation(
+    semaphore: asyncio.Semaphore,
+    flow: ApplicationFlow,
+    repository: DraftRepository,
+    state: LoadtestState,
+    metrics: LoadtestMetrics,
+    run_id: str,
+    *,
+    user_id: int,
+    reservation_index: int,
+    rows: int,
+    credentials_path: str,
+    google_api_retry: Any,
+    google_throttle_seconds: float,
+) -> None:
+    async with semaphore:
+        started = time.perf_counter()
+        try:
+            reservation_id, registered_ids, google_range = await _create_bulk_reservation(
+                flow,
+                repository,
+                run_id,
+                user_id=user_id,
+                reservation_index=reservation_index,
+                rows=rows,
+                credentials_path=credentials_path,
+                google_api_retry=google_api_retry,
+                google_throttle_seconds=google_throttle_seconds,
+            )
+            state.reservation_ids.append(reservation_id)
+            state.application_ids.extend([f"BULK:{item}" for item in registered_ids])
+            state.google_ranges.append(google_range)
+        except Exception as exc:
+            metrics.errors.append(
+                OperationError(
+                    operation="bulk_reservation",
+                    user_id=user_id,
+                    message=_safe_error(exc),
+                )
+            )
+        metrics.bulk_seconds.append(time.perf_counter() - started)
+
+
+async def _create_bulk_reservation(
+    flow: ApplicationFlow,
+    repository: DraftRepository,
+    run_id: str,
+    *,
+    user_id: int,
+    reservation_index: int,
+    rows: int,
+    credentials_path: str,
+    google_api_retry: Any,
+    google_throttle_seconds: float,
+) -> tuple[str, list[str], dict[str, Any]]:
+    response = await flow.create_bulk_batch(user_id)
+    reservation_id = response.keyboard_payload
+    if not reservation_id:
+        raise RuntimeError(f"bulk reservation start did not return id: {response.text[:200]}")
+    await flow.select_bulk_direction(user_id, reservation_id, Direction.FL)
+    await flow.select_bulk_target(
+        user_id,
+        reservation_id,
+        target_kind=BulkTargetKind.ROLLOUT,
+    )
+    await flow.select_bulk_change_type(user_id, reservation_id, ChangeType.ADD)
+    response = await flow.save_bulk_reservation_count(user_id, str(rows), reservation_id)
+    if "Количество строк" not in response.text:
+        raise RuntimeError(f"bulk reservation count failed: {response.text[:200]}")
+    response = await flow.confirm_bulk_reservation_creation(user_id, reservation_id)
+    if "Не удалось" in response.text:
+        raise RuntimeError(response.text[:300])
+    reservation = await repository.get_bulk_reservation(reservation_id)
+    if (
+        reservation is None
+        or not reservation.spreadsheet_id
+        or not reservation.sheet_name
+        or reservation.sheet_id is None
+        or reservation.start_row is None
+        or reservation.end_row is None
+    ):
+        raise RuntimeError(f"bulk reservation was not created: {reservation_id}")
+
+    await _fill_bulk_reservation_rows(
+        reservation,
+        run_id=run_id,
+        reservation_index=reservation_index,
+        rows=rows,
+        credentials_path=credentials_path,
+        google_api_retry=google_api_retry,
+    )
+    await _throttle(google_throttle_seconds)
+    response = await flow.confirm_bulk_reservation_filled(user_id, reservation_id)
+    if "Не удалось" in response.text or "нет заполненных строк" in response.text:
+        raise RuntimeError(response.text[:300])
+    applications = await repository.list_submitted_applications(include_deferred=True)
+    registered_ids = [
+        application.application_id
+        for application in applications
+        if application.telegram_user_id == user_id
+        and application.batch_id is None
+        and application.last_seen_row_number is not None
+        and reservation.start_row <= application.last_seen_row_number <= reservation.end_row
+    ]
+    return (
+        reservation_id,
+        registered_ids,
+        {
+            "kind": "bulk_reservation",
+            "spreadsheet_id": reservation.spreadsheet_id,
+            "sheet_name": reservation.sheet_name,
+            "sheet_id": reservation.sheet_id,
+            "range": f"A{reservation.start_row}:X{reservation.end_row}",
+            "reservation_id": reservation_id,
+            "row_link": reservation.insert_url,
+        },
+    )
+
+
 async def _create_bulk_batch(
     flow: ApplicationFlow,
     repository: DraftRepository,
@@ -857,6 +1056,44 @@ async def _fill_bulk_rows(
     )
 
 
+async def _fill_bulk_reservation_rows(
+    reservation: Any,
+    *,
+    run_id: str,
+    reservation_index: int,
+    rows: int,
+    credentials_path: str,
+    google_api_retry: Any,
+) -> None:
+    values = []
+    for row_index in range(1, rows + 1):
+        row = [""] * 11
+        row[0] = f"{run_id} scriptwriter reservation {reservation_index}"
+        row[2] = f"{run_id} case reservation {reservation_index}.{row_index}"
+        row[3] = f"{run_id} change reservation {reservation_index}.{row_index}"
+        row[4] = f"{run_id} source reservation {reservation_index}.{row_index}"
+        row[10] = f"{run_id}.intent.reservation.{reservation_index}.{row_index}"
+        values.append(row)
+
+    def operation() -> Any:
+        api = build_google_sheets_api(credentials_path)
+        return api.spreadsheets().values().update(
+            spreadsheetId=reservation.spreadsheet_id,
+            range=(
+                f"{quote_sheet_name(reservation.sheet_name)}!"
+                f"A{reservation.start_row}:K{reservation.start_row + rows - 1}"
+            ),
+            valueInputOption="USER_ENTERED",
+            body={"values": values},
+        ).execute()
+
+    await execute_with_retry_async(
+        operation,
+        config=google_api_retry,
+        operation_id=f"loadtest-fill-bulk-reservation:{reservation.reservation_id}",
+    )
+
+
 class _NoopSemaphore:
     async def __aenter__(self) -> None:
         return None
@@ -896,6 +1133,12 @@ def _safe_error(exc: Exception) -> str:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run scenario load test for the bot.")
     parser.add_argument("--profile", choices=sorted(PROFILES), default="baseline")
+    parser.add_argument(
+        "--bulk-mode",
+        choices=("reservations", "legacy"),
+        default="reservations",
+        help="Which bulk workflow to exercise. Default: reservations.",
+    )
     parser.add_argument("--run-id", default=default_run_id())
     parser.add_argument("--cleanup-sqlite", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--concurrency", type=int, default=5)
@@ -919,6 +1162,7 @@ async def async_main(argv: list[str] | None = None) -> int:
         cleanup=args.cleanup_sqlite,
         report_path=args.report_path,
         google_throttle_seconds=args.google_throttle_seconds,
+        bulk_mode=args.bulk_mode,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 1 if report["errors"] else 0

@@ -83,7 +83,7 @@ def load_settings() -> Settings:
         os.getenv("STATUS_POLLING_INTERVAL_SECONDS", "30").strip() or "30"
     )
     status_polling_memory_log_interval = int(
-        os.getenv("STATUS_POLLING_MEMORY_LOG_INTERVAL", "10").strip() or "10"
+        os.getenv("STATUS_POLLING_MEMORY_LOG_INTERVAL", "40").strip() or "40"
     )
     status_not_found_threshold = int(
         os.getenv("STATUS_NOT_FOUND_THRESHOLD", "20").strip() or "20"
