@@ -605,6 +605,12 @@ class GoogleSheetsBulkReservationService:
                     "fields": "userEnteredValue",
                 }
             },
+            _clear_row_background_format_request(
+                sheet_id=sheet_id,
+                start_row=insert_row,
+                end_row=insert_row + count - 1,
+                column_count=column_count,
+            ),
             {
                 "createDeveloperMetadata": {
                     "developerMetadata": {
@@ -2491,6 +2497,28 @@ def _clear_required_input_columns_format_requests(
         for row_number in row_numbers
         for column_index in _reservation_required_column_indices(schema)
     ]
+
+
+def _clear_row_background_format_request(
+    *,
+    sheet_id: int,
+    start_row: int,
+    end_row: int,
+    column_count: int,
+) -> dict[str, Any]:
+    return {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": start_row - 1,
+                "endRowIndex": end_row,
+                "startColumnIndex": 0,
+                "endColumnIndex": column_count,
+            },
+            "cell": {"userEnteredFormat": {}},
+            "fields": "userEnteredFormat.backgroundColor",
+        }
+    }
 
 
 def _registered_reservation_border_requests(

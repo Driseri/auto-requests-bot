@@ -42,6 +42,7 @@ from app.submission import (
     PREVIOUS_WORKSHEET_HEADERS,
     SHEET_HEADERS,
     SheetConfigurationError,
+    URGENT_SHEET_NAME,
     build_google_sheets_api,
     dashboard_projection,
     dashboard_tracked_row,
@@ -727,6 +728,19 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
         if "setBasicFilter" in request
     )
     assert urgent_filter["filter"]["range"]["endRowIndex"] == 1
+    urgent_format = next(
+        request["addConditionalFormatRule"]["rule"]["booleanRule"]["condition"]["values"][0][
+            "userEnteredValue"
+        ]
+        for request in initialization_requests
+        if "addConditionalFormatRule" in request
+        and "$R2" in request["addConditionalFormatRule"]["rule"]["booleanRule"]["condition"][
+            "values"
+        ][0]["userEnteredValue"]
+    )
+    assert urgent_format.startswith("=AND(")
+    assert "$R2=" in urgent_format
+    assert '$U2<>"CHIPS"' in urgent_format
     assert result.row_number == 4
 
 
@@ -758,6 +772,51 @@ async def test_existing_urgent_sheet_gets_chips_section_without_changing_rows():
     assert requests[0]["insertDimension"]["range"]["startIndex"] == 2
     assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 3
     assert result.row_number == 3
+
+
+@pytest.mark.asyncio
+async def test_existing_urgent_sheet_replaces_urgent_conditional_formatting():
+    rows = [
+        SHEET_HEADERS,
+        draft_to_sheet_row(urgent_draft(ChangeType.ADD)),
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+    ]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {URGENT_SHEET_NAME: 42}},
+        headers={(FL_SPREADSHEET, URGENT_SHEET_NAME): SHEET_HEADERS},
+        rows={(FL_SPREADSHEET, URGENT_SHEET_NAME): rows},
+    )
+    api.sheets_by_spreadsheet[FL_SPREADSHEET][0]["conditionalFormats"] = [
+        {"old": 1},
+        {"old": 2},
+    ]
+    service = make_service(api)
+
+    result = await service.submit(urgent_draft(ChangeType.ADD, application_id="COND0001"))
+
+    assert result.success is True
+    requests = api.batch_updates[-2]["body"]["requests"]
+    deleted_indices = [
+        request["deleteConditionalFormatRule"]["index"]
+        for request in requests
+        if "deleteConditionalFormatRule" in request
+    ]
+    assert deleted_indices == [1, 0]
+    urgent_rules = [
+        request["addConditionalFormatRule"]["rule"]["booleanRule"]["condition"]["values"][0][
+            "userEnteredValue"
+        ]
+        for request in requests
+        if "addConditionalFormatRule" in request
+        and "$R2" in request["addConditionalFormatRule"]["rule"]["booleanRule"]["condition"][
+            "values"
+        ][0]["userEnteredValue"]
+    ]
+    assert len(urgent_rules) == 1
+    assert urgent_rules[0].startswith("=AND(")
+    assert "$R2=" in urgent_rules[0]
+    assert '$U2<>"CHIPS"' in urgent_rules[0]
 
 
 @pytest.mark.asyncio

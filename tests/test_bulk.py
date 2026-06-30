@@ -391,10 +391,21 @@ async def test_bulk_reservation_creation_highlights_required_columns_without_bor
         if "repeatCell" in request
         and request["repeatCell"].get("fields") == "userEnteredFormat.backgroundColor"
     ]
+    clear_background = next(
+        item
+        for item in repeat_cells
+        if item["range"].get("startRowIndex") == (result.reservation.start_row - 1)
+        and item["range"].get("endRowIndex") == result.reservation.end_row
+        and item["range"].get("startColumnIndex") == 0
+        and item["range"].get("endColumnIndex") == len(WORKSHEET_HEADERS)
+        and item["cell"].get("userEnteredFormat") == {}
+    )
+    assert clear_background["fields"] == "userEnteredFormat.backgroundColor"
     highlighted_columns = {
         item["range"]["startColumnIndex"]
         for item in repeat_cells
         if item["range"].get("startRowIndex") == (result.reservation.start_row - 1)
+        and "backgroundColor" in item["cell"].get("userEnteredFormat", {})
     }
     assert highlighted_columns == {0, 2, 3, 4, 10}
     colors_by_column = {
@@ -403,6 +414,7 @@ async def test_bulk_reservation_creation_highlights_required_columns_without_bor
         ]
         for item in repeat_cells
         if item["range"]["startColumnIndex"] in highlighted_columns
+        and "backgroundColor" in item["cell"].get("userEnteredFormat", {})
     }
     assert colors_by_column[0] == BULK_RESERVATION_SCRIPTWRITER_BACKGROUND_COLOR
     assert {
@@ -449,6 +461,7 @@ async def test_bulk_reservation_chips_creation_highlights_chips_required_columns
         if "repeatCell" in request
         and request["repeatCell"].get("fields") == "userEnteredFormat.backgroundColor"
         and request["repeatCell"]["range"].get("startRowIndex") == (result.reservation.start_row - 1)
+        and "backgroundColor" in request["repeatCell"]["cell"].get("userEnteredFormat", {})
     }
     assert highlighted_columns == {0, 2, 3, 4, 5, 10}
     colors_by_column = {
@@ -459,6 +472,7 @@ async def test_bulk_reservation_chips_creation_highlights_chips_required_columns
         if "repeatCell" in request
         and request["repeatCell"].get("fields") == "userEnteredFormat.backgroundColor"
         and request["repeatCell"]["range"].get("startRowIndex") == (result.reservation.start_row - 1)
+        and "backgroundColor" in request["repeatCell"]["cell"].get("userEnteredFormat", {})
     }
     assert colors_by_column[0] == BULK_RESERVATION_SCRIPTWRITER_BACKGROUND_COLOR
     assert all(

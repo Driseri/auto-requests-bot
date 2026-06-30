@@ -938,6 +938,13 @@ class GoogleSheetsSubmissionService:
                 end_row_index=marker_position,
             )
         )
+        formatting_requests.extend(
+            _replace_urgent_conditional_formatting_requests(
+                api,
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+            )
+        )
         api.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": formatting_requests},
@@ -2837,13 +2844,43 @@ def _urgent_conditional_formatting_request(sheet_id: int) -> dict[str, Any]:
                 "booleanRule": {
                     "condition": {
                         "type": "CUSTOM_FORMULA",
-                        "values": [{"userEnteredValue": '=$R2="Да"'}],
+                        "values": [{"userEnteredValue": '=AND($R2="Да",$U2<>"CHIPS")'}],
                     },
                     "format": {"backgroundColor": {"red": 1.0, "green": 0.90, "blue": 0.82}},
                 },
             },
         }
     }
+
+
+def _replace_urgent_conditional_formatting_requests(
+    api: Any,
+    *,
+    spreadsheet_id: str,
+    sheet_id: int,
+) -> list[dict[str, Any]]:
+    metadata = api.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId),conditionalFormats)",
+    ).execute()
+    conditional_count = 0
+    for sheet in metadata.get("sheets", []):
+        properties = sheet.get("properties", {})
+        if properties.get("sheetId") == sheet_id:
+            conditional_count = len(sheet.get("conditionalFormats", []))
+            break
+    requests: list[dict[str, Any]] = [
+        {
+            "deleteConditionalFormatRule": {
+                "sheetId": sheet_id,
+                "index": index,
+            }
+        }
+        for index in range(conditional_count - 1, -1, -1)
+    ]
+    requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=1))
+    requests.append(_urgent_conditional_formatting_request(sheet_id))
+    return requests
 
 
 def _urgent_dashboard_conditional_formatting_request(sheet_id: int) -> dict[str, Any]:
