@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from html import escape
 from uuid import uuid4
 
@@ -11,7 +12,12 @@ from app.formatting import (
     render_html_with_formatting,
     serialize_formatting_spans,
 )
-from app.bulk import BulkApplicationRegistrar, BulkBatchServiceProtocol
+from app.bulk import (
+    BulkApplicationRegistrar,
+    BulkReservationRegistrar,
+    BulkReservationServiceProtocol,
+    BulkBatchServiceProtocol,
+)
 from app.llm import LLM_ERROR_PREFIX, LlmClient
 from app.models import (
     AnswerType,
@@ -20,6 +26,9 @@ from app.models import (
     BotResponse,
     BulkBatch,
     BulkCreationState,
+    BulkReservation,
+    BulkReservationState,
+    BulkTargetKind,
     ChangeType,
     Direction,
     Draft,
@@ -60,6 +69,7 @@ PENDING_SET_DEFAULT_INTENT = "set_default_intent"
 PENDING_SET_DEFAULT_SCRIPTWRITER = "set_default_scriptwriter"
 PENDING_SET_DEFAULT_DIRECTION = "set_default_direction"
 PENDING_CREATE_BULK_DIRECTION = "create_bulk_direction"
+PENDING_BULK_RESERVATION_COUNT = "bulk_reservation_count"
 
 STEP_PROMPTS = {
     Step.DIRECTION: "Выберите направление заявки.",
@@ -108,8 +118,11 @@ class ApplicationFlow:
         submission_service: SubmissionServiceProtocol,
         bulk_service: BulkBatchServiceProtocol | None = None,
         bulk_registrar: BulkApplicationRegistrar | None = None,
+        bulk_reservation_service: BulkReservationServiceProtocol | None = None,
+        bulk_reservation_registrar: BulkReservationRegistrar | None = None,
         show_llm_response_json: bool = False,
         bulk_reserved_rows: int = 100,
+        bulk_max_rows: int = 50,
         bulk_creation_stale_seconds: int = 600,
         dashboard_enabled: bool = False,
         urgent_editor_notifications_enabled: bool = False,
@@ -120,8 +133,11 @@ class ApplicationFlow:
         self.submission_service = submission_service
         self.bulk_service = bulk_service
         self.bulk_registrar = bulk_registrar
+        self.bulk_reservation_service = bulk_reservation_service
+        self.bulk_reservation_registrar = bulk_reservation_registrar
         self.show_llm_response_json = show_llm_response_json
         self.bulk_reserved_rows = bulk_reserved_rows
+        self.bulk_max_rows = bulk_max_rows
         self.bulk_creation_stale_seconds = bulk_creation_stale_seconds
         self.dashboard_enabled = dashboard_enabled
         self.urgent_editor_notifications_enabled = urgent_editor_notifications_enabled
@@ -158,6 +174,9 @@ class ApplicationFlow:
         """Восстановить незавершенный workflow перед показом главного меню."""
         settings = await self.repository.get_user_settings(telegram_user_id)
         pending_action = settings.pending_action or ""
+        reservation = await self.repository.get_active_bulk_reservation(telegram_user_id)
+        if reservation is not None:
+            return self._bulk_reservation_response(reservation)
         if pending_action.startswith(f"{PENDING_CREATE_BULK_DIRECTION}:"):
             idempotency_key = pending_action.split(":", maxsplit=1)[1]
             request = await self.repository.get_bulk_creation_request(idempotency_key)
@@ -277,7 +296,7 @@ class ApplicationFlow:
     async def bulk_upload_stub(self, telegram_user_id: int) -> BotResponse:
         return await self.open_bulk_menu(telegram_user_id)
 
-    async def open_bulk_menu(self, telegram_user_id: int) -> BotResponse:
+    async def _legacy_open_bulk_menu(self, telegram_user_id: int) -> BotResponse:
         return BotResponse(
             text=(
                 "Массовая загрузка работает через отдельный лист Google Sheets.\n\n"
@@ -288,7 +307,7 @@ class ApplicationFlow:
             keyboard=KeyboardKind.BULK_MENU,
         )
 
-    async def create_bulk_batch(self, telegram_user_id: int) -> BotResponse:
+    async def _legacy_create_bulk_batch(self, telegram_user_id: int) -> BotResponse:
         """Запустить выбор направления перед созданием секции массовой заявки."""
         if self.bulk_service is None:
             return BotResponse(
@@ -352,7 +371,7 @@ class ApplicationFlow:
         await self.repository.save_user_setting(telegram_user_id, "pending_action", None)
         return self._bulk_created_response(batch_id, insert_url)
 
-    async def select_bulk_direction(
+    async def _legacy_select_bulk_direction(
         self,
         telegram_user_id: int,
         idempotency_key: str,
@@ -421,6 +440,304 @@ class ApplicationFlow:
         return BotResponse(
             text=result.message,
             keyboard=KeyboardKind.BULK_COMPLETED,
+        )
+
+    async def open_bulk_menu(self, telegram_user_id: int) -> BotResponse:
+        if self.bulk_reservation_service is None:
+            return await self._legacy_open_bulk_menu(telegram_user_id)
+        return BotResponse(
+            text=(
+                "Массовая заявка создаёт обычные строки сразу в нужном рабочем листе.\n\n"
+                "Выберите направление, место, тип и количество строк. После заполнения бот "
+                "зарегистрирует заполненные строки как обычные заявки."
+            ),
+            keyboard=KeyboardKind.BULK_MENU,
+        )
+
+    async def create_bulk_batch(self, telegram_user_id: int) -> BotResponse:
+        if self.bulk_reservation_service is None:
+            return await self._legacy_create_bulk_batch(telegram_user_id)
+        active = await self.repository.get_active_bulk_reservation(telegram_user_id)
+        if active is not None:
+            return self._bulk_reservation_response(active)
+        reservation_id = f"RES-{uuid4().hex[:8].upper()}"
+        await self.repository.create_bulk_reservation(
+            reservation_id=reservation_id,
+            idempotency_key=uuid4().hex,
+            telegram_user_id=telegram_user_id,
+        )
+        return BotResponse(
+            text="Выберите направление массовой заявки.",
+            keyboard=KeyboardKind.BULK_DIRECTION,
+            keyboard_payload=reservation_id,
+        )
+
+    async def select_bulk_direction(
+        self,
+        telegram_user_id: int,
+        reservation_id: str,
+        direction: Direction,
+    ) -> BotResponse:
+        if self.bulk_reservation_service is None:
+            return await self._legacy_select_bulk_direction(
+                telegram_user_id,
+                reservation_id,
+                direction,
+            )
+        reservation = await self.repository.get_bulk_reservation(reservation_id)
+        if reservation is None or reservation.telegram_user_id != telegram_user_id:
+            return BotResponse(text="Массовый резерв не найден.", keyboard=KeyboardKind.BULK_MENU)
+        reservation = await self.repository.update_bulk_reservation_step(
+            reservation_id,
+            state=BulkReservationState.AWAITING_TARGET,
+            direction=direction.value,
+        )
+        return self._bulk_reservation_response(reservation)
+
+    async def select_bulk_target(
+        self,
+        telegram_user_id: int,
+        reservation_id: str,
+        target_kind: BulkTargetKind,
+    ) -> BotResponse:
+        reservation = await self.repository.get_bulk_reservation(reservation_id)
+        if reservation is None or reservation.telegram_user_id != telegram_user_id:
+            return BotResponse(text="Массовый резерв не найден.", keyboard=KeyboardKind.BULK_MENU)
+        reservation = await self.repository.update_bulk_reservation_step(
+            reservation_id,
+            state=BulkReservationState.AWAITING_CHANGE_TYPE,
+            target_kind=target_kind.value,
+        )
+        return self._bulk_reservation_response(reservation)
+
+    async def select_bulk_change_type(
+        self,
+        telegram_user_id: int,
+        reservation_id: str,
+        change_type: ChangeType,
+    ) -> BotResponse:
+        reservation = await self.repository.get_bulk_reservation(reservation_id)
+        if reservation is None or reservation.telegram_user_id != telegram_user_id:
+            return BotResponse(text="Массовый резерв не найден.", keyboard=KeyboardKind.BULK_MENU)
+        if reservation.target_kind == BulkTargetKind.INTEGRATION.value and change_type == ChangeType.CHIPS:
+            return BotResponse(
+                text="CHIPS для интеграций пока не поддерживается. Выберите ADD или EDIT.",
+                keyboard=KeyboardKind.BULK_CHANGE_TYPE,
+                keyboard_payload=reservation_id,
+            )
+        reservation = await self.repository.update_bulk_reservation_step(
+            reservation_id,
+            state=BulkReservationState.AWAITING_COUNT,
+            change_type=change_type.value,
+        )
+        await self.repository.save_user_setting(
+            telegram_user_id,
+            "pending_action",
+            f"{PENDING_BULK_RESERVATION_COUNT}:{reservation_id}",
+        )
+        return BotResponse(
+            text=f"Введите количество строк для массовой заявки. Максимум: {self.bulk_max_rows}.",
+            keyboard=KeyboardKind.STEP,
+        )
+
+    async def save_bulk_reservation_count(
+        self,
+        telegram_user_id: int,
+        text: str,
+        reservation_id: str,
+    ) -> BotResponse:
+        reservation = await self.repository.get_bulk_reservation(reservation_id)
+        if reservation is None or reservation.telegram_user_id != telegram_user_id:
+            return BotResponse(text="Массовый резерв не найден.", keyboard=KeyboardKind.BULK_MENU)
+        try:
+            count = int(text.strip())
+        except ValueError:
+            return BotResponse(
+                text=f"Введите число от 1 до {self.bulk_max_rows}.",
+                keyboard=KeyboardKind.STEP,
+            )
+        if count <= 0 or count > self.bulk_max_rows:
+            return BotResponse(
+                text=f"Введите число от 1 до {self.bulk_max_rows}.",
+                keyboard=KeyboardKind.STEP,
+            )
+        await self.repository.save_user_setting(telegram_user_id, "pending_action", None)
+        reservation = await self.repository.update_bulk_reservation_step(
+            reservation_id,
+            state=BulkReservationState.AWAITING_CONFIRMATION,
+            requested_count=count,
+        )
+        return self._bulk_reservation_response(reservation)
+
+    async def confirm_bulk_reservation_creation(
+        self,
+        telegram_user_id: int,
+        reservation_id: str,
+    ) -> BotResponse:
+        if self.bulk_reservation_service is None:
+            return BotResponse(text="Массовая заявка не настроена.", keyboard=KeyboardKind.BULK_MENU)
+        existing = await self.repository.get_bulk_reservation(reservation_id)
+        if (
+            existing is not None
+            and existing.telegram_user_id == telegram_user_id
+            and existing.state == BulkReservationState.CREATING.value
+            and _bulk_reservation_is_recent(
+                existing,
+                stale_after_seconds=self.bulk_creation_stale_seconds,
+            )
+        ):
+            return self._bulk_reservation_response(existing)
+        reservation = await self.repository.claim_bulk_reservation_creation(
+            reservation_id,
+            stale_after_seconds=self.bulk_creation_stale_seconds,
+        )
+        if reservation is None or reservation.telegram_user_id != telegram_user_id:
+            return BotResponse(text="Массовый резерв не найден.", keyboard=KeyboardKind.BULK_MENU)
+        if reservation.state == BulkReservationState.CREATED.value:
+            return self._bulk_reservation_response(reservation)
+        if reservation.state != BulkReservationState.CREATING.value:
+            return self._bulk_reservation_response(reservation)
+        result = await self.bulk_reservation_service.create_reservation_with_lock(reservation)
+        if not result.success or result.reservation is None:
+            if result.retry_allowed:
+                return BotResponse(
+                    text=result.message,
+                    keyboard=KeyboardKind.BULK_COUNT_CONFIRM,
+                    keyboard_payload=reservation_id,
+                )
+            await self.repository.fail_bulk_reservation(reservation_id, error=result.message)
+            return BotResponse(text=result.message, keyboard=KeyboardKind.BULK_MENU)
+        saved = await self.repository.complete_bulk_reservation_creation_and_shift(
+            reservation_id,
+            spreadsheet_id=result.reservation.spreadsheet_id or "",
+            sheet_id=result.reservation.sheet_id or 0,
+            sheet_name=result.reservation.sheet_name or "",
+            start_row=result.reservation.start_row or 0,
+            end_row=result.reservation.end_row or 0,
+            insert_url=result.insert_url or "",
+            shifted_rows=result.reservation.requested_count or 0,
+        )
+        return self._bulk_reservation_response(saved)
+
+    async def confirm_bulk_reservation_filled(
+        self,
+        telegram_user_id: int,
+        reservation_id: str,
+    ) -> BotResponse:
+        if self.bulk_reservation_registrar is None:
+            return BotResponse(text="Регистрация массового резерва не настроена.", keyboard=KeyboardKind.BULK_MENU)
+        result = await self.bulk_reservation_registrar.register_reservation(
+            reservation_id,
+            telegram_user_id,
+        )
+        if not result.success:
+            link = (
+                f'\n\n<a href="{escape(result.insert_url, quote=True)}">Открыть исходный диапазон</a>'
+                if result.insert_url
+                else ""
+            )
+            return BotResponse(
+                text=f"{escape(result.message)}{link}",
+                keyboard=KeyboardKind.BULK_RESERVATION_CREATED,
+                keyboard_payload=reservation_id,
+                parse_mode="HTML",
+            )
+        return BotResponse(
+            text=result.message,
+            keyboard=KeyboardKind.BULK_RESERVATION_COMPLETED,
+        )
+
+    async def cancel_bulk_reservation(
+        self,
+        telegram_user_id: int,
+        reservation_id: str,
+    ) -> BotResponse:
+        reservation = await self.repository.get_bulk_reservation(reservation_id)
+        if reservation is not None and reservation.telegram_user_id == telegram_user_id:
+            await self.repository.cancel_bulk_reservation(reservation_id)
+        await self.repository.save_user_setting(telegram_user_id, "pending_action", None)
+        return BotResponse(
+            text=(
+                "Массовая заявка отменена. Если строки уже были созданы в таблице, "
+                "они останутся пустым резервом и не будут зарегистрированы ботом."
+            ),
+            keyboard=KeyboardKind.BULK_MENU,
+        )
+
+    def _bulk_reservation_response(self, reservation: BulkReservation | None) -> BotResponse:
+        if reservation is None:
+            return BotResponse(text="Массовый резерв не найден.", keyboard=KeyboardKind.BULK_MENU)
+        state = reservation.state
+        if state == BulkReservationState.AWAITING_DIRECTION.value:
+            return BotResponse(
+                text="Выберите направление массовой заявки.",
+                keyboard=KeyboardKind.BULK_DIRECTION,
+                keyboard_payload=reservation.reservation_id,
+            )
+        if state == BulkReservationState.AWAITING_TARGET.value:
+            return BotResponse(
+                text="Куда заносим массовую заявку?",
+                keyboard=KeyboardKind.BULK_TARGET,
+                keyboard_payload=reservation.reservation_id,
+            )
+        if state == BulkReservationState.AWAITING_CHANGE_TYPE.value:
+            return BotResponse(
+                text="Выберите тип изменения для строк.",
+                keyboard=KeyboardKind.BULK_CHANGE_TYPE,
+                keyboard_payload=_bulk_change_type_keyboard_payload(reservation),
+            )
+        if state == BulkReservationState.AWAITING_COUNT.value:
+            return BotResponse(
+                text=f"Введите количество строк для массовой заявки. Максимум: {self.bulk_max_rows}.",
+                keyboard=KeyboardKind.STEP,
+            )
+        if state == BulkReservationState.AWAITING_CONFIRMATION.value:
+            return BotResponse(
+                text=(
+                    "Проверьте параметры массового ввода:\n\n"
+                    f"Направление: {direction_display_label(reservation.direction)}\n"
+                    f"Куда заносим: {_bulk_target_label(reservation.target_kind)}\n"
+                    f"Тип: {reservation.change_type}\n"
+                    f"Количество строк: {reservation.requested_count}\n\n"
+                    "Статус у строк останется пустым до регистрации."
+                ),
+                keyboard=KeyboardKind.BULK_COUNT_CONFIRM,
+                keyboard_payload=reservation.reservation_id,
+            )
+        if state == BulkReservationState.CREATING.value:
+            return BotResponse(
+                text=(
+                    "Строки для массовой заявки уже создаются.\n\n"
+                    "Подождите несколько секунд. Если сообщение не обновится, нажмите кнопку создания ещё раз."
+                ),
+                keyboard=KeyboardKind.BULK_COUNT_CONFIRM,
+                keyboard_payload=reservation.reservation_id,
+            )
+        if state == BulkReservationState.CREATED.value:
+            link = (
+                f'\n\n<a href="{escape(reservation.insert_url or "", quote=True)}">Открыть диапазон</a>'
+                if reservation.insert_url
+                else ""
+            )
+            return BotResponse(
+                text=(
+                    "Строки для массовой заявки созданы.\n\n"
+                    "Заполните нужные строки в таблице. После заполнения вернитесь сюда "
+                    "и нажмите «Заявка заполнена»."
+                    f"{link}"
+                ),
+                keyboard=KeyboardKind.BULK_RESERVATION_CREATED,
+                keyboard_payload=reservation.reservation_id,
+                parse_mode="HTML",
+            )
+        if state == BulkReservationState.REGISTERED.value:
+            return BotResponse(
+                text=f"Массовый ввод уже зарегистрирован. Заявок: {reservation.registered_count}.",
+                keyboard=KeyboardKind.BULK_RESERVATION_COMPLETED,
+            )
+        return BotResponse(
+            text=reservation.last_error or "Массовый резерв находится в ошибочном состоянии.",
+            keyboard=KeyboardKind.BULK_MENU,
         )
 
     async def open_defaults_menu(self, telegram_user_id: int) -> BotResponse:
@@ -1453,6 +1770,14 @@ class ApplicationFlow:
             return None
 
         value = (text or "").strip()
+        if pending_action.startswith(f"{PENDING_BULK_RESERVATION_COUNT}:"):
+            reservation_id = pending_action.split(":", maxsplit=1)[1]
+            return await self.save_bulk_reservation_count(
+                telegram_user_id,
+                value,
+                reservation_id,
+            )
+
         if not value:
             return BotResponse(
                 text="Значение не должно быть пустым.",
@@ -1724,6 +2049,37 @@ def _direction_requires_answer_type(direction: str | None) -> bool:
 
 def _answer_type_requires_change_type(answer_type: str | None) -> bool:
     return answer_type in {AnswerType.ROLLOUT.value, AnswerType.URGENT.value}
+
+
+def _bulk_target_label(target_kind: str | None) -> str:
+    labels = {
+        BulkTargetKind.ROLLOUT.value: AnswerType.ROLLOUT.value,
+        BulkTargetKind.URGENT.value: AnswerType.URGENT.value,
+        BulkTargetKind.INTEGRATION.value: AnswerType.INTEGRATION.value,
+    }
+    return labels.get(target_kind or "", target_kind or "-")
+
+
+def _bulk_change_type_keyboard_payload(reservation: BulkReservation) -> str:
+    if reservation.target_kind == BulkTargetKind.INTEGRATION.value:
+        return f"{reservation.reservation_id}:integration"
+    return reservation.reservation_id
+
+
+def _bulk_reservation_is_recent(
+    reservation: BulkReservation,
+    *,
+    stale_after_seconds: int,
+) -> bool:
+    if not reservation.started_at:
+        return False
+    try:
+        started = datetime.fromisoformat(reservation.started_at)
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - started < timedelta(seconds=stale_after_seconds)
 
 
 def _is_llm_error_result(llm_result) -> bool:

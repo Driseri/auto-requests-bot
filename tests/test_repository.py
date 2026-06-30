@@ -9,6 +9,7 @@ from app.models import (
     ApplicationStatus,
     BulkBatchLocationState,
     BulkRegistrationState,
+    BulkReservationState,
     FieldName,
     Step,
 )
@@ -50,6 +51,155 @@ async def test_sqlite_state_persists_between_repository_instances(tmp_path):
     assert draft is not None
     assert draft.intent == "intent.persisted"
     assert draft.current_step == Step.SCRIPTWRITER
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_migration_and_row_shift(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_reservations.db"))
+    await repository.init()
+    await repository.create_bulk_reservation(
+        reservation_id="RES-1",
+        idempotency_key="key-1",
+        telegram_user_id=10,
+    )
+    await repository.complete_bulk_reservation_creation(
+        "RES-1",
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="29.06 (1)",
+        start_row=20,
+        end_row=24,
+        insert_url="https://example.test",
+    )
+    await repository.save_submitted_application(
+        application_id="APP-BELOW",
+        telegram_user_id=10,
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="29.06 (1)",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=30,
+    )
+    await repository.save_submitted_application(
+        application_id="APP-ABOVE",
+        telegram_user_id=10,
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="29.06 (1)",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=10,
+    )
+
+    await repository.shift_rows_after_insert(
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        from_row=15,
+        delta=5,
+    )
+
+    reservation = await repository.get_bulk_reservation("RES-1")
+    below = await repository.get_submitted_application("APP-BELOW")
+    above = await repository.get_submitted_application("APP-ABOVE")
+    assert reservation is not None
+    assert reservation.state == BulkReservationState.CREATED.value
+    assert reservation.start_row == 25
+    assert reservation.end_row == 29
+    assert below is not None
+    assert below.last_seen_row_number == 35
+    assert above is not None
+    assert above.last_seen_row_number == 10
+
+
+@pytest.mark.asyncio
+async def test_failed_bulk_reservation_is_not_active(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_failed_not_active.db"))
+    await repository.init()
+    await repository.create_bulk_reservation(
+        reservation_id="RES-FAILED",
+        idempotency_key="key-failed",
+        telegram_user_id=10,
+    )
+    await repository.fail_bulk_reservation("RES-FAILED", error="google failed")
+
+    assert await repository.get_active_bulk_reservation(10) is None
+
+
+@pytest.mark.asyncio
+async def test_complete_bulk_reservation_creation_and_shift_is_atomic(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_creation_atomic.db"))
+    await repository.init()
+    await repository.create_bulk_reservation(
+        reservation_id="RES-1",
+        idempotency_key="key-1",
+        telegram_user_id=10,
+    )
+    await repository.update_bulk_reservation_step(
+        "RES-1",
+        state=BulkReservationState.AWAITING_CONFIRMATION,
+        direction="ФЛ",
+        target_kind="rollout",
+        change_type="ADD",
+        requested_count=3,
+    )
+    await repository.save_submitted_application(
+        application_id="APP-BELOW",
+        telegram_user_id=10,
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="29.06 (1)",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=30,
+    )
+
+    await repository.complete_bulk_reservation_creation_and_shift(
+        "RES-1",
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="29.06 (1)",
+        start_row=20,
+        end_row=22,
+        insert_url="https://example.test",
+        shifted_rows=3,
+    )
+
+    reservation = await repository.get_bulk_reservation("RES-1")
+    below = await repository.get_submitted_application("APP-BELOW")
+    assert reservation is not None
+    assert reservation.state == BulkReservationState.CREATED.value
+    assert reservation.start_row == 20
+    assert reservation.end_row == 22
+    assert below is not None
+    assert below.last_seen_row_number == 33
+
+
+@pytest.mark.asyncio
+async def test_bulk_section_lock_blocks_other_owner_until_released(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_section_lock.db"))
+    await repository.init()
+
+    first = await repository.acquire_bulk_section_lock(
+        lock_key="spreadsheet:sheet:rollout:add",
+        owner="RES-1",
+        ttl_seconds=600,
+    )
+    second = await repository.acquire_bulk_section_lock(
+        lock_key="spreadsheet:sheet:rollout:add",
+        owner="RES-2",
+        ttl_seconds=600,
+    )
+    await repository.release_bulk_section_lock(
+        lock_key="spreadsheet:sheet:rollout:add",
+        owner="RES-1",
+    )
+    third = await repository.acquire_bulk_section_lock(
+        lock_key="spreadsheet:sheet:rollout:add",
+        owner="RES-2",
+        ttl_seconds=600,
+    )
+
+    assert first is True
+    assert second is False
+    assert third is True
 
 
 @pytest.mark.asyncio

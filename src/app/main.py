@@ -7,7 +7,12 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 
 from app.bot import create_router
-from app.bulk import BulkApplicationRegistrar, GoogleSheetsBulkBatchService
+from app.bulk import (
+    BulkApplicationRegistrar,
+    BulkReservationRegistrar,
+    GoogleSheetsBulkBatchService,
+    GoogleSheetsBulkReservationService,
+)
 from app.config import load_settings
 from app.flow import ApplicationFlow
 from app.llm import LlmClient
@@ -43,7 +48,7 @@ async def main() -> None:
         "gigachat_retry_backoff_factor=%s gigachat_show_response_json=%s "
         "status_polling_enabled=%s status_polling_interval_seconds=%s "
         "dashboard_sync_interval_seconds=%s "
-        "bulk_reserved_rows=%s bulk_registration_stale_seconds=%s "
+        "bulk_max_rows=%s bulk_reserved_rows=%s bulk_registration_stale_seconds=%s "
         "bot_timezone=%s rollout_wednesday_cutoff=%s rollout_thursday_cutoff=%s "
         "application_editors_count=%s",
         settings.sqlite_path,
@@ -69,6 +74,7 @@ async def main() -> None:
         settings.status_polling_enabled,
         settings.status_polling_interval_seconds,
         settings.dashboard_sync_interval_seconds,
+        settings.bulk_max_rows,
         settings.bulk_reserved_rows,
         settings.bulk_registration_stale_seconds,
         settings.rollout_schedule.timezone_name,
@@ -94,6 +100,32 @@ async def main() -> None:
         )
         if settings.google_dashboard_spreadsheet_id
         else None
+    )
+    submission_service = GoogleSheetsSubmissionService(
+        direction_spreadsheets=direction_spreadsheets,
+        dashboard_spreadsheet_id=settings.google_dashboard_spreadsheet_id,
+        credentials_path=settings.google_credentials_path,
+        rollout_schedule=settings.rollout_schedule,
+        timezone_name=settings.rollout_schedule.timezone_name,
+        application_editors=settings.application_editors,
+        dashboard_sync=dashboard_sync,
+        google_api_retry=settings.google_api_retry,
+    )
+    bulk_reservation_service = GoogleSheetsBulkReservationService(
+        submission_service=submission_service,
+        repository=repository,
+        google_api_retry=settings.google_api_retry,
+    )
+    bulk_reservation_registrar = BulkReservationRegistrar(
+        repository=repository,
+        credentials_path=settings.google_credentials_path,
+        application_editors=settings.application_editors,
+        urgent_editor_notifications_enabled=(
+            settings.urgent_editor_notifications_enabled
+        ),
+        editor_urgent_chat_id=settings.editor_urgent_chat_id,
+        google_api_retry=settings.google_api_retry,
+        timezone_name=settings.rollout_schedule.timezone_name,
     )
     bulk_registrar = BulkApplicationRegistrar(
         repository=repository,
@@ -122,16 +154,7 @@ async def main() -> None:
             user_prompt_path=settings.gigachat_user_prompt_path,
         ),
         show_llm_response_json=settings.gigachat_show_response_json,
-        submission_service=GoogleSheetsSubmissionService(
-            direction_spreadsheets=direction_spreadsheets,
-            dashboard_spreadsheet_id=settings.google_dashboard_spreadsheet_id,
-            credentials_path=settings.google_credentials_path,
-            rollout_schedule=settings.rollout_schedule,
-            timezone_name=settings.rollout_schedule.timezone_name,
-            application_editors=settings.application_editors,
-            dashboard_sync=dashboard_sync,
-            google_api_retry=settings.google_api_retry,
-        ),
+        submission_service=submission_service,
         bulk_service=GoogleSheetsBulkBatchService(
             direction_spreadsheets=direction_spreadsheets,
             credentials_path=settings.google_credentials_path,
@@ -142,6 +165,9 @@ async def main() -> None:
             timezone_name=settings.rollout_schedule.timezone_name,
         ),
         bulk_registrar=bulk_registrar,
+        bulk_reservation_service=bulk_reservation_service,
+        bulk_reservation_registrar=bulk_reservation_registrar,
+        bulk_max_rows=settings.bulk_max_rows,
         bulk_reserved_rows=settings.bulk_reserved_rows,
         bulk_creation_stale_seconds=settings.bulk_creation_stale_seconds,
         dashboard_enabled=bool(settings.google_dashboard_spreadsheet_id),

@@ -59,6 +59,7 @@ from app.submission import (
 LOGGER = logging.getLogger(__name__)
 URGENT_EDITOR_NOTIFICATION_EVENT_TYPE = "urgent-editor-application-created"
 URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE = "urgent-editor-scriptwriter-response"
+URGENT_EDITOR_BULK_RESERVATION_EVENT_TYPE = "urgent-editor-bulk-reservation-created"
 SCRIPTWRITER_RESPONSE_PREVIEW_LIMIT = 1800
 STABLE_NOTIFICATION_POLLS = 3
 SINGLE_IMPORTANT_STATUSES = {
@@ -1969,6 +1970,7 @@ class StatusNotificationService:
         if item.event_type in {
             URGENT_EDITOR_NOTIFICATION_EVENT_TYPE,
             URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE,
+            URGENT_EDITOR_BULK_RESERVATION_EVENT_TYPE,
         }:
             return None
         return await self._reply_markup_for_user(item.telegram_user_id)
@@ -1976,7 +1978,13 @@ class StatusNotificationService:
     async def _keyboard_kind_for_user(self, telegram_user_id: int) -> KeyboardKind:
         settings = await self.repository.get_user_settings(telegram_user_id)
         pending_action = settings.pending_action or ""
-        if pending_action.startswith("create_bulk_direction:"):
+        if pending_action.startswith("create_bulk_direction:") or pending_action.startswith(
+            "bulk_reservation_count:"
+        ):
+            return KeyboardKind.NOTIFICATION_BULK_BACK
+
+        reservation = await self.repository.get_active_bulk_reservation(telegram_user_id)
+        if reservation is not None:
             return KeyboardKind.NOTIFICATION_BULK_BACK
 
         batch = await self.repository.get_latest_unregistered_bulk_batch(

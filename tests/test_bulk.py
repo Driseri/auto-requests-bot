@@ -14,7 +14,9 @@ from app.bulk import (
     CURRENT_BULK_STAGING_HEADERS,
     LEGACY_BULK_STAGING_HEADERS,
     BulkApplicationRegistrar,
+    BulkReservationRegistrar,
     GoogleSheetsBulkBatchService,
+    GoogleSheetsBulkReservationService,
     _bulk_schema_layout,
 )
 from app.models import (
@@ -24,11 +26,20 @@ from app.models import (
     BulkApplicationStatus,
     BulkBatchStatus,
     BulkRegistrationState,
+    BulkReservation,
+    BulkReservationState,
+    BulkTargetKind,
     ChangeType,
     Direction,
 )
 from app.repository import DraftRepository
-from app.submission import DirectionSpreadsheetConfig
+from app.scheduling import RolloutSchedule
+from app.submission import (
+    CHIPS_WORKSHEET_HEADERS,
+    DirectionSpreadsheetConfig,
+    GoogleSheetsSubmissionService,
+    WORKSHEET_HEADERS,
+)
 
 
 def test_new_bulk_sheet_uses_client_case_header():
@@ -92,12 +103,33 @@ class FakeValuesResource:
         return FakeRequest({"updatedRows": 1})
 
 
+class FakeDeveloperMetadataResource:
+    def __init__(self, api: "FakeSheetsApi") -> None:
+        self.api = api
+
+    def search(self, **kwargs):
+        self.api.developer_metadata_search_calls.append(kwargs)
+        lookup = kwargs["body"]["dataFilters"][0]["developerMetadataLookup"]
+        metadata_key = lookup.get("metadataKey")
+        metadata_value = lookup.get("metadataValue")
+        matches = [
+            {"developerMetadata": item}
+            for item in self.api.developer_metadata
+            if item.get("metadataKey") == metadata_key
+            and item.get("metadataValue") == metadata_value
+        ]
+        return FakeRequest({"matchedDeveloperMetadata": matches})
+
+
 class FakeSpreadsheetsResource:
     def __init__(self, api: "FakeSheetsApi") -> None:
         self.api = api
 
     def values(self):
         return FakeValuesResource(self.api)
+
+    def developerMetadata(self):
+        return FakeDeveloperMetadataResource(self.api)
 
     def get(self, **kwargs):
         self.api.metadata_get_calls.append(kwargs)
@@ -141,6 +173,10 @@ class FakeSpreadsheetsResource:
                             )
                             break
                     replies.append({})
+                elif "createDeveloperMetadata" in request:
+                    metadata = request["createDeveloperMetadata"]["developerMetadata"]
+                    self.api.developer_metadata.append(metadata)
+                    replies.append({"createDeveloperMetadata": {"developerMetadata": metadata}})
                 else:
                     replies.append({})
             return {"replies": replies}
@@ -170,6 +206,8 @@ class FakeSheetsApi:
         self.value_get_calls = []
         self.value_updates = []
         self.batch_updates = []
+        self.developer_metadata = []
+        self.developer_metadata_search_calls = []
 
     def spreadsheets(self):
         return FakeSpreadsheetsResource(self)
@@ -228,6 +266,366 @@ def make_service(
         clock=clock,
         timezone_name=timezone_name,
     )
+
+
+def make_reservation_service(repository: DraftRepository, api: FakeSheetsApi):
+    submission_service = GoogleSheetsSubmissionService(
+        direction_spreadsheets=DirectionSpreadsheetConfig(
+            fl_spreadsheet_id=FL_SPREADSHEET,
+            sme_spreadsheet_id="sme-spreadsheet",
+            ai_spreadsheet_id="ai-spreadsheet",
+            voice_collection_spreadsheet_id="voice-spreadsheet",
+        ),
+        credentials_path="missing-for-test.json",
+        rollout_schedule=RolloutSchedule.from_strings(),
+        clock=lambda: datetime(2026, 6, 23, 7, 0, tzinfo=timezone.utc),
+        sheets_api=api,
+    )
+    return GoogleSheetsBulkReservationService(
+        submission_service=submission_service,
+        repository=repository,
+    )
+
+
+def make_reservation(
+    *,
+    reservation_id: str = "RES-12345678",
+    change_type: ChangeType = ChangeType.ADD,
+    requested_count: int = 3,
+) -> BulkReservation:
+    return BulkReservation(
+        reservation_id=reservation_id,
+        idempotency_key=f"{reservation_id}-key",
+        telegram_user_id=123,
+        state=BulkReservationState.CREATING.value,
+        direction=Direction.FL.value,
+        target_kind=BulkTargetKind.ROLLOUT.value,
+        change_type=change_type.value,
+        requested_count=requested_count,
+    )
+
+
+async def save_created_reservation(
+    repository: DraftRepository,
+    *,
+    reservation_id: str,
+    requested_count: int,
+    start_row: int,
+    end_row: int,
+    change_type: ChangeType = ChangeType.ADD,
+) -> None:
+    await repository.create_bulk_reservation(
+        reservation_id=reservation_id,
+        idempotency_key=f"{reservation_id}-key",
+        telegram_user_id=123,
+    )
+    await repository.update_bulk_reservation_step(
+        reservation_id,
+        state=BulkReservationState.AWAITING_CONFIRMATION,
+        direction=Direction.FL.value,
+        target_kind=BulkTargetKind.ROLLOUT.value,
+        change_type=change_type.value,
+        requested_count=requested_count,
+    )
+    await repository.complete_bulk_reservation_creation(
+        reservation_id,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name="29.06 (1)",
+        start_row=start_row,
+        end_row=end_row,
+        insert_url="https://example.test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_creation_highlights_required_columns_without_borders(tmp_path):
+    repository = DraftRepository(str(tmp_path / "reservation_highlight.db"))
+    await repository.init()
+    api = FakeSheetsApi()
+    service = make_reservation_service(repository, api)
+
+    result = await service.create_reservation(make_reservation(requested_count=2))
+
+    assert result.success is True
+    requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+    ]
+    assert not any("updateBorders" in request for request in requests)
+    repeat_cells = [
+        request["repeatCell"]
+        for request in requests
+        if "repeatCell" in request
+        and request["repeatCell"].get("fields") == "userEnteredFormat.backgroundColor"
+    ]
+    highlighted_columns = {
+        item["range"]["startColumnIndex"]
+        for item in repeat_cells
+        if item["range"].get("startRowIndex") == (result.reservation.start_row - 1)
+    }
+    assert highlighted_columns == {0, 2, 3, 4, 10}
+    assert all(
+        item["cell"]["userEnteredFormat"]["backgroundColor"]
+        == {"red": 1.0, "green": 0.97, "blue": 0.80}
+        for item in repeat_cells
+        if item["range"]["startColumnIndex"] in highlighted_columns
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_chips_creation_highlights_chips_required_columns(tmp_path):
+    repository = DraftRepository(str(tmp_path / "reservation_chips_highlight.db"))
+    await repository.init()
+    rows = [
+        ["ADD"],
+        WORKSHEET_HEADERS,
+        ["EDIT"],
+        WORKSHEET_HEADERS,
+        ["CHIPS"],
+        CHIPS_WORKSHEET_HEADERS,
+    ]
+    api = FakeSheetsApi(sheets={FL_SPREADSHEET: {"29.06 (1)": 100}})
+    api.rows[(FL_SPREADSHEET, "29.06 (1)")] = rows
+    service = make_reservation_service(repository, api)
+
+    result = await service.create_reservation(
+        make_reservation(change_type=ChangeType.CHIPS, requested_count=2)
+    )
+
+    assert result.success is True
+    requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+    ]
+    highlighted_columns = {
+        request["repeatCell"]["range"]["startColumnIndex"]
+        for request in requests
+        if "repeatCell" in request
+        and request["repeatCell"].get("fields") == "userEnteredFormat.backgroundColor"
+        and request["repeatCell"]["range"].get("startRowIndex") == (result.reservation.start_row - 1)
+    }
+    assert highlighted_columns == {0, 2, 3, 4, 5, 10}
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_creation_reuses_existing_metadata_range(tmp_path):
+    repository = DraftRepository(str(tmp_path / "reservation_metadata_recovery.db"))
+    await repository.init()
+    api = FakeSheetsApi(sheets={FL_SPREADSHEET: {"29.06 (1)": 100}})
+    api.developer_metadata.append(
+        {
+            "metadataKey": "bulk_reservation_id",
+            "metadataValue": "RES-RECOVER",
+            "visibility": "DOCUMENT",
+            "location": {
+                "dimensionRange": {
+                    "sheetId": 100,
+                    "dimension": "ROWS",
+                    "startIndex": 19,
+                    "endIndex": 22,
+                }
+            },
+        }
+    )
+    service = make_reservation_service(repository, api)
+
+    result = await service.create_reservation(
+        make_reservation(reservation_id="RES-RECOVER", requested_count=3)
+    )
+
+    assert result.success is True
+    assert result.reservation is not None
+    assert result.reservation.start_row == 20
+    assert result.reservation.end_row == 22
+    requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+    ]
+    assert not any("insertDimension" in request for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_registration_adds_borders_after_success(tmp_path):
+    repository = DraftRepository(str(tmp_path / "reservation_registration_borders.db"))
+    await repository.init()
+    api = FakeSheetsApi(sheets={FL_SPREADSHEET: {"29.06 (1)": 100}})
+    rows = [[""] * len(WORKSHEET_HEADERS) for _ in range(5)]
+    rows[0][0] = "writer 1"
+    rows[0][2] = "case 1"
+    rows[0][3] = "change 1"
+    rows[0][4] = "source 1"
+    rows[0][10] = "intent 1"
+    rows[2][0] = "writer 2"
+    rows[2][2] = "case 2"
+    rows[2][3] = "change 2"
+    rows[2][4] = "source 2"
+    rows[2][10] = "intent 2"
+    api.rows[(FL_SPREADSHEET, "'29.06 (1)'!A10:X14")] = rows
+    await save_created_reservation(
+        repository,
+        reservation_id="RES-READY",
+        requested_count=5,
+        start_row=10,
+        end_row=14,
+    )
+    registrar = BulkReservationRegistrar(
+        repository=repository,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    result = await registrar.register_reservation("RES-READY", 123)
+
+    assert result.success is True
+    requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+    ]
+    border_requests = [request["updateBorders"] for request in requests if "updateBorders" in request]
+    assert len(border_requests) == 2
+    assert border_requests[0]["range"]["startRowIndex"] == 9
+    assert border_requests[0]["range"]["endRowIndex"] == 10
+    assert border_requests[1]["range"]["startRowIndex"] == 11
+    assert border_requests[1]["range"]["endRowIndex"] == 12
+    clear_requests = [
+        request["repeatCell"]
+        for request in requests
+        if "repeatCell" in request
+        and request["repeatCell"].get("fields") == "userEnteredFormat.backgroundColor"
+    ]
+    cleared_rows = {
+        request["range"]["startRowIndex"]
+        for request in clear_requests
+        if request["cell"].get("userEnteredFormat") == {}
+    }
+    assert cleared_rows == {10, 12, 13}
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_registration_error_does_not_add_borders(tmp_path):
+    repository = DraftRepository(str(tmp_path / "reservation_registration_no_borders.db"))
+    await repository.init()
+    api = FakeSheetsApi(sheets={FL_SPREADSHEET: {"29.06 (1)": 100}})
+    partial = [""] * len(WORKSHEET_HEADERS)
+    partial[0] = "writer"
+    partial[2] = "case"
+    api.rows[(FL_SPREADSHEET, "'29.06 (1)'!A10:X10")] = [partial]
+    await save_created_reservation(
+        repository,
+        reservation_id="RES-PARTIAL",
+        requested_count=1,
+        start_row=10,
+        end_row=10,
+    )
+    registrar = BulkReservationRegistrar(
+        repository=repository,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+
+    result = await registrar.register_reservation("RES-PARTIAL", 123)
+
+    assert result.success is False
+    requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+    ]
+    assert not any("updateBorders" in request for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_registration_enqueues_dashboard_application_projection(tmp_path):
+    repository = DraftRepository(str(tmp_path / "reservation_dashboard.db"))
+    await repository.init()
+    api = FakeSheetsApi(sheets={FL_SPREADSHEET: {"29.06 (1)": 100}})
+    row = [""] * len(WORKSHEET_HEADERS)
+    row[0] = "writer"
+    row[2] = "case text that must not become dashboard date"
+    row[3] = "change description"
+    row[4] = "source text"
+    row[10] = "dashboard.intent"
+    api.rows[(FL_SPREADSHEET, "'29.06 (1)'!A10:X10")] = [row]
+    await save_created_reservation(
+        repository,
+        reservation_id="RES-DASH",
+        requested_count=1,
+        start_row=10,
+        end_row=10,
+    )
+    registrar = BulkReservationRegistrar(
+        repository=repository,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+        clock=lambda: datetime(2026, 6, 30, 9, 15, tzinfo=timezone.utc),
+    )
+
+    result = await registrar.register_reservation("RES-DASH", 123)
+
+    assert result.success is True
+    outbox = await repository.list_dashboard_outbox()
+    assert len(outbox) == 1
+    dashboard_row = json.loads(outbox[0].snapshot_json)["row"]
+    assert dashboard_row[0] == outbox[0].entity_id
+    assert dashboard_row[1] == ""
+    assert dashboard_row[2] == "2026-06-30T09:15:00+00:00"
+    assert dashboard_row[3] == Direction.FL.value
+    assert dashboard_row[4] == ApplicationType.SINGLE.value
+    assert dashboard_row[5] == AnswerType.ROLLOUT.value
+    assert dashboard_row[8] == ApplicationStatus.NEW.value
+    assert dashboard_row[9] == "Редактор не выбран"
+    assert dashboard_row[10] == "Нет"
+    assert dashboard_row[11].endswith("gid=100&range=A10:X10")
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_chips_dashboard_projection_uses_dashboard_layout(tmp_path):
+    repository = DraftRepository(str(tmp_path / "reservation_chips_dashboard.db"))
+    await repository.init()
+    api = FakeSheetsApi(sheets={FL_SPREADSHEET: {"29.06 (1)": 100}})
+    row = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    row[0] = "writer"
+    row[2] = "chips reason that must not become dashboard date"
+    row[3] = "text before"
+    row[4] = "chip text"
+    row[5] = "text after"
+    row[10] = "chips.intent"
+    api.rows[(FL_SPREADSHEET, "'29.06 (1)'!A10:U10")] = [row]
+    await save_created_reservation(
+        repository,
+        reservation_id="RES-CHIPS-DASH",
+        requested_count=1,
+        start_row=10,
+        end_row=10,
+        change_type=ChangeType.CHIPS,
+    )
+    registrar = BulkReservationRegistrar(
+        repository=repository,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+        clock=lambda: datetime(2026, 6, 30, 9, 20, tzinfo=timezone.utc),
+    )
+
+    result = await registrar.register_reservation("RES-CHIPS-DASH", 123)
+
+    assert result.success is True
+    outbox = await repository.list_dashboard_outbox()
+    assert len(outbox) == 1
+    dashboard_row = json.loads(outbox[0].snapshot_json)["row"]
+    assert dashboard_row[0] == outbox[0].entity_id
+    assert dashboard_row[1] == ""
+    assert dashboard_row[2] == "2026-06-30T09:20:00+00:00"
+    assert dashboard_row[3] == Direction.FL.value
+    assert dashboard_row[4] == ApplicationType.SINGLE.value
+    assert dashboard_row[5] == AnswerType.ROLLOUT.value
+    assert dashboard_row[8] == ApplicationStatus.NEW.value
+    assert dashboard_row[10] == "Нет"
+    assert dashboard_row[11].endswith("gid=100&range=A10:U10")
 
 
 @pytest.mark.asyncio

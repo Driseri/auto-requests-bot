@@ -1,0 +1,5 @@
+services:
+  bot:
+    env_file:
+      - path: .env.local
+        required: true

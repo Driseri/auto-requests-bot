@@ -57,6 +57,7 @@ class Settings:
     dashboard_outbox_retry_max_seconds: int
     dashboard_outbox_sending_stale_seconds: int
     bulk_reserved_rows: int
+    bulk_max_rows: int
     bulk_registration_stale_seconds: int
     bulk_creation_stale_seconds: int
     notification_max_attempts: int
@@ -129,6 +130,7 @@ def load_settings() -> Settings:
     if bulk_relocation_search_interval_seconds <= 0:
         raise ValueError("BULK_RELOCATION_SEARCH_INTERVAL_SECONDS must be greater than 0")
     bulk_reserved_rows = int(os.getenv("BULK_RESERVED_ROWS", "100").strip() or "100")
+    bulk_max_rows = int(os.getenv("BULK_MAX_ROWS", "50").strip() or "50")
     bulk_registration_stale_seconds = int(
         os.getenv("BULK_REGISTRATION_STALE_SECONDS", "600").strip() or "600"
     )
@@ -165,6 +167,8 @@ def load_settings() -> Settings:
         )
     if bulk_reserved_rows <= 0:
         raise ValueError("BULK_RESERVED_ROWS must be greater than 0")
+    if bulk_max_rows <= 0:
+        raise ValueError("BULK_MAX_ROWS must be greater than 0")
     positive_values = {
         "BULK_REGISTRATION_STALE_SECONDS": bulk_registration_stale_seconds,
         "BULK_CREATION_STALE_SECONDS": bulk_creation_stale_seconds,
@@ -267,6 +271,7 @@ def load_settings() -> Settings:
         dashboard_outbox_retry_max_seconds=dashboard_outbox_retry_max_seconds,
         dashboard_outbox_sending_stale_seconds=dashboard_outbox_sending_stale_seconds,
         bulk_reserved_rows=bulk_reserved_rows,
+        bulk_max_rows=bulk_max_rows,
         bulk_registration_stale_seconds=bulk_registration_stale_seconds,
         bulk_creation_stale_seconds=bulk_creation_stale_seconds,
         notification_max_attempts=notification_max_attempts,

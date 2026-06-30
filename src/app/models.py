@@ -119,6 +119,26 @@ class BulkRegistrationState(StrEnum):
     REGISTERED = "REGISTERED"
 
 
+class BulkReservationState(StrEnum):
+    AWAITING_DIRECTION = "AWAITING_DIRECTION"
+    AWAITING_TARGET = "AWAITING_TARGET"
+    AWAITING_CHANGE_TYPE = "AWAITING_CHANGE_TYPE"
+    AWAITING_COUNT = "AWAITING_COUNT"
+    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+    CREATING = "CREATING"
+    CREATED = "CREATED"
+    REGISTERING = "REGISTERING"
+    REGISTERED = "REGISTERED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
+
+
+class BulkTargetKind(StrEnum):
+    ROLLOUT = "rollout"
+    URGENT = "urgent"
+    INTEGRATION = "integration"
+
+
 class BulkBatchLocationState(StrEnum):
     KNOWN = "KNOWN"
     MISSING = "MISSING"
@@ -174,7 +194,12 @@ class KeyboardKind(StrEnum):
     EDIT_MENU_CHIPS = "edit_menu_chips"
     BULK_MENU = "bulk_menu"
     BULK_DIRECTION = "bulk_direction"
+    BULK_TARGET = "bulk_target"
+    BULK_CHANGE_TYPE = "bulk_change_type"
+    BULK_COUNT_CONFIRM = "bulk_count_confirm"
     BULK_CREATED = "bulk_created"
+    BULK_RESERVATION_CREATED = "bulk_reservation_created"
+    BULK_RESERVATION_COMPLETED = "bulk_reservation_completed"
     DEFAULTS_MENU = "defaults_menu"
     DEFAULTS_BACK = "defaults_back"
     NOTIFICATION = "notification"
@@ -455,6 +480,30 @@ class BulkCreationRequest:
     started_at: str | None = None
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass(slots=True)
+class BulkReservation:
+    reservation_id: str
+    idempotency_key: str
+    telegram_user_id: int
+    state: str
+    direction: str | None = None
+    target_kind: str | None = None
+    change_type: str | None = None
+    requested_count: int | None = None
+    spreadsheet_id: str | None = None
+    sheet_id: int | None = None
+    sheet_name: str | None = None
+    start_row: int | None = None
+    end_row: int | None = None
+    insert_url: str | None = None
+    registered_count: int = 0
+    last_error: str | None = None
+    started_at: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+    registered_at: str | None = None
 
 
 @dataclass(slots=True)

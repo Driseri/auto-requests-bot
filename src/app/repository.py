@@ -15,6 +15,8 @@ from app.models import (
     BulkBatchLocationState,
     BulkBatchStatus,
     BulkRegistrationState,
+    BulkReservation,
+    BulkReservationState,
     DashboardOutboxItem,
     DashboardOutboxState,
     Draft,
@@ -265,6 +267,43 @@ class DraftRepository:
                     insert_url TEXT,
                     last_error TEXT,
                     started_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bulk_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    telegram_user_id INTEGER NOT NULL,
+                    direction TEXT,
+                    target_kind TEXT,
+                    change_type TEXT,
+                    requested_count INTEGER,
+                    spreadsheet_id TEXT,
+                    sheet_id INTEGER,
+                    sheet_name TEXT,
+                    start_row INTEGER,
+                    end_row INTEGER,
+                    insert_url TEXT,
+                    state TEXT NOT NULL,
+                    registered_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    started_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    registered_at TEXT
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bulk_section_locks (
+                    lock_key TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -806,75 +845,103 @@ class DraftRepository:
         submitted_at: str | None = None,
     ) -> SubmittedApplication:
         now = utc_now_iso()
+        item = {
+            "application_id": application_id,
+            "telegram_user_id": telegram_user_id,
+            "spreadsheet_id": spreadsheet_id,
+            "sheet_id": sheet_id,
+            "sheet_name": sheet_name,
+            "last_known_status": last_known_status,
+            "direction": direction,
+            "answer_type": answer_type,
+            "application_type": application_type,
+            "change_type": change_type,
+            "is_urgent": is_urgent,
+            "batch_id": batch_id,
+            "last_seen_row_number": last_seen_row_number,
+            "last_seen_editor": last_seen_editor,
+            "last_seen_editor_comment": last_seen_editor_comment,
+            "last_seen_final_answer": last_seen_final_answer,
+            "submitted_at": submitted_at,
+        }
         async with self._connection() as db:
-            await db.execute(
-                """
-                INSERT INTO submitted_applications (
-                    application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
-                    last_known_status, direction, answer_type, application_type, change_type, is_urgent,
-                    batch_id, last_seen_row_number, last_seen_editor,
-                    last_seen_editor_comment, last_seen_final_answer, submitted_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(application_id) DO UPDATE SET
-                    telegram_user_id = excluded.telegram_user_id,
-                    spreadsheet_id = excluded.spreadsheet_id,
-                    sheet_id = excluded.sheet_id,
-                    sheet_name = excluded.sheet_name,
-                    last_known_status = excluded.last_known_status,
-                    direction = excluded.direction,
-                    answer_type = excluded.answer_type,
-                    application_type = excluded.application_type,
-                    change_type = excluded.change_type,
-                    is_urgent = excluded.is_urgent,
-                    batch_id = excluded.batch_id,
-                    last_seen_row_number = excluded.last_seen_row_number,
-                    last_seen_editor = excluded.last_seen_editor,
-                    last_seen_editor_comment = excluded.last_seen_editor_comment,
-                    last_seen_final_answer = excluded.last_seen_final_answer,
-                    last_seen_scriptwriter_response = NULL,
-                    pending_editor_comment = NULL,
-                    pending_editor_comment_seen_count = 0,
-                    pending_scriptwriter_response = NULL,
-                    pending_scriptwriter_response_seen_count = 0,
-                    submitted_at = COALESCE(
-                        submitted_applications.submitted_at,
-                        excluded.submitted_at
-                    ),
-                    polling_state = ?,
-                    not_found_count = 0,
-                    last_not_found_at = NULL,
-                    next_status_check_at = NULL,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    application_id,
-                    telegram_user_id,
-                    spreadsheet_id,
-                    sheet_id,
-                    sheet_name,
-                    last_known_status,
-                    direction,
-                    answer_type,
-                    application_type,
-                    change_type,
-                    None if is_urgent is None else (1 if is_urgent else 0),
-                    batch_id,
-                    last_seen_row_number,
-                    last_seen_editor,
-                    last_seen_editor_comment,
-                    last_seen_final_answer,
-                    submitted_at,
-                    now,
-                    now,
-                    StatusPollingState.ACTIVE.value,
-                ),
-            )
+            await self._save_submitted_application_in_connection(db, item, now)
             await db.commit()
         submitted = await self.get_submitted_application(application_id)
         if submitted is None:
             raise LookupError(f"Submitted application not found: {application_id}")
         return submitted
+
+    @staticmethod
+    async def _save_submitted_application_in_connection(
+        db: aiosqlite.Connection,
+        item: dict[str, Any],
+        now: str,
+    ) -> None:
+        is_urgent = item.get("is_urgent")
+        await db.execute(
+            """
+            INSERT INTO submitted_applications (
+                application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
+                last_known_status, direction, answer_type, application_type, change_type, is_urgent,
+                batch_id, last_seen_row_number, last_seen_editor,
+                last_seen_editor_comment, last_seen_final_answer, submitted_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(application_id) DO UPDATE SET
+                telegram_user_id = excluded.telegram_user_id,
+                spreadsheet_id = excluded.spreadsheet_id,
+                sheet_id = excluded.sheet_id,
+                sheet_name = excluded.sheet_name,
+                last_known_status = excluded.last_known_status,
+                direction = excluded.direction,
+                answer_type = excluded.answer_type,
+                application_type = excluded.application_type,
+                change_type = excluded.change_type,
+                is_urgent = excluded.is_urgent,
+                batch_id = excluded.batch_id,
+                last_seen_row_number = excluded.last_seen_row_number,
+                last_seen_editor = excluded.last_seen_editor,
+                last_seen_editor_comment = excluded.last_seen_editor_comment,
+                last_seen_final_answer = excluded.last_seen_final_answer,
+                last_seen_scriptwriter_response = NULL,
+                pending_editor_comment = NULL,
+                pending_editor_comment_seen_count = 0,
+                pending_scriptwriter_response = NULL,
+                pending_scriptwriter_response_seen_count = 0,
+                submitted_at = COALESCE(
+                    submitted_applications.submitted_at,
+                    excluded.submitted_at
+                ),
+                polling_state = ?,
+                not_found_count = 0,
+                last_not_found_at = NULL,
+                next_status_check_at = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (
+                item["application_id"],
+                item["telegram_user_id"],
+                item.get("spreadsheet_id"),
+                item.get("sheet_id"),
+                item["sheet_name"],
+                item["last_known_status"],
+                item.get("direction"),
+                item.get("answer_type"),
+                item.get("application_type"),
+                item.get("change_type"),
+                None if is_urgent is None else (1 if is_urgent else 0),
+                item.get("batch_id"),
+                item.get("last_seen_row_number"),
+                item.get("last_seen_editor"),
+                item.get("last_seen_editor_comment"),
+                item.get("last_seen_final_answer"),
+                item.get("submitted_at"),
+                now,
+                now,
+                StatusPollingState.ACTIVE.value,
+            ),
+        )
 
     async def get_submitted_application(
         self,
@@ -2078,6 +2145,560 @@ class DraftRepository:
             )
             await db.commit()
 
+    async def create_bulk_reservation(
+        self,
+        *,
+        reservation_id: str,
+        idempotency_key: str,
+        telegram_user_id: int,
+    ) -> BulkReservation:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO bulk_reservations (
+                    reservation_id, idempotency_key, telegram_user_id, state,
+                    registered_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    reservation_id,
+                    idempotency_key,
+                    telegram_user_id,
+                    BulkReservationState.AWAITING_DIRECTION.value,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+        reservation = await self.get_bulk_reservation(reservation_id)
+        if reservation is None:
+            raise LookupError(f"Bulk reservation not found: {reservation_id}")
+        return reservation
+
+    async def get_bulk_reservation(self, reservation_id: str) -> BulkReservation | None:
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM bulk_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return self._bulk_reservation_from_row(row) if row is not None else None
+
+    async def get_active_bulk_reservation(
+        self,
+        telegram_user_id: int,
+    ) -> BulkReservation | None:
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM bulk_reservations
+                WHERE telegram_user_id = ?
+                  AND state NOT IN (?, ?, ?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (
+                    telegram_user_id,
+                    BulkReservationState.REGISTERED.value,
+                    BulkReservationState.CANCELLED.value,
+                    BulkReservationState.FAILED.value,
+                ),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return self._bulk_reservation_from_row(row) if row is not None else None
+
+    async def update_bulk_reservation_step(
+        self,
+        reservation_id: str,
+        *,
+        state: BulkReservationState,
+        direction: str | None = None,
+        target_kind: str | None = None,
+        change_type: str | None = None,
+        requested_count: int | None = None,
+    ) -> BulkReservation | None:
+        now = utc_now_iso()
+        assignments = ["state = ?", "updated_at = ?"]
+        params: list[Any] = [state.value, now]
+        for column, value in (
+            ("direction", direction),
+            ("target_kind", target_kind),
+            ("change_type", change_type),
+            ("requested_count", requested_count),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        params.append(reservation_id)
+        async with self._connection() as db:
+            await db.execute(
+                f"""
+                UPDATE bulk_reservations
+                SET {", ".join(assignments)}
+                WHERE reservation_id = ?
+                """,
+                params,
+            )
+            await db.commit()
+        return await self.get_bulk_reservation(reservation_id)
+
+    async def claim_bulk_reservation_creation(
+        self,
+        reservation_id: str,
+        *,
+        stale_after_seconds: int,
+    ) -> BulkReservation | None:
+        now = datetime.now(timezone.utc)
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM bulk_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.commit()
+                return None
+            reservation = self._bulk_reservation_from_row(row)
+            if reservation.state == BulkReservationState.CREATED.value:
+                await db.commit()
+                return reservation
+            if reservation.state == BulkReservationState.CREATING.value:
+                started = _parse_iso_datetime(reservation.started_at)
+                if started and now - started < timedelta(seconds=stale_after_seconds):
+                    await db.commit()
+                    return reservation
+            now_iso = now.isoformat()
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, started_at = ?, last_error = NULL, updated_at = ?
+                WHERE reservation_id = ?
+                  AND state IN (?, ?, ?)
+                """,
+                (
+                    BulkReservationState.CREATING.value,
+                    now_iso,
+                    now_iso,
+                    reservation_id,
+                    BulkReservationState.AWAITING_CONFIRMATION.value,
+                    BulkReservationState.CREATING.value,
+                    BulkReservationState.FAILED.value,
+                ),
+            )
+            await db.commit()
+        return await self.get_bulk_reservation(reservation_id)
+
+    async def complete_bulk_reservation_creation_and_shift(
+        self,
+        reservation_id: str,
+        *,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+        start_row: int,
+        end_row: int,
+        insert_url: str,
+        shifted_rows: int,
+    ) -> BulkReservation | None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                UPDATE submitted_applications
+                SET last_seen_row_number = last_seen_row_number + ?,
+                    updated_at = ?
+                WHERE spreadsheet_id = ?
+                  AND sheet_id = ?
+                  AND last_seen_row_number >= ?
+                """,
+                (shifted_rows, now, spreadsheet_id, sheet_id, start_row),
+            )
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET start_row = CASE
+                        WHEN start_row IS NULL THEN NULL
+                        WHEN start_row >= ? THEN start_row + ?
+                        ELSE start_row
+                    END,
+                    end_row = CASE
+                        WHEN end_row IS NULL THEN NULL
+                        WHEN end_row >= ? THEN end_row + ?
+                        ELSE end_row
+                    END,
+                    updated_at = ?
+                WHERE spreadsheet_id = ?
+                  AND sheet_id = ?
+                  AND reservation_id != ?
+                  AND state NOT IN (?, ?, ?)
+                """,
+                (
+                    start_row,
+                    shifted_rows,
+                    start_row,
+                    shifted_rows,
+                    now,
+                    spreadsheet_id,
+                    sheet_id,
+                    reservation_id,
+                    BulkReservationState.REGISTERED.value,
+                    BulkReservationState.CANCELLED.value,
+                    BulkReservationState.FAILED.value,
+                ),
+            )
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, spreadsheet_id = ?, sheet_id = ?, sheet_name = ?,
+                    start_row = ?, end_row = ?, insert_url = ?,
+                    started_at = NULL, last_error = NULL, updated_at = ?
+                WHERE reservation_id = ?
+                """,
+                (
+                    BulkReservationState.CREATED.value,
+                    spreadsheet_id,
+                    sheet_id,
+                    sheet_name,
+                    start_row,
+                    end_row,
+                    insert_url,
+                    now,
+                    reservation_id,
+                ),
+            )
+            await db.commit()
+        return await self.get_bulk_reservation(reservation_id)
+
+    async def complete_bulk_reservation_creation(
+        self,
+        reservation_id: str,
+        *,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+        start_row: int,
+        end_row: int,
+        insert_url: str,
+    ) -> BulkReservation | None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, spreadsheet_id = ?, sheet_id = ?, sheet_name = ?,
+                    start_row = ?, end_row = ?, insert_url = ?,
+                    last_error = NULL, updated_at = ?
+                WHERE reservation_id = ?
+                """,
+                (
+                    BulkReservationState.CREATED.value,
+                    spreadsheet_id,
+                    sheet_id,
+                    sheet_name,
+                    start_row,
+                    end_row,
+                    insert_url,
+                    now,
+                    reservation_id,
+                ),
+            )
+            await db.commit()
+        return await self.get_bulk_reservation(reservation_id)
+
+    async def fail_bulk_reservation(
+        self,
+        reservation_id: str,
+        *,
+        error: str,
+    ) -> None:
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, started_at = NULL, last_error = ?, updated_at = ?
+                WHERE reservation_id = ?
+                """,
+                (
+                    BulkReservationState.FAILED.value,
+                    error[:1000],
+                    utc_now_iso(),
+                    reservation_id,
+                ),
+            )
+            await db.commit()
+
+    async def cancel_bulk_reservation(self, reservation_id: str) -> None:
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, updated_at = ?
+                WHERE reservation_id = ?
+                """,
+                (BulkReservationState.CANCELLED.value, utc_now_iso(), reservation_id),
+            )
+            await db.commit()
+
+    async def claim_bulk_reservation_registration(
+        self,
+        reservation_id: str,
+        *,
+        stale_after_seconds: int,
+    ) -> BulkReservation | None:
+        now = datetime.now(timezone.utc)
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM bulk_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.commit()
+                return None
+            reservation = self._bulk_reservation_from_row(row)
+            if reservation.state == BulkReservationState.REGISTERED.value:
+                await db.commit()
+                return reservation
+            if reservation.state == BulkReservationState.REGISTERING.value:
+                started = _parse_iso_datetime(reservation.started_at)
+                if started and now - started < timedelta(seconds=stale_after_seconds):
+                    await db.commit()
+                    return reservation
+            now_iso = now.isoformat()
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, started_at = ?, last_error = NULL, updated_at = ?
+                WHERE reservation_id = ?
+                  AND state IN (?, ?, ?)
+                """,
+                (
+                    BulkReservationState.REGISTERING.value,
+                    now_iso,
+                    now_iso,
+                    reservation_id,
+                    BulkReservationState.CREATED.value,
+                    BulkReservationState.REGISTERING.value,
+                    BulkReservationState.FAILED.value,
+                ),
+            )
+            await db.commit()
+        return await self.get_bulk_reservation(reservation_id)
+
+    async def release_bulk_reservation_registration(
+        self,
+        reservation_id: str,
+        *,
+        error: str | None = None,
+    ) -> None:
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, started_at = NULL, last_error = ?, updated_at = ?
+                WHERE reservation_id = ?
+                  AND state = ?
+                """,
+                (
+                    BulkReservationState.CREATED.value,
+                    (error or "")[:1000] or None,
+                    utc_now_iso(),
+                    reservation_id,
+                    BulkReservationState.REGISTERING.value,
+                ),
+            )
+            await db.commit()
+
+    async def complete_bulk_reservation_registration(
+        self,
+        reservation_id: str,
+        *,
+        registered_count: int,
+    ) -> None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, registered_count = ?, registered_at = ?,
+                    started_at = NULL, last_error = NULL, updated_at = ?
+                WHERE reservation_id = ?
+                """,
+                (
+                    BulkReservationState.REGISTERED.value,
+                    registered_count,
+                    now,
+                    now,
+                    reservation_id,
+                ),
+            )
+            await db.commit()
+
+    async def complete_bulk_reservation_registration_with_updates(
+        self,
+        reservation_id: str,
+        *,
+        registered_count: int,
+        tracking: list[dict[str, Any]],
+        dashboard_projections: list[dict[str, Any]],
+        notification_event: dict[str, Any] | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for item in tracking:
+                await self._save_submitted_application_in_connection(db, item, now)
+            for projection in dashboard_projections:
+                await self._upsert_dashboard_projection_in_connection(
+                    db,
+                    entity_type=projection["entity_type"],
+                    entity_id=projection["entity_id"],
+                    snapshot=projection["snapshot"],
+                    now=now,
+                )
+            if notification_event is not None:
+                await self._insert_notification_event_in_connection(
+                    db,
+                    telegram_user_id=notification_event["telegram_user_id"],
+                    event_type=notification_event["event_type"],
+                    dedupe_key=notification_event["dedupe_key"],
+                    snapshot_json=notification_event["snapshot_json"],
+                    chunks=notification_event["chunks"],
+                    now=now,
+                )
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET state = ?, registered_count = ?, registered_at = ?,
+                    started_at = NULL, last_error = NULL, updated_at = ?
+                WHERE reservation_id = ?
+                """,
+                (
+                    BulkReservationState.REGISTERED.value,
+                    registered_count,
+                    now,
+                    now,
+                    reservation_id,
+                ),
+            )
+            await db.commit()
+
+    async def acquire_bulk_section_lock(
+        self,
+        *,
+        lock_key: str,
+        owner: str,
+        ttl_seconds: int,
+    ) -> bool:
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "DELETE FROM bulk_section_locks WHERE expires_at <= ?",
+                (now_iso,),
+            )
+            cursor = await db.execute(
+                "SELECT owner FROM bulk_section_locks WHERE lock_key = ?",
+                (lock_key,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is not None and row[0] != owner:
+                await db.commit()
+                return False
+            await db.execute(
+                """
+                INSERT INTO bulk_section_locks (
+                    lock_key, owner, expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(lock_key) DO UPDATE SET
+                    owner = excluded.owner,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (lock_key, owner, expires_at, now_iso, now_iso),
+            )
+            await db.commit()
+        return True
+
+    async def release_bulk_section_lock(self, *, lock_key: str, owner: str) -> None:
+        async with self._connection() as db:
+            await db.execute(
+                "DELETE FROM bulk_section_locks WHERE lock_key = ? AND owner = ?",
+                (lock_key, owner),
+            )
+            await db.commit()
+
+    async def shift_rows_after_insert(
+        self,
+        *,
+        spreadsheet_id: str,
+        sheet_id: int,
+        from_row: int,
+        delta: int,
+    ) -> None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                UPDATE submitted_applications
+                SET last_seen_row_number = last_seen_row_number + ?,
+                    updated_at = ?
+                WHERE spreadsheet_id = ?
+                  AND sheet_id = ?
+                  AND last_seen_row_number >= ?
+                """,
+                (delta, now, spreadsheet_id, sheet_id, from_row),
+            )
+            await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET start_row = CASE
+                        WHEN start_row IS NULL THEN NULL
+                        WHEN start_row >= ? THEN start_row + ?
+                        ELSE start_row
+                    END,
+                    end_row = CASE
+                        WHEN end_row IS NULL THEN NULL
+                        WHEN end_row >= ? THEN end_row + ?
+                        ELSE end_row
+                    END,
+                    updated_at = ?
+                WHERE spreadsheet_id = ?
+                  AND sheet_id = ?
+                  AND state NOT IN (?, ?, ?)
+                """,
+                (
+                    from_row,
+                    delta,
+                    from_row,
+                    delta,
+                    now,
+                    spreadsheet_id,
+                    sheet_id,
+                    BulkReservationState.REGISTERED.value,
+                    BulkReservationState.CANCELLED.value,
+                    BulkReservationState.FAILED.value,
+                ),
+            )
+            await db.commit()
+
     @staticmethod
     async def _update_submitted_application_in_connection(
         db: aiosqlite.Connection,
@@ -2309,6 +2930,31 @@ class DraftRepository:
             started_at=row["started_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _bulk_reservation_from_row(row: aiosqlite.Row) -> BulkReservation:
+        return BulkReservation(
+            reservation_id=row["reservation_id"],
+            idempotency_key=row["idempotency_key"],
+            telegram_user_id=row["telegram_user_id"],
+            state=row["state"],
+            direction=row["direction"],
+            target_kind=row["target_kind"],
+            change_type=row["change_type"],
+            requested_count=row["requested_count"],
+            spreadsheet_id=row["spreadsheet_id"],
+            sheet_id=row["sheet_id"],
+            sheet_name=row["sheet_name"],
+            start_row=row["start_row"],
+            end_row=row["end_row"],
+            insert_url=row["insert_url"],
+            registered_count=row["registered_count"] or 0,
+            last_error=row["last_error"],
+            started_at=row["started_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            registered_at=row["registered_at"],
         )
 
     async def _update_user_settings(

@@ -1,10 +1,12 @@
 .env
+.env.local
 .venv/
 __pycache__/
 .pytest_cache/
 .codex/
 .docker-config-release/
 output/
+tmp/
 *.tar
 *.pyc
 *.db

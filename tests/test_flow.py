@@ -8,6 +8,9 @@ from app.keyboards import build_keyboard
 from app.models import (
     AnswerType,
     ApplicationStatus,
+    BulkReservation,
+    BulkReservationState,
+    BulkTargetKind,
     ChangeType,
     Direction,
     FieldName,
@@ -19,6 +22,7 @@ from app.models import (
 )
 from app.repository import DraftRepository
 from app.submission import InMemorySubmissionService
+from app.bulk import BulkReservationCreationResult
 
 
 class FakeLlmClient:
@@ -82,6 +86,38 @@ class FakeBulkRegistrar:
     async def register_batch(self, batch_id: str, telegram_user_id: int):
         self.calls.append((batch_id, telegram_user_id))
         return self.result
+
+
+class FakeBulkReservationService:
+    def __init__(self) -> None:
+        self.calls: list[BulkReservation] = []
+
+    async def create_reservation(self, reservation: BulkReservation):
+        return await self.create_reservation_with_lock(reservation)
+
+    async def create_reservation_with_lock(self, reservation: BulkReservation):
+        self.calls.append(reservation)
+        return BulkReservationCreationResult(
+            success=True,
+            message="ok",
+            reservation=BulkReservation(
+                reservation_id=reservation.reservation_id,
+                idempotency_key=reservation.idempotency_key,
+                telegram_user_id=reservation.telegram_user_id,
+                state=BulkReservationState.CREATED.value,
+                direction=reservation.direction,
+                target_kind=reservation.target_kind,
+                change_type=reservation.change_type,
+                requested_count=reservation.requested_count,
+                spreadsheet_id="spreadsheet",
+                sheet_id=123,
+                sheet_name="29.06 (1)",
+                start_row=10,
+                end_row=14,
+                insert_url="https://docs.google.com/spreadsheets/d/spreadsheet/edit#gid=123&range=A10:X14",
+            ),
+            insert_url="https://docs.google.com/spreadsheets/d/spreadsheet/edit#gid=123&range=A10:X14",
+        )
 
 
 class RateLimitedSubmissionService:
@@ -817,6 +853,124 @@ async def test_notification_menu_restores_unregistered_bulk_batch(tmp_path):
     assert response.keyboard_payload == "BATCH-ABC12345"
     assert "Заявка заполнена" in response.text
     assert "gid=100&amp;range=A3:G3" in response.text
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_flow_creates_rows_after_confirmation(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_reservation_flow.db"))
+    await repository.init()
+    service = FakeBulkReservationService()
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        bulk_reservation_service=service,
+        bulk_max_rows=5,
+    )
+
+    direction = await flow.create_bulk_batch(180)
+    reservation_id = direction.keyboard_payload
+    assert reservation_id is not None
+
+    target = await flow.select_bulk_direction(180, reservation_id, Direction.FL)
+    assert target.keyboard == KeyboardKind.BULK_TARGET
+
+    change_type = await flow.select_bulk_target(
+        180,
+        reservation_id,
+        target_kind=BulkTargetKind.ROLLOUT,
+    )
+    assert change_type.keyboard == KeyboardKind.BULK_CHANGE_TYPE
+
+    count = await flow.select_bulk_change_type(180, reservation_id, ChangeType.ADD)
+    assert count.keyboard == KeyboardKind.STEP
+
+    confirmation = await flow.handle_text(180, "5")
+    assert confirmation.keyboard == KeyboardKind.BULK_COUNT_CONFIRM
+
+    created = await flow.confirm_bulk_reservation_creation(180, reservation_id)
+    assert created.keyboard == KeyboardKind.BULK_RESERVATION_CREATED
+    assert created.keyboard_payload == reservation_id
+    assert len(service.calls) == 1
+
+    reservation = await repository.get_bulk_reservation(reservation_id)
+    assert reservation is not None
+    assert reservation.state == BulkReservationState.CREATED.value
+    assert reservation.start_row == 10
+    assert reservation.end_row == 14
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_count_validation_uses_configured_limit(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_reservation_count.db"))
+    await repository.init()
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        bulk_reservation_service=FakeBulkReservationService(),
+        bulk_max_rows=3,
+    )
+
+    response = await flow.create_bulk_batch(180)
+    reservation_id = response.keyboard_payload
+    assert reservation_id is not None
+    await flow.select_bulk_direction(180, reservation_id, Direction.FL)
+    await flow.select_bulk_target(
+        180,
+        reservation_id,
+        target_kind=BulkTargetKind.URGENT,
+    )
+    await flow.select_bulk_change_type(180, reservation_id, ChangeType.EDIT)
+
+    invalid = await flow.handle_text(180, "4")
+
+    assert invalid.keyboard == KeyboardKind.STEP
+    assert "1 до 3" in invalid.text
+
+
+@pytest.mark.asyncio
+async def test_bulk_reservation_double_confirm_while_creating_does_not_insert_again(tmp_path):
+    repository = DraftRepository(str(tmp_path / "bulk_reservation_creating.db"))
+    await repository.init()
+    service = FakeBulkReservationService()
+    flow = ApplicationFlow(
+        repository,
+        FakeLlmClient(),
+        InMemorySubmissionService(),
+        bulk_reservation_service=service,
+        bulk_max_rows=5,
+    )
+    response = await flow.create_bulk_batch(180)
+    reservation_id = response.keyboard_payload
+    assert reservation_id is not None
+    await flow.select_bulk_direction(180, reservation_id, Direction.FL)
+    await flow.select_bulk_target(180, reservation_id, target_kind=BulkTargetKind.ROLLOUT)
+    await flow.select_bulk_change_type(180, reservation_id, ChangeType.ADD)
+    await flow.handle_text(180, "3")
+    await repository.claim_bulk_reservation_creation(
+        reservation_id,
+        stale_after_seconds=600,
+    )
+
+    result = await flow.confirm_bulk_reservation_creation(180, reservation_id)
+
+    assert service.calls == []
+    assert result.keyboard == KeyboardKind.BULK_COUNT_CONFIRM
+    assert "создаются" in result.text
+
+
+def test_bulk_integration_change_type_keyboard_hides_chips():
+    keyboard = build_keyboard(KeyboardKind.BULK_CHANGE_TYPE, "RES-123:integration")
+    labels = [
+        button.text
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+
+    assert ChangeType.ADD.value in labels
+    assert ChangeType.EDIT.value in labels
+    assert ChangeType.CHIPS.value not in labels
 
 
 @pytest.mark.asyncio

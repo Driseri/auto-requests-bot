@@ -67,6 +67,26 @@ class CallbackData:
     def bulk_direction(idempotency_key: str, direction: str) -> str:
         return f"app:bulk_direction:{idempotency_key}:{direction}"
 
+    @staticmethod
+    def bulk_target(reservation_id: str, target_kind: str) -> str:
+        return f"app:bulk_target:{reservation_id}:{target_kind}"
+
+    @staticmethod
+    def bulk_change_type(reservation_id: str, change_type: str) -> str:
+        return f"app:bulk_change_type:{reservation_id}:{change_type}"
+
+    @staticmethod
+    def bulk_confirm(reservation_id: str) -> str:
+        return f"app:bulk_confirm:{reservation_id}"
+
+    @staticmethod
+    def bulk_reservation_ready(reservation_id: str) -> str:
+        return f"app:bulk_reservation_ready:{reservation_id}"
+
+    @staticmethod
+    def bulk_cancel(reservation_id: str) -> str:
+        return f"app:bulk_cancel:{reservation_id}"
+
 
 def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyboardMarkup | None:
     """Построить клавиатуру по состоянию flow и callback payload."""
@@ -331,6 +351,97 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
             if not payload:
                 return build_keyboard(KeyboardKind.BULK_MENU)
             return _bulk_direction_keyboard(payload)
+        case KeyboardKind.BULK_TARGET:
+            if not payload:
+                return build_keyboard(KeyboardKind.BULK_MENU)
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=AnswerType.URGENT.value,
+                            callback_data=CallbackData.bulk_target(payload, "urgent"),
+                        ),
+                        InlineKeyboardButton(
+                            text=AnswerType.ROLLOUT.value,
+                            callback_data=CallbackData.bulk_target(payload, "rollout"),
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text=AnswerType.INTEGRATION.value,
+                            callback_data=CallbackData.bulk_target(payload, "integration"),
+                        )
+                    ],
+                    [InlineKeyboardButton(text="Отменить", callback_data=CallbackData.bulk_cancel(payload))],
+                ]
+            )
+        case KeyboardKind.BULK_CHANGE_TYPE:
+            if not payload:
+                return build_keyboard(KeyboardKind.BULK_MENU)
+            reservation_id, _, target_kind = payload.partition(":")
+            change_types = (
+                (ChangeType.ADD, ChangeType.EDIT)
+                if target_kind == "integration"
+                else tuple(ChangeType)
+            )
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=change_type.value,
+                            callback_data=CallbackData.bulk_change_type(
+                                reservation_id,
+                                change_type.value,
+                            ),
+                        )
+                        for change_type in change_types
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Отменить",
+                            callback_data=CallbackData.bulk_cancel(reservation_id),
+                        )
+                    ],
+                ]
+            )
+        case KeyboardKind.BULK_COUNT_CONFIRM:
+            if not payload:
+                return build_keyboard(KeyboardKind.BULK_MENU)
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Создать строки",
+                            callback_data=CallbackData.bulk_confirm(payload),
+                        )
+                    ],
+                    [InlineKeyboardButton(text="Отменить", callback_data=CallbackData.bulk_cancel(payload))],
+                ]
+            )
+        case KeyboardKind.BULK_RESERVATION_CREATED:
+            if not payload:
+                return build_keyboard(KeyboardKind.BULK_MENU)
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Заявка заполнена",
+                            callback_data=CallbackData.bulk_reservation_ready(payload),
+                        )
+                    ],
+                ]
+            )
+        case KeyboardKind.BULK_RESERVATION_COMPLETED:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Главное меню",
+                            callback_data=CallbackData.NEW,
+                        )
+                    ]
+                ]
+            )
         case KeyboardKind.BULK_CREATED:
             if not payload:
                 return build_keyboard(KeyboardKind.BULK_MENU)

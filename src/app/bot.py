@@ -15,6 +15,7 @@ from app.keyboards import CallbackData, build_keyboard
 from app.models import (
     AnswerType,
     BotResponse,
+    BulkTargetKind,
     ChangeType,
     Direction,
     FieldName,
@@ -393,16 +394,69 @@ def create_router(flow: ApplicationFlow) -> Router:
     @router.callback_query(F.data.startswith("app:bulk_direction:"))
     async def callback_bulk_direction(callback: CallbackQuery) -> None:
         _, _, idempotency_key, direction = (callback.data or "").split(":", maxsplit=3)
-        await _show_callback_processing(
-            callback,
-            "Массовая заявка создается в Google Sheets. Подождите...",
-        )
         response = await flow.select_bulk_direction(
             _callback_user_id(callback),
             idempotency_key,
             Direction(direction),
         )
         await ui.answer_callback(callback, response)
+
+    @router.callback_query(F.data.startswith("app:bulk_target:"))
+    async def callback_bulk_target(callback: CallbackQuery) -> None:
+        _, _, reservation_id, target_kind = (callback.data or "").split(":", maxsplit=3)
+        await ui.answer_callback(
+            callback,
+            await flow.select_bulk_target(
+                _callback_user_id(callback),
+                reservation_id,
+                BulkTargetKind(target_kind),
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("app:bulk_change_type:"))
+    async def callback_bulk_change_type(callback: CallbackQuery) -> None:
+        _, _, reservation_id, change_type = (callback.data or "").split(":", maxsplit=3)
+        await ui.answer_callback(
+            callback,
+            await flow.select_bulk_change_type(
+                _callback_user_id(callback),
+                reservation_id,
+                ChangeType(change_type),
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("app:bulk_confirm:"))
+    async def callback_bulk_confirm(callback: CallbackQuery) -> None:
+        reservation_id = (callback.data or "").split(":", maxsplit=2)[2]
+        await _show_callback_processing(
+            callback,
+            "Готовлю строки для массовой заявки в Google Sheets. Подождите...",
+        )
+        await ui.answer_callback(
+            callback,
+            await flow.confirm_bulk_reservation_creation(
+                _callback_user_id(callback),
+                reservation_id,
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("app:bulk_reservation_ready:"))
+    async def callback_bulk_reservation_ready(callback: CallbackQuery) -> None:
+        reservation_id = (callback.data or "").split(":", maxsplit=2)[2]
+        await _answer_bulk_reservation_registration(
+            callback,
+            flow,
+            ui,
+            reservation_id,
+        )
+
+    @router.callback_query(F.data.startswith("app:bulk_cancel:"))
+    async def callback_bulk_cancel(callback: CallbackQuery) -> None:
+        reservation_id = (callback.data or "").split(":", maxsplit=2)[2]
+        await ui.answer_callback(
+            callback,
+            await flow.cancel_bulk_reservation(_callback_user_id(callback), reservation_id),
+        )
 
     @router.callback_query(F.data.startswith("app:bulk_ready:"))
     async def callback_bulk_ready(callback: CallbackQuery) -> None:
@@ -713,6 +767,75 @@ async def _answer_bulk_registration(
     )
 
 
+async def _answer_bulk_reservation_registration(
+    callback: CallbackQuery,
+    flow: ApplicationFlow,
+    ui: ActiveMessageManager,
+    reservation_id: str,
+) -> None:
+    """Register filled rows from the new bulk reservation without editing the link message."""
+    if callback.message is None:
+        return
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        LOGGER.exception(
+            "Could not disable bulk reservation button: reservation_id=%s",
+            reservation_id,
+        )
+    progress_message = await callback.message.answer(
+        "Массовая заявка регистрируется в Google Sheets. Подождите..."
+    )
+    try:
+        response = await flow.confirm_bulk_reservation_filled(
+            _callback_user_id(callback),
+            reservation_id,
+        )
+    except Exception:
+        LOGGER.exception(
+            "Unexpected bulk reservation registration failure: reservation_id=%s telegram_user_id=%s",
+            reservation_id,
+            _callback_user_id(callback),
+        )
+        response = BotResponse(
+            text=(
+                "Не удалось завершить регистрацию массовой заявки. "
+                "Исходный диапазон доступен в сообщении выше. Повторите попытку."
+            ),
+            keyboard=KeyboardKind.BULK_RESERVATION_CREATED,
+            keyboard_payload=reservation_id,
+        )
+    markup = build_keyboard(response.keyboard, response.keyboard_payload)
+    if progress_message is not None:
+        try:
+            await progress_message.edit_text(
+                response.text,
+                reply_markup=markup,
+                parse_mode=response.parse_mode,
+            )
+            await ui.track_response_message(
+                _callback_user_id(callback),
+                progress_message,
+                markup,
+            )
+            return
+        except Exception:
+            LOGGER.exception(
+                "Could not edit bulk reservation progress: reservation_id=%s",
+                reservation_id,
+            )
+    sent = await callback.message.answer(
+        response.text,
+        reply_markup=markup,
+        parse_mode=response.parse_mode,
+    )
+    await ui.track_response_message(
+        _callback_user_id(callback),
+        sent,
+        markup,
+    )
+
+
 def _user_id(message: Message) -> int:
     if message.from_user is None:
         raise ValueError("Telegram message has no from_user")
@@ -737,7 +860,11 @@ def _callback_author_name(callback: CallbackQuery) -> str:
 
 def _callback_bypasses_active_message(callback: CallbackQuery) -> bool:
     data = callback.data or ""
-    return data.startswith("app:bulk_ready:") or data == CallbackData.NOTIFICATION_NEW
+    return (
+        data.startswith("app:bulk_ready:")
+        or data.startswith("app:bulk_reservation_ready:")
+        or data == CallbackData.NOTIFICATION_NEW
+    )
 
 
 def _message_coordinates(message: Any) -> tuple[int, int] | None:
