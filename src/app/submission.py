@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Protocol
+from zoneinfo import ZoneInfo
 
 from app.formatting import build_text_format_runs, deserialize_formatting_spans
 from app.google_api import (
@@ -39,6 +40,7 @@ from app.sheet_dates import google_sheets_date_cell, utc_iso
 LOGGER = logging.getLogger(__name__)
 EDITOR_NOT_SELECTED = "Редактор не выбран"
 SECTION_LOCK_TTL_SECONDS = 600
+DAILY_SEPARATOR_FORMAT = "%d.%m.%y"
 
 LEGACY_WORKSHEET_HEADERS = [
     "ID заявки",
@@ -291,12 +293,14 @@ class SheetConfigurationError(RuntimeError):
 class _SubmissionWriteResult:
     result: SubmissionResult
     shift_from_row: int | None = None
+    shift_delta: int = 1
 
 
 @dataclass(frozen=True, slots=True)
 class _InsertedRow:
     row_number: int
     shift_from_row: int | None = None
+    shift_delta: int = 1
 
 
 class GoogleSheetsSubmissionService:
@@ -316,6 +320,7 @@ class GoogleSheetsSubmissionService:
         dashboard_sync: DashboardSyncService | None = None,
         google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
         repository: DraftRepository | None = None,
+        daily_sheet_grouping_enabled: bool = True,
         # Legacy constructor args kept temporarily for tests/old wiring.
         spreadsheet_id: str = "",
         high_priority_sheet_name: str = "",
@@ -332,6 +337,7 @@ class GoogleSheetsSubmissionService:
         self._sheets_api = sheets_api
         self._external_sheets_api = sheets_api is not None
         self.google_api_retry = google_api_retry
+        self.daily_sheet_grouping_enabled = daily_sheet_grouping_enabled
         self.rollout_schedule = rollout_schedule
         self.timezone_name = timezone_name
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -434,7 +440,7 @@ class GoogleSheetsSubmissionService:
                             spreadsheet_id=write_result.result.spreadsheet_id,
                             sheet_id=write_result.result.sheet_id,
                             from_row=write_result.shift_from_row,
-                            delta=1,
+                            delta=write_result.shift_delta,
                         )
                     result = write_result.result
                 finally:
@@ -541,8 +547,14 @@ class GoogleSheetsSubmissionService:
             )
             row_number = insert_result.row_number
             shift_from_row = insert_result.shift_from_row
+            shift_delta = insert_result.shift_delta
         elif layout.startswith("urgent:"):
-            insert_result = self._insert_urgent_row(
+            insert_urgent_row = (
+                self._insert_urgent_row
+                if self.daily_sheet_grouping_enabled
+                else self._insert_urgent_row_without_daily
+            )
+            insert_result = insert_urgent_row(
                 api,
                 spreadsheet_id,
                 sheet_id,
@@ -552,9 +564,25 @@ class GoogleSheetsSubmissionService:
             )
             row_number = insert_result.row_number
             shift_from_row = insert_result.shift_from_row
+            shift_delta = insert_result.shift_delta
+        elif (
+            application.answer_type == AnswerType.INTEGRATION.value
+            and self.daily_sheet_grouping_enabled
+        ):
+            insert_result = self._insert_flat_daily_row(
+                api,
+                spreadsheet_id,
+                sheet_id,
+                sheet_name,
+                row_data,
+            )
+            row_number = insert_result.row_number
+            shift_from_row = insert_result.shift_from_row
+            shift_delta = insert_result.shift_delta
         else:
             row_number = self._next_row_number(api, spreadsheet_id, sheet_name)
             shift_from_row = None
+            shift_delta = 1
             api.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
                 body={
@@ -591,6 +619,7 @@ class GoogleSheetsSubmissionService:
                 submitted_at=utc_iso(submitted_at),
             ),
             shift_from_row=shift_from_row,
+            shift_delta=shift_delta,
         )
 
     def _find_application_row(
@@ -611,6 +640,8 @@ class GoogleSheetsSubmissionService:
             LEGACY_WORKSHEET_HEADERS,
         )
         for row_number, row in enumerate(rows, start=1):
+            if is_daily_separator_row(row):
+                continue
             normalized = [str(value).strip() for value in row]
             matched_headers = next(
                 (
@@ -795,6 +826,295 @@ class GoogleSheetsSubmissionService:
             majorDimension="ROWS",
         ).execute()
         return len(result.get("values", [])) + 1
+
+    def _insert_flat_daily_row(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+        row_data: dict[str, Any],
+    ) -> _InsertedRow:
+        rows = self._read_rows(api, spreadsheet_id, sheet_name)
+        return self._insert_daily_row(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            rows=rows,
+            section_start_row=2,
+            section_end_row=len(rows) + 1,
+            column_count=len(row_data["values"]),
+            row_data=row_data,
+        )
+
+    def _insert_daily_row(
+        self,
+        api: Any,
+        *,
+        spreadsheet_id: str,
+        sheet_id: int,
+        rows: list[list[Any]],
+        section_start_row: int,
+        section_end_row: int,
+        column_count: int,
+        row_data: dict[str, Any],
+        extra_requests: list[dict[str, Any]] | None = None,
+        extra_requests_factory: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
+    ) -> _InsertedRow:
+        label = daily_separator_label(self.clock(), self.timezone_name)
+        plan = _daily_insert_plan(
+            rows,
+            label=label,
+            sheet_id=sheet_id,
+            section_start_row=section_start_row,
+            section_end_row=section_end_row,
+            column_count=column_count,
+            row_data=row_data,
+        )
+        requests = [
+            *plan["requests"],
+            *(extra_requests or []),
+            *((extra_requests_factory(plan) if extra_requests_factory else [])),
+        ]
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+        self._apply_daily_group_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            group_request=plan.get("group_request"),
+        )
+        return _InsertedRow(
+            row_number=plan["row_number"],
+            shift_from_row=plan["shift_from_row"],
+            shift_delta=plan["shift_delta"],
+        )
+
+    async def prepare_daily_sheet_blocks_once(self) -> None:
+        if not self.daily_sheet_grouping_enabled:
+            return
+        shifts = await execute_with_retry_async(
+            self._prepare_daily_sheet_blocks_sync,
+            config=self.google_api_retry,
+            operation_id="daily-sheet-maintenance",
+            reset_client=self._reset_sheets_api,
+        )
+        if self.repository is None:
+            return
+        for spreadsheet_id, sheet_id, from_row in shifts:
+            await self.repository.shift_rows_after_insert(
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+                from_row=from_row,
+                delta=1,
+            )
+
+    def _prepare_daily_sheet_blocks_sync(self) -> list[tuple[str, int, int]]:
+        api = self._get_sheets_api()
+        shifts: list[tuple[str, int, int]] = []
+        for spreadsheet_id in self._configured_spreadsheet_ids():
+            metadata = api.spreadsheets().get(
+                spreadsheetId=spreadsheet_id,
+                fields="sheets.properties",
+            ).execute()
+            for sheet in metadata.get("sheets", []):
+                properties = sheet.get("properties", {})
+                sheet_name = str(properties.get("title") or "")
+                sheet_id = int(properties.get("sheetId") or 0)
+                if not sheet_name or not sheet_id:
+                    continue
+                if _is_urgent_sheet_name(sheet_name):
+                    shifts.extend(
+                        self._prepare_urgent_daily_blocks_sync(
+                            api,
+                            spreadsheet_id,
+                            sheet_id,
+                            sheet_name,
+                        )
+                    )
+                elif _is_integration_sheet_name(sheet_name):
+                    shift_from = self._prepare_flat_daily_block_sync(
+                        api,
+                        spreadsheet_id,
+                        sheet_id,
+                        sheet_name,
+                    )
+                    if shift_from is not None:
+                        shifts.append((spreadsheet_id, sheet_id, shift_from))
+        return shifts
+
+    def _configured_spreadsheet_ids(self) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for spreadsheet_id in (
+            self.direction_spreadsheets.fl_spreadsheet_id,
+            self.direction_spreadsheets.sme_spreadsheet_id,
+            self.direction_spreadsheets.ai_spreadsheet_id,
+            self.direction_spreadsheets.voice_collection_spreadsheet_id,
+        ):
+            if spreadsheet_id and spreadsheet_id not in seen:
+                seen.add(spreadsheet_id)
+                result.append(spreadsheet_id)
+        return result
+
+    def _prepare_flat_daily_block_sync(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+    ) -> int | None:
+        rows = self._read_rows(api, spreadsheet_id, sheet_name)
+        if not rows or _working_sheet_schema(rows[0]) is None:
+            return None
+        return self._insert_daily_separator_if_missing(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            rows=rows,
+            section_start_row=2,
+            section_end_row=len(rows) + 1,
+            column_count=SHEET_COLUMN_COUNT,
+        )
+
+    def _prepare_urgent_daily_blocks_sync(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+    ) -> list[tuple[str, int, int]]:
+        rows = self._read_rows(api, spreadsheet_id, sheet_name)
+        if not rows or _working_sheet_schema(rows[0]) is None:
+            return []
+        marker_positions = [
+            index
+            for index, row in enumerate(rows)
+            if _is_exact_marker_row(row, ChangeType.CHIPS.value)
+        ]
+        if len(marker_positions) != 1:
+            return []
+        marker_position = marker_positions[0]
+        shifts: list[tuple[str, int, int]] = []
+        shift_from = self._insert_daily_separator_if_missing(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            rows=rows,
+            section_start_row=2,
+            section_end_row=marker_position + 1,
+            column_count=SHEET_COLUMN_COUNT,
+        )
+        if shift_from is not None:
+            shifts.append((spreadsheet_id, sheet_id, shift_from))
+            rows = self._read_rows(api, spreadsheet_id, sheet_name)
+            marker_positions = [
+                index
+                for index, row in enumerate(rows)
+                if _is_exact_marker_row(row, ChangeType.CHIPS.value)
+            ]
+            if len(marker_positions) != 1:
+                return shifts
+            marker_position = marker_positions[0]
+        if marker_position + 1 >= len(rows) or not _is_chips_header(rows[marker_position + 1]):
+            return shifts
+        shift_from = self._insert_daily_separator_if_missing(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            rows=rows,
+            section_start_row=marker_position + 3,
+            section_end_row=len(rows) + 1,
+            column_count=len(CHIPS_WORKSHEET_HEADERS),
+        )
+        if shift_from is not None:
+            shifts.append((spreadsheet_id, sheet_id, shift_from))
+        return shifts
+
+    def _insert_daily_separator_if_missing(
+        self,
+        api: Any,
+        *,
+        spreadsheet_id: str,
+        sheet_id: int,
+        rows: list[list[Any]],
+        section_start_row: int,
+        section_end_row: int,
+        column_count: int,
+    ) -> int | None:
+        label = daily_separator_label(self.clock(), self.timezone_name)
+        separator_rows = [
+            row_number
+            for row_number in range(section_start_row, min(section_end_row, len(rows) + 1))
+            if is_daily_separator_row(rows[row_number - 1])
+        ]
+        if any(_cell(rows[row_number - 1], 0).strip() == label for row_number in separator_rows):
+            return None
+        insert_row = section_end_row
+        group_request = _previous_daily_group_request(
+            separator_rows,
+            new_separator_row=insert_row,
+            sheet_id=sheet_id,
+        )
+        requests = [
+            {
+                "insertDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": insert_row - 1,
+                        "endIndex": insert_row,
+                    },
+                    "inheritFromBefore": True,
+                }
+            },
+            {
+                "updateCells": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": insert_row - 1,
+                        "endRowIndex": insert_row,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": column_count,
+                    },
+                    "rows": [_daily_separator_row_data(label, column_count)],
+                    "fields": "userEnteredValue,userEnteredFormat",
+                }
+            },
+        ]
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+        self._apply_daily_group_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            group_request=group_request,
+        )
+        return insert_row if insert_row <= len(rows) else None
+
+    def _apply_daily_group_best_effort(
+        self,
+        api: Any,
+        *,
+        spreadsheet_id: str,
+        group_request: dict[str, Any] | None,
+    ) -> None:
+        if group_request is None:
+            return
+        try:
+            api.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [group_request]},
+            ).execute()
+        except Exception as exc:
+            LOGGER.warning(
+                "Daily sheet previous block grouping failed; continuing without grouping: "
+                "spreadsheet_id=%s error=%r",
+                spreadsheet_id,
+                exc,
+            )
 
     def _initialize_sectioned_sheet(
         self,
@@ -1159,6 +1479,69 @@ class GoogleSheetsSubmissionService:
             )
 
         if change_type == ChangeType.CHIPS:
+            return self._insert_daily_row(
+                api,
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+                rows=rows,
+                section_start_row=marker_position + 3,
+                section_end_row=len(rows) + 1,
+                column_count=len(row_data["values"]),
+                row_data=row_data,
+            )
+        else:
+            # ADD/EDIT urgent rows must be inserted above the CHIPS marker so
+            # the lower CHIPS section remains a clean independent table.
+            return self._insert_daily_row(
+                api,
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+                rows=rows,
+                section_start_row=2,
+                section_end_row=marker_position + 1,
+                column_count=len(row_data["values"]),
+                row_data=row_data,
+                extra_requests_factory=lambda plan: [
+                    _basic_filter_request(
+                        sheet_id,
+                        SHEET_COLUMN_COUNT,
+                        end_row_index=marker_position + plan["shift_delta"],
+                    )
+                ],
+            )
+
+    def _insert_urgent_row_without_daily(
+        self,
+        api: Any,
+        spreadsheet_id: str,
+        sheet_id: int,
+        sheet_name: str,
+        change_type: ChangeType | None,
+        row_data: dict[str, Any],
+    ) -> _InsertedRow:
+        if change_type is None:
+            raise SheetConfigurationError(
+                "Для срочной заявки не выбран тип изменения ADD, EDIT или CHIPS."
+            )
+        rows = self._read_rows(api, spreadsheet_id, sheet_name)
+        marker_positions = [
+            index
+            for index, row in enumerate(rows)
+            if _is_exact_marker_row(row, ChangeType.CHIPS.value)
+        ]
+        if len(marker_positions) != 1:
+            raise SheetConfigurationError(
+                "В листе срочных заявок отсутствует однозначная секция CHIPS."
+            )
+        marker_position = marker_positions[0]
+        if (
+            marker_position + 1 >= len(rows)
+            or not _is_chips_header(rows[marker_position + 1])
+        ):
+            raise SheetConfigurationError(
+                "Повреждена шапка секции CHIPS в листе срочных заявок."
+            )
+        if change_type == ChangeType.CHIPS:
             row_number = len(rows) + 1
             shift_from_row = None
             requests = [
@@ -1174,8 +1557,6 @@ class GoogleSheetsSubmissionService:
                 }
             ]
         else:
-            # ADD/EDIT urgent rows must be inserted above the CHIPS marker so
-            # the lower CHIPS section remains a clean independent table.
             row_number = marker_position + 1
             shift_from_row = row_number
             requests = [
@@ -1750,6 +2131,17 @@ def sheet_section_lock_key(
     section_kind: str,
 ) -> str:
     return f"{spreadsheet_id}:{sheet_name}:{section_kind}"
+
+
+def _is_urgent_sheet_name(sheet_name: str) -> bool:
+    return sheet_name == URGENT_SHEET_NAME or sheet_name.endswith(f" {URGENT_SHEET_NAME}")
+
+
+def _is_integration_sheet_name(sheet_name: str) -> bool:
+    return (
+        sheet_name == INTEGRATION_SHEET_NAME
+        or sheet_name.endswith(f" {INTEGRATION_SHEET_NAME}")
+    )
 
 
 def week_sheet_name(created_at: str | None = None) -> str:
@@ -2672,6 +3064,151 @@ def _basic_filter_request(
         "setBasicFilter": {
             "filter": {
                 "range": range_config
+            }
+        }
+    }
+
+
+def daily_separator_label(moment: datetime, timezone_name: str = DEFAULT_TIMEZONE) -> str:
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+    return moment.astimezone(tz).strftime(DAILY_SEPARATOR_FORMAT)
+
+
+def is_daily_separator_row(row: list[Any]) -> bool:
+    first_cell = _cell(row, 0).strip()
+    if not first_cell:
+        return False
+    try:
+        datetime.strptime(first_cell, DAILY_SEPARATOR_FORMAT)
+    except ValueError:
+        return False
+    return all(not str(value or "").strip() for value in row[1:])
+
+
+def _daily_insert_plan(
+    rows: list[list[Any]],
+    *,
+    label: str,
+    sheet_id: int,
+    section_start_row: int,
+    section_end_row: int,
+    column_count: int,
+    row_data: dict[str, Any],
+) -> dict[str, Any]:
+    section_start_row = max(section_start_row, 1)
+    section_end_row = max(section_end_row, section_start_row)
+    separator_rows = [
+        row_number
+        for row_number in range(section_start_row, min(section_end_row, len(rows) + 1))
+        if is_daily_separator_row(rows[row_number - 1])
+    ]
+    today_rows = [
+        row_number
+        for row_number in separator_rows
+        if _cell(rows[row_number - 1], 0).strip() == label
+    ]
+    group_request: dict[str, Any] | None = None
+    requests: list[dict[str, Any]] = []
+    if today_rows:
+        today_row = today_rows[-1]
+        next_separator = next(
+            (row_number for row_number in separator_rows if row_number > today_row),
+            None,
+        )
+        insert_row = next_separator or section_end_row
+        inserted_rows = 1
+        update_rows = [row_data]
+    else:
+        insert_row = section_end_row
+        inserted_rows = 2
+        update_rows = [
+            _daily_separator_row_data(label, column_count),
+            row_data,
+        ]
+        group_request = _previous_daily_group_request(
+            separator_rows,
+            new_separator_row=insert_row,
+            sheet_id=sheet_id,
+        )
+
+    insert_index = insert_row - 1
+    shift_from_row = insert_row if insert_row <= len(rows) else None
+    requests.extend(
+        [
+            {
+                "insertDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": insert_index,
+                        "endIndex": insert_index + inserted_rows,
+                    },
+                    "inheritFromBefore": True,
+                }
+            },
+            {
+                "updateCells": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": insert_index,
+                        "endRowIndex": insert_index + inserted_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": column_count,
+                    },
+                    "rows": update_rows,
+                    "fields": (
+                        "userEnteredValue,dataValidation,"
+                        "userEnteredFormat,textFormatRuns"
+                    ),
+                }
+            },
+        ]
+    )
+    return {
+        "row_number": insert_row + inserted_rows - 1,
+        "shift_from_row": shift_from_row,
+        "shift_delta": inserted_rows,
+        "requests": requests,
+        "group_request": group_request,
+    }
+
+
+def _daily_separator_row_data(label: str, column_count: int) -> dict[str, Any]:
+    values: list[dict[str, Any]] = []
+    for index in range(column_count):
+        cell = _cell_data(label if index == 0 else "")
+        cell["userEnteredFormat"] = {
+            "backgroundColor": {"red": 0.82, "green": 0.82, "blue": 0.82},
+            "textFormat": {"bold": True},
+        }
+        values.append(cell)
+    return {"values": values}
+
+
+def _previous_daily_group_request(
+    separator_rows: list[int],
+    *,
+    new_separator_row: int,
+    sheet_id: int,
+) -> dict[str, Any] | None:
+    previous_rows = [row_number for row_number in separator_rows if row_number < new_separator_row]
+    if not previous_rows or not sheet_id:
+        return None
+    previous_separator = previous_rows[-1]
+    start_row = previous_separator + 1
+    end_row = new_separator_row - 1
+    if start_row > end_row:
+        return None
+    return {
+        "addDimensionGroup": {
+            "range": {
+                "sheetId": sheet_id,
+                "dimension": "ROWS",
+                "startIndex": start_row - 1,
+                "endIndex": end_row,
             }
         }
     }

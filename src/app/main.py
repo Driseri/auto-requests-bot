@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -50,7 +52,8 @@ async def main() -> None:
         "dashboard_sync_interval_seconds=%s "
         "bulk_max_rows=%s bulk_reserved_rows=%s bulk_registration_stale_seconds=%s "
         "bot_timezone=%s rollout_wednesday_cutoff=%s rollout_thursday_cutoff=%s "
-        "application_editors_count=%s",
+        "application_editors_count=%s daily_sheet_grouping_enabled=%s "
+        "daily_sheet_maintenance_enabled=%s daily_sheet_maintenance_time=%s",
         settings.sqlite_path,
         bool(settings.google_dashboard_spreadsheet_id),
         bool(settings.google_fl_spreadsheet_id),
@@ -81,6 +84,9 @@ async def main() -> None:
         cutoff_to_string(settings.rollout_schedule.wednesday_cutoff),
         cutoff_to_string(settings.rollout_schedule.thursday_cutoff),
         len(settings.application_editors),
+        settings.daily_sheet_grouping_enabled,
+        settings.daily_sheet_maintenance_enabled,
+        settings.daily_sheet_maintenance_time,
     )
 
     repository = DraftRepository(settings.sqlite_path)
@@ -111,11 +117,13 @@ async def main() -> None:
         dashboard_sync=dashboard_sync,
         google_api_retry=settings.google_api_retry,
         repository=repository,
+        daily_sheet_grouping_enabled=settings.daily_sheet_grouping_enabled,
     )
     bulk_reservation_service = GoogleSheetsBulkReservationService(
         submission_service=submission_service,
         repository=repository,
         google_api_retry=settings.google_api_retry,
+        daily_sheet_grouping_enabled=settings.daily_sheet_grouping_enabled,
     )
     bulk_reservation_registrar = BulkReservationRegistrar(
         repository=repository,
@@ -187,6 +195,7 @@ async def main() -> None:
     dispatcher.include_router(create_router(flow))
 
     polling_task: asyncio.Task | None = None
+    daily_maintenance_task: asyncio.Task | None = None
     if settings.status_polling_enabled:
         polling_task = asyncio.create_task(
             run_status_polling_loop(
@@ -243,13 +252,61 @@ async def main() -> None:
                 memory_log_interval=settings.status_polling_memory_log_interval,
             )
         )
+    if (
+        settings.daily_sheet_grouping_enabled
+        and settings.daily_sheet_maintenance_enabled
+    ):
+        daily_maintenance_task = asyncio.create_task(
+            run_daily_sheet_maintenance_loop(
+                submission_service=submission_service,
+                time_hhmm=settings.daily_sheet_maintenance_time,
+                timezone_name=settings.rollout_schedule.timezone_name,
+            )
+        )
 
     try:
         await dispatcher.start_polling(bot)
     finally:
         if polling_task is not None:
             polling_task.cancel()
-            await asyncio.gather(polling_task, return_exceptions=True)
+        if daily_maintenance_task is not None:
+            daily_maintenance_task.cancel()
+        await asyncio.gather(
+            *[
+                task
+                for task in (polling_task, daily_maintenance_task)
+                if task is not None
+            ],
+            return_exceptions=True,
+        )
+
+
+async def run_daily_sheet_maintenance_loop(
+    *,
+    submission_service: GoogleSheetsSubmissionService,
+    time_hhmm: str,
+    timezone_name: str,
+) -> None:
+    while True:
+        delay = _seconds_until_next_daily_run(time_hhmm, timezone_name)
+        await asyncio.sleep(delay)
+        try:
+            await submission_service.prepare_daily_sheet_blocks_once()
+        except Exception:
+            logging.exception("Daily sheet maintenance failed")
+
+
+def _seconds_until_next_daily_run(time_hhmm: str, timezone_name: str) -> float:
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo("Europe/Moscow")
+    hour, minute = (int(part) for part in time_hhmm.split(":", maxsplit=1))
+    now = datetime.now(tz)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max((target - now).total_seconds(), 1.0)
 
 
 if __name__ == "__main__":

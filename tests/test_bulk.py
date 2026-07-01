@@ -323,6 +323,7 @@ def make_reservation(
     reservation_id: str = "RES-12345678",
     change_type: ChangeType = ChangeType.ADD,
     requested_count: int = 3,
+    target_kind: BulkTargetKind = BulkTargetKind.ROLLOUT,
 ) -> BulkReservation:
     return BulkReservation(
         reservation_id=reservation_id,
@@ -330,7 +331,7 @@ def make_reservation(
         telegram_user_id=123,
         state=BulkReservationState.CREATING.value,
         direction=Direction.FL.value,
-        target_kind=BulkTargetKind.ROLLOUT.value,
+        target_kind=target_kind.value,
         change_type=change_type.value,
         requested_count=requested_count,
     )
@@ -427,6 +428,53 @@ async def test_bulk_reservation_creation_highlights_required_columns_without_bor
         4: BULK_RESERVATION_REQUIRED_BACKGROUND_COLOR,
         10: BULK_RESERVATION_REQUIRED_BACKGROUND_COLOR,
     }
+
+
+@pytest.mark.asyncio
+async def test_urgent_bulk_reservation_creation_creates_daily_separator(tmp_path):
+    repository = DraftRepository(str(tmp_path / "urgent_reservation_daily.db"))
+    await repository.init()
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 100}},
+    )
+    api.rows[(FL_SPREADSHEET, "Срочные")] = [
+        WORKSHEET_HEADERS,
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+    ]
+    service = make_reservation_service(repository, api)
+
+    result = await service.create_reservation(
+        make_reservation(
+            reservation_id="RES-URGENT-DAY",
+            requested_count=2,
+            change_type=ChangeType.ADD,
+            target_kind=BulkTargetKind.URGENT,
+        )
+    )
+
+    assert result.success is True
+    assert result.reservation is not None
+    assert result.reservation.start_row == 3
+    assert result.reservation.end_row == 4
+    assert result.shifted_rows == 3
+    requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+    ]
+    update_cells = next(request["updateCells"] for request in requests if "updateCells" in request)
+    assert update_cells["rows"][0]["values"][0]["userEnteredValue"] == {
+        "stringValue": "23.06.26"
+    }
+    metadata = next(
+        request["createDeveloperMetadata"]
+        for request in requests
+        if "createDeveloperMetadata" in request
+    )
+    dimension_range = metadata["developerMetadata"]["location"]["dimensionRange"]
+    assert dimension_range["startIndex"] == 2
+    assert dimension_range["endIndex"] == 3
 
 
 @pytest.mark.asyncio

@@ -884,7 +884,7 @@ docker images 'alfa-auto-requests-bot'
 Команды ниже рассчитаны на текущий пилотный сервер:
 
 - VPS user: `root`;
-- VPS host: `85.137.93.143`;
+- VPS host: `206.223.244.31`;
 - каталог приложения на VPS: `/opt/alfa-auto-requests`;
 - production Compose: `docker-compose.prod.yml`.
 
@@ -927,13 +927,13 @@ image. Это стабильнее для маленького сервера.
 ### 4. Передать image на VPS
 
 ```powershell
-scp ".\alfa-auto-requests-bot-$env:APP_VERSION.tar" root@85.137.93.143:/opt/alfa-auto-requests/
+scp ".\alfa-auto-requests-bot-$env:APP_VERSION.tar" root@206.223.244.31:/opt/alfa-auto-requests/
 ```
 
 Если менялся `docker-compose.prod.yml`, отдельно передайте его:
 
 ```powershell
-scp ".\docker-compose.prod.yml" root@85.137.93.143:/opt/alfa-auto-requests/docker-compose.prod.yml
+scp ".\docker-compose.prod.yml" root@206.223.244.31:/opt/alfa-auto-requests/docker-compose.prod.yml
 ```
 
 `.env` так не перезаписывайте. Его меняют вручную на VPS, чтобы случайно не затереть
@@ -944,7 +944,7 @@ scp ".\docker-compose.prod.yml" root@85.137.93.143:/opt/alfa-auto-requests/docke
 SSH на VPS:
 
 ```bash
-ssh root@85.137.93.143
+ssh root@206.223.244.31
 cd /opt/alfa-auto-requests
 
 docker compose -f docker-compose.prod.yml ps

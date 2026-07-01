@@ -52,6 +52,7 @@ from app.submission import (
     dashboard_bulk_batch_row,
     dashboard_projection,
     dashboard_tracked_row,
+    is_daily_separator_row,
     quote_sheet_name,
 )
 
@@ -2375,6 +2376,8 @@ def _working_data_rows(
     result: list[tuple[int, list[Any], dict[str, Any]]] = []
     active_layout: dict[str, Any] | None = None
     for row_number, row in enumerate(rows, start=start_row):
+        if is_daily_separator_row(row):
+            continue
         row_layout = _working_row_layout(row)
         if row_layout is not None:
             active_layout = row_layout

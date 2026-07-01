@@ -1,5 +1,5 @@
 [ssh]
-host = "85.137.93.143"
+host = "206.223.244.31"
 port = 22
 username = "root"
 password = "change-me"

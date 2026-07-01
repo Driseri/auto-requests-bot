@@ -48,9 +48,13 @@ from app.submission import (
     sheet_section_lock_key,
     _editor_data_validation_rule,
     _cell_data,
+    _daily_separator_row_data,
+    _previous_daily_group_request,
     _status_cell_data,
     _status_data_validation_rule,
     _worksheet_schema_layout,
+    daily_separator_label,
+    is_daily_separator_row,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -141,6 +145,7 @@ class BulkReservationCreationResult:
     reservation: BulkReservation | None = None
     insert_url: str | None = None
     retry_allowed: bool = False
+    shifted_rows: int = 0
 
 
 class BulkReservationMetadataLookupError(RuntimeError):
@@ -151,6 +156,12 @@ class BulkReservationMetadataLookupError(RuntimeError):
 class BulkReservationRange:
     start_row: int
     end_row: int
+
+
+@dataclass(frozen=True, slots=True)
+class _BulkReservationRowsInsert:
+    start_row: int
+    shifted_rows: int
 
 
 class BulkBatchServiceProtocol(Protocol):
@@ -281,9 +292,11 @@ class GoogleSheetsBulkReservationService:
         submission_service: GoogleSheetsSubmissionService,
         repository: DraftRepository,
         google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
+        daily_sheet_grouping_enabled: bool = True,
     ) -> None:
         self.repository = repository
         self.google_api_retry = google_api_retry
+        self.daily_sheet_grouping_enabled = daily_sheet_grouping_enabled
         self._submission = submission_service
         self._section_locks: dict[str, asyncio.Lock] = {}
 
@@ -383,6 +396,7 @@ class GoogleSheetsBulkReservationService:
         )
         if existing_range is not None:
             start_row, end_row = existing_range.start_row, existing_range.end_row
+            shifted_rows = 0
             LOGGER.info(
                 "Bulk reservation creation reused metadata range: reservation_id=%s "
                 "telegram_user_id=%s spreadsheet_id=%s sheet_id=%s sheet_name=%s "
@@ -397,7 +411,7 @@ class GoogleSheetsBulkReservationService:
                 reservation.requested_count,
             )
         else:
-            start_row = self._insert_blank_rows(
+            insert_result = self._insert_blank_rows(
                 api,
                 spreadsheet_id=spreadsheet_id,
                 sheet_id=sheet_id,
@@ -409,6 +423,8 @@ class GoogleSheetsBulkReservationService:
                 count=reservation.requested_count or 1,
                 reservation_id=reservation.reservation_id,
             )
+            start_row = insert_result.start_row
+            shifted_rows = insert_result.shifted_rows
             end_row = start_row + (reservation.requested_count or 1) - 1
             LOGGER.info(
                 "Bulk reservation rows inserted: reservation_id=%s telegram_user_id=%s "
@@ -453,6 +469,7 @@ class GoogleSheetsBulkReservationService:
                 updated_at=utc_now_iso(),
             ),
             insert_url=insert_url,
+            shifted_rows=shifted_rows,
         )
 
     def _find_existing_reservation_range(
@@ -537,7 +554,7 @@ class GoogleSheetsBulkReservationService:
                     start_row=result.reservation.start_row or 0,
                     end_row=result.reservation.end_row or 0,
                     insert_url=result.insert_url or "",
-                    shifted_rows=result.reservation.requested_count or 0,
+                    shifted_rows=result.shifted_rows,
                 )
                 return BulkReservationCreationResult(
                     success=True,
@@ -565,15 +582,73 @@ class GoogleSheetsBulkReservationService:
         target_marker: str | None,
         count: int,
         reservation_id: str,
-    ) -> int:
+    ) -> _BulkReservationRowsInsert:
         rows = self._submission._read_rows(api, spreadsheet_id, sheet_name)
         if layout.startswith("urgent:"):
-            insert_row = _urgent_bulk_insert_row(rows, change_type)
+            if self.daily_sheet_grouping_enabled:
+                insert_plan = _daily_bulk_reservation_insert_plan(
+                    rows,
+                    sheet_id=sheet_id,
+                    label=daily_separator_label(
+                        self._submission.clock(),
+                        self._submission.timezone_name,
+                    ),
+                    section_start_row=_urgent_bulk_section_start_row(rows, change_type),
+                    section_end_row=_urgent_bulk_insert_row(rows, change_type),
+                    column_count=(
+                        len(CHIPS_WORKSHEET_HEADERS)
+                        if schema in {"chips", "previous_chips"}
+                        else len(WORKSHEET_HEADERS)
+                    ),
+                    count=count,
+                )
+            else:
+                insert_row = _urgent_bulk_insert_row(rows, change_type)
+                insert_plan = {
+                    "start_row": insert_row,
+                    "insert_row": insert_row,
+                    "inserted_rows": count,
+                    "inserted_header_rows": [],
+                    "prefix_requests": [],
+                }
         elif layout.startswith("sectioned:"):
             insert_row = _sectioned_bulk_insert_row(rows, change_type, target_marker)
+            insert_plan = {
+                "start_row": insert_row,
+                "insert_row": insert_row,
+                "inserted_rows": count,
+                "prefix_requests": [],
+            }
+        elif self.daily_sheet_grouping_enabled:
+            insert_plan = _daily_bulk_reservation_insert_plan(
+                rows,
+                sheet_id=sheet_id,
+                label=daily_separator_label(
+                    self._submission.clock(),
+                    self._submission.timezone_name,
+                ),
+                section_start_row=2,
+                section_end_row=len(rows) + 1,
+                column_count=(
+                    len(CHIPS_WORKSHEET_HEADERS)
+                    if schema in {"chips", "previous_chips"}
+                    else len(WORKSHEET_HEADERS)
+                ),
+                count=count,
+            )
         else:
             insert_row = len(rows) + 1
-        insert_index = insert_row - 1
+            insert_plan = {
+                "start_row": insert_row,
+                "insert_row": insert_row,
+                "inserted_rows": count,
+                "inserted_header_rows": [],
+                "prefix_requests": [],
+            }
+        insert_row = insert_plan["start_row"]
+        physical_insert_row = insert_plan["insert_row"]
+        inserted_rows = insert_plan["inserted_rows"]
+        insert_index = physical_insert_row - 1
         column_count = (
             len(CHIPS_WORKSHEET_HEADERS)
             if schema in {"chips", "previous_chips"}
@@ -587,7 +662,7 @@ class GoogleSheetsBulkReservationService:
                         "sheetId": sheet_id,
                         "dimension": "ROWS",
                         "startIndex": insert_index,
-                        "endIndex": insert_index + count,
+                        "endIndex": insert_index + inserted_rows,
                     },
                     "inheritFromBefore": True,
                 }
@@ -597,12 +672,15 @@ class GoogleSheetsBulkReservationService:
                     "range": {
                         "sheetId": sheet_id,
                         "startRowIndex": insert_index,
-                        "endRowIndex": insert_index + count,
+                        "endRowIndex": insert_index + inserted_rows,
                         "startColumnIndex": 0,
                         "endColumnIndex": column_count,
                     },
-                    "rows": [blank_row for _ in range(count)],
-                    "fields": "userEnteredValue",
+                    "rows": [
+                        *insert_plan.get("inserted_header_rows", []),
+                        *[blank_row for _ in range(count)],
+                    ],
+                    "fields": "userEnteredValue,userEnteredFormat",
                 }
             },
             _clear_row_background_format_request(
@@ -621,8 +699,8 @@ class GoogleSheetsBulkReservationService:
                             "dimensionRange": {
                                 "sheetId": sheet_id,
                                 "dimension": "ROWS",
-                                "startIndex": insert_index,
-                                "endIndex": insert_index + 1,
+                                "startIndex": insert_row - 1,
+                                "endIndex": insert_row,
                             }
                         },
                     }
@@ -639,7 +717,15 @@ class GoogleSheetsBulkReservationService:
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
         ).execute()
-        return insert_row
+        self._submission._apply_daily_group_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            group_request=insert_plan.get("group_request"),
+        )
+        return _BulkReservationRowsInsert(
+            start_row=insert_row,
+            shifted_rows=inserted_rows if physical_insert_row <= len(rows) else 0,
+        )
 
     @staticmethod
     def _apply_reservation_borders(
@@ -2429,6 +2515,72 @@ def _urgent_bulk_insert_row(rows: list[list[Any]], change_type: ChangeType) -> i
     if change_type == ChangeType.CHIPS:
         return len(rows) + 1
     return marker_position + 1
+
+
+def _urgent_bulk_section_start_row(rows: list[list[Any]], change_type: ChangeType) -> int:
+    if change_type != ChangeType.CHIPS:
+        return 2
+    marker_positions = [
+        index
+        for index, row in enumerate(rows)
+        if _cell(row, 0).strip() == ChangeType.CHIPS.value
+    ]
+    if len(marker_positions) != 1:
+        raise ValueError("В листе срочных заявок отсутствует однозначная секция CHIPS.")
+    return marker_positions[0] + 3
+
+
+def _daily_bulk_reservation_insert_plan(
+    rows: list[list[Any]],
+    *,
+    sheet_id: int,
+    label: str,
+    section_start_row: int,
+    section_end_row: int,
+    column_count: int,
+    count: int,
+) -> dict[str, Any]:
+    section_start_row = max(section_start_row, 1)
+    section_end_row = max(section_end_row, section_start_row)
+    separator_rows = [
+        row_number
+        for row_number in range(section_start_row, min(section_end_row, len(rows) + 1))
+        if is_daily_separator_row(rows[row_number - 1])
+    ]
+    today_rows = [
+        row_number
+        for row_number in separator_rows
+        if _cell(rows[row_number - 1], 0).strip() == label
+    ]
+    group_request: dict[str, Any] | None = None
+    inserted_header_rows: list[dict[str, Any]] = []
+    if today_rows:
+        today_row = today_rows[-1]
+        next_separator = next(
+            (row_number for row_number in separator_rows if row_number > today_row),
+            None,
+        )
+        physical_insert_row = next_separator or section_end_row
+        start_row = physical_insert_row
+        inserted_rows = count
+    else:
+        physical_insert_row = section_end_row
+        start_row = section_end_row + 1
+        inserted_rows = count + 1
+        inserted_header_rows = [_daily_separator_row_data(label, column_count)]
+        group_request = _previous_daily_group_request(
+            separator_rows,
+            new_separator_row=physical_insert_row,
+            sheet_id=sheet_id,
+        )
+    return {
+        "insert_row": physical_insert_row,
+        "start_row": start_row,
+        "inserted_rows": inserted_rows,
+        "inserted_header_rows": inserted_header_rows,
+        "prefix_requests": [],
+        "group_request": group_request,
+    }
 
 
 def _reservation_required_indices(schema: str) -> tuple[int, ...]:

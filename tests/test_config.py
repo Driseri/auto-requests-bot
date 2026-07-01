@@ -27,6 +27,9 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert settings.bulk_reserved_rows == 100
     assert settings.bulk_registration_stale_seconds == 600
     assert settings.bulk_creation_stale_seconds == 600
+    assert settings.daily_sheet_grouping_enabled is True
+    assert settings.daily_sheet_maintenance_enabled is True
+    assert settings.daily_sheet_maintenance_time == "00:01"
     assert settings.notification_max_attempts == 10
     assert settings.notification_retry_base_seconds == 30
     assert settings.notification_sending_stale_seconds == 300
@@ -103,6 +106,25 @@ def test_load_settings_uses_custom_bulk_limits(monkeypatch):
     assert settings.bulk_reserved_rows == 75
     assert settings.bulk_registration_stale_seconds == 900
     assert settings.bulk_creation_stale_seconds == 700
+
+
+def test_load_settings_uses_custom_daily_sheet_grouping(monkeypatch):
+    monkeypatch.setenv("DAILY_SHEET_GROUPING_ENABLED", "false")
+    monkeypatch.setenv("DAILY_SHEET_MAINTENANCE_ENABLED", "false")
+    monkeypatch.setenv("DAILY_SHEET_MAINTENANCE_TIME", "01:15")
+
+    settings = load_settings()
+
+    assert settings.daily_sheet_grouping_enabled is False
+    assert settings.daily_sheet_maintenance_enabled is False
+    assert settings.daily_sheet_maintenance_time == "01:15"
+
+
+def test_load_settings_rejects_invalid_daily_sheet_maintenance_time(monkeypatch):
+    monkeypatch.setenv("DAILY_SHEET_MAINTENANCE_TIME", "25:99")
+
+    with pytest.raises(ValueError, match="DAILY_SHEET_MAINTENANCE_TIME"):
+        load_settings()
 
 
 @pytest.mark.parametrize(

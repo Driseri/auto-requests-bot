@@ -202,6 +202,10 @@ class FakeSpreadsheetsResource:
                     append_cells = request["appendCells"]
                     self.api.append_cells.append((spreadsheet_id, append_cells))
                     replies.append({"appendCells": {}})
+                elif "addDimensionGroup" in request:
+                    if self.api.fail_dimension_group:
+                        raise RuntimeError("dimension group failed")
+                    replies.append({})
                 elif "updateCells" in request:
                     update_cells = request["updateCells"]
                     rows = update_cells.get("rows", [])
@@ -247,6 +251,7 @@ class FakeSheetsApi:
         self.updated_rows = []
         self.batch_updates = []
         self.append_cells = []
+        self.fail_dimension_group = False
 
     def spreadsheets(self):
         return FakeSpreadsheetsResource(self)
@@ -590,9 +595,13 @@ async def test_new_urgent_sheet_creates_chips_section_and_inserts_add_above_it()
     ]
     requests = api.batch_updates[-1]["body"]["requests"]
     assert requests[0]["insertDimension"]["range"]["startIndex"] == 1
+    assert requests[0]["insertDimension"]["range"]["endIndex"] == 3
     assert requests[1]["updateCells"]["range"]["startRowIndex"] == 1
-    assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 2
-    assert result.row_number == 2
+    rows = requests[1]["updateCells"]["rows"]
+    assert rows[0]["values"][0]["userEnteredValue"] == {"stringValue": "03.06.26"}
+    assert rows[1]["values"][11]["userEnteredValue"] == {"stringValue": "A1B2C3D4"}
+    assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 3
+    assert result.row_number == 3
 
 
 @pytest.mark.asyncio
@@ -641,7 +650,7 @@ async def test_single_submission_different_section_is_not_blocked_by_lock(tmp_pa
 
     assert acquired is True
     assert result.success is True
-    assert result.row_number == 4
+    assert result.row_number == 5
 
 
 @pytest.mark.asyncio
@@ -696,14 +705,14 @@ async def test_single_submission_shift_rows_after_insert_dimension(tmp_path):
     result = await service.submit(urgent_draft(ChangeType.EDIT, application_id="NEWEDIT1"))
 
     assert result.success is True
-    assert result.row_number == 3
+    assert result.row_number == 4
     existing = await repository.get_submitted_application("EXISTING1")
     reservation = await repository.get_bulk_reservation("RES-BELOW")
     assert existing is not None
-    assert existing.last_seen_row_number == 6
+    assert existing.last_seen_row_number == 7
     assert reservation is not None
-    assert reservation.start_row == 8
-    assert reservation.end_row == 10
+    assert reservation.start_row == 9
+    assert reservation.end_row == 11
 
 
 @pytest.mark.asyncio
@@ -715,8 +724,11 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
 
     assert result.success is True
     assert result.sheet_name == "Срочные"
-    append_request = api.batch_updates[-1]["body"]["requests"][0]["appendCells"]
-    cells = append_request["rows"][0]["values"]
+    update_request = api.batch_updates[-1]["body"]["requests"][1]["updateCells"]
+    assert update_request["rows"][0]["values"][0]["userEnteredValue"] == {
+        "stringValue": "03.06.26"
+    }
+    cells = update_request["rows"][1]["values"]
     assert len(cells) == len(CHIPS_WORKSHEET_HEADERS)
     assert cells[3]["userEnteredValue"] == {"stringValue": "before"}
     assert cells[4]["userEnteredValue"] == {"stringValue": "chip"}
@@ -741,7 +753,7 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
     assert urgent_format.startswith("=AND(")
     assert "$R2=" in urgent_format
     assert '$U2<>"CHIPS"' in urgent_format
-    assert result.row_number == 4
+    assert result.row_number == 5
 
 
 @pytest.mark.asyncio
@@ -770,8 +782,12 @@ async def test_existing_urgent_sheet_gets_chips_section_without_changing_rows():
     ]
     requests = api.batch_updates[-1]["body"]["requests"]
     assert requests[0]["insertDimension"]["range"]["startIndex"] == 2
-    assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 3
-    assert result.row_number == 3
+    assert requests[0]["insertDimension"]["range"]["endIndex"] == 4
+    assert requests[1]["updateCells"]["rows"][0]["values"][0]["userEnteredValue"] == {
+        "stringValue": "03.06.26"
+    }
+    assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 4
+    assert result.row_number == 4
 
 
 @pytest.mark.asyncio
@@ -817,6 +833,79 @@ async def test_existing_urgent_sheet_replaces_urgent_conditional_formatting():
     assert urgent_rules[0].startswith("=AND(")
     assert "$R2=" in urgent_rules[0]
     assert '$U2<>"CHIPS"' in urgent_rules[0]
+
+
+@pytest.mark.asyncio
+async def test_integration_submission_creates_daily_separator():
+    api = FakeSheetsApi()
+    service = make_service(api)
+
+    result = await service.submit(
+        make_draft(
+            answer_type=AnswerType.INTEGRATION.value,
+            change_type=ChangeType.ADD.value,
+            is_urgent=False,
+        )
+    )
+
+    assert result.success is True
+    assert result.sheet_name == "Интеграции"
+    requests = api.batch_updates[-1]["body"]["requests"]
+    assert requests[0]["insertDimension"]["range"]["startIndex"] == 1
+    assert requests[0]["insertDimension"]["range"]["endIndex"] == 3
+    update_rows = requests[1]["updateCells"]["rows"]
+    assert update_rows[0]["values"][0]["userEnteredValue"] == {
+        "stringValue": "03.06.26"
+    }
+    assert update_rows[1]["values"][11]["userEnteredValue"] == {
+        "stringValue": "A1B2C3D4"
+    }
+    assert result.row_number == 3
+
+
+@pytest.mark.asyncio
+async def test_daily_grouping_failure_does_not_block_submission():
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Интеграции": 42}},
+        headers={(FL_SPREADSHEET, "Интеграции"): SHEET_HEADERS},
+        rows={
+            (FL_SPREADSHEET, "Интеграции"): [
+                SHEET_HEADERS,
+                ["02.06.26"],
+                ["Иван Иванов", ApplicationStatus.NEW.value],
+            ]
+        },
+    )
+    api.fail_dimension_group = True
+    service = make_service(api)
+
+    result = await service.submit(
+        make_draft(
+            answer_type=AnswerType.INTEGRATION.value,
+            change_type=ChangeType.ADD.value,
+            is_urgent=False,
+        )
+    )
+
+    assert result.success is True
+    assert result.row_number == 5
+    critical_requests = api.batch_updates[-2]["body"]["requests"]
+    assert all("addDimensionGroup" not in request for request in critical_requests)
+    assert "insertDimension" in critical_requests[0]
+    assert "updateCells" in critical_requests[1]
+    best_effort_requests = api.batch_updates[-1]["body"]["requests"]
+    assert best_effort_requests == [
+        {
+            "addDimensionGroup": {
+                "range": {
+                    "sheetId": 42,
+                    "dimension": "ROWS",
+                    "startIndex": 2,
+                    "endIndex": 3,
+                }
+            }
+        }
+    ]
 
 
 @pytest.mark.asyncio

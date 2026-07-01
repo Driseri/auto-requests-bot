@@ -60,6 +60,9 @@ class Settings:
     bulk_max_rows: int
     bulk_registration_stale_seconds: int
     bulk_creation_stale_seconds: int
+    daily_sheet_grouping_enabled: bool
+    daily_sheet_maintenance_enabled: bool
+    daily_sheet_maintenance_time: str
     notification_max_attempts: int
     notification_retry_base_seconds: int
     notification_sending_stale_seconds: int
@@ -137,6 +140,19 @@ def load_settings() -> Settings:
     bulk_creation_stale_seconds = int(
         os.getenv("BULK_CREATION_STALE_SECONDS", "600").strip() or "600"
     )
+    daily_sheet_grouping_enabled = _env_bool(
+        "DAILY_SHEET_GROUPING_ENABLED",
+        default=True,
+    )
+    daily_sheet_maintenance_enabled = _env_bool(
+        "DAILY_SHEET_MAINTENANCE_ENABLED",
+        default=True,
+    )
+    daily_sheet_maintenance_time = (
+        os.getenv("DAILY_SHEET_MAINTENANCE_TIME", "00:01").strip() or "00:01"
+    )
+    if not _valid_hhmm(daily_sheet_maintenance_time):
+        raise ValueError("DAILY_SHEET_MAINTENANCE_TIME must use HH:MM format")
     notification_max_attempts = int(
         os.getenv("NOTIFICATION_MAX_ATTEMPTS", "10").strip() or "10"
     )
@@ -274,6 +290,9 @@ def load_settings() -> Settings:
         bulk_max_rows=bulk_max_rows,
         bulk_registration_stale_seconds=bulk_registration_stale_seconds,
         bulk_creation_stale_seconds=bulk_creation_stale_seconds,
+        daily_sheet_grouping_enabled=daily_sheet_grouping_enabled,
+        daily_sheet_maintenance_enabled=daily_sheet_maintenance_enabled,
+        daily_sheet_maintenance_time=daily_sheet_maintenance_time,
         notification_max_attempts=notification_max_attempts,
         notification_retry_base_seconds=notification_retry_base_seconds,
         notification_sending_stale_seconds=notification_sending_stale_seconds,
@@ -315,6 +334,17 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _valid_hhmm(value: str) -> bool:
+    parts = value.split(":")
+    if len(parts) != 2:
+        return False
+    try:
+        hour, minute = (int(part) for part in parts)
+    except ValueError:
+        return False
+    return 0 <= hour <= 23 and 0 <= minute <= 59
 
 
 def _env_editors(name: str) -> tuple[str, ...]:
