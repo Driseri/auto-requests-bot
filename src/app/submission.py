@@ -3143,7 +3143,7 @@ def _previous_daily_group_request(
     if not previous_rows or not sheet_id:
         return None
     previous_separator = previous_rows[-1]
-    start_row = previous_separator
+    start_row = previous_separator + 1
     end_row = new_separator_row - 1
     if start_row > end_row:
         return None

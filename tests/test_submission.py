@@ -991,13 +991,34 @@ async def test_daily_grouping_failure_does_not_block_submission():
             "addDimensionGroup": {
                 "range": {
                     "sheetId": 42,
-                    "dimension": "ROWS",
-                    "startIndex": 1,
-                    "endIndex": 3,
+                        "dimension": "ROWS",
+                        "startIndex": 2,
+                        "endIndex": 3,
+                    }
                 }
-            }
         }
     ]
+
+
+def test_previous_daily_group_excludes_date_separator_row():
+    from app.submission import _previous_daily_group_request
+
+    request = _previous_daily_group_request(
+        [2, 8],
+        new_separator_row=12,
+        sheet_id=42,
+    )
+
+    assert request == {
+        "addDimensionGroup": {
+            "range": {
+                "sheetId": 42,
+                "dimension": "ROWS",
+                "startIndex": 8,
+                "endIndex": 11,
+            }
+        }
+    }
 
 
 @pytest.mark.asyncio
