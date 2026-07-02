@@ -100,7 +100,7 @@ def test_plan_urgent_chips_layout_migration_moves_legacy_chips_into_day():
     add_row[11] = "ADD00001"
     chips_row = [""] * len(CHIPS_WORKSHEET_HEADERS)
     chips_row[11] = "CHIP0001"
-    chips_row[14] = "03.06.2026 10:00"
+    chips_row[14] = 46195.31915330102
     rows = [
         WORKSHEET_HEADERS,
         ["03.06.26"],
@@ -143,6 +143,12 @@ def test_plan_urgent_chips_layout_migration_moves_legacy_chips_into_day():
         for item in report["tracking_updates"]
     }
     assert updates == {"ADD00001": 3, "CHIP0001": 6}
+    chips_projection = next(
+        item
+        for item in report["dashboard_projections"]
+        if item["entity_id"] == "CHIP0001"
+    )
+    assert chips_projection["snapshot"]["row"][2].endswith("+00:00")
 
 
 def test_plan_urgent_chips_layout_migration_skips_nested_headers():

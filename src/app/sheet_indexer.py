@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 from typing import Any
@@ -21,7 +21,7 @@ from app.models import (
 )
 from app.repository import DraftRepository
 from app.scheduling import DEFAULT_TIMEZONE
-from app.sheet_dates import utc_iso
+from app.sheet_dates import GOOGLE_SHEETS_EPOCH, utc_iso
 from app.submission import (
     CHIPS_WORKSHEET_HEADERS,
     CURRENT_WORKSHEET_HEADERS,
@@ -430,7 +430,9 @@ def plan_urgent_chips_layout_migration(
                         [
                             application_id,
                             "",
-                            _value(_normalize_row(row), chips_layout, "Дата заявки"),
+                            _dashboard_date_value(
+                                _value(_normalize_row(row), chips_layout, "Дата заявки")
+                            ),
                             _value(_normalize_row(row), chips_layout, "Направление"),
                             _value(_normalize_row(row), chips_layout, "Тип заявки")
                             or ApplicationType.SINGLE.value,
@@ -887,7 +889,7 @@ def _tracking_updates_for_sheet_rows(
                     [
                         application_id,
                         _value(normalized, layout, "ID пачки"),
-                        _value(normalized, layout, "Дата заявки"),
+                        _dashboard_date_value(_value(normalized, layout, "Дата заявки")),
                         _value(normalized, layout, "Направление"),
                         _value(normalized, layout, "Тип заявки")
                         or ApplicationType.SINGLE.value,
@@ -923,6 +925,21 @@ def _merge_dashboard_projections(
     for item in override:
         merged[item["entity_id"]] = item
     return list(merged.values())
+
+
+def _dashboard_date_value(value: Any) -> str:
+    if isinstance(value, int | float):
+        local_naive = GOOGLE_SHEETS_EPOCH + timedelta(days=float(value))
+        return utc_iso(local_naive.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE)))
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        serial = float(text)
+    except ValueError:
+        return text
+    local_naive = GOOGLE_SHEETS_EPOCH + timedelta(days=serial)
+    return utc_iso(local_naive.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE)))
 
 
 def _legacy_global_chips_marker_index(rows: list[list[Any]]) -> int | None:
