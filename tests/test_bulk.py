@@ -298,6 +298,7 @@ def make_reservation_service(
     api: FakeSheetsApi,
     *,
     google_api_retry: GoogleApiRetryConfig = GoogleApiRetryConfig(),
+    daily_sheet_grouping_enabled: bool = True,
 ):
     submission_service = GoogleSheetsSubmissionService(
         direction_spreadsheets=DirectionSpreadsheetConfig(
@@ -310,11 +311,13 @@ def make_reservation_service(
         rollout_schedule=RolloutSchedule.from_strings(),
         clock=lambda: datetime(2026, 6, 23, 7, 0, tzinfo=timezone.utc),
         sheets_api=api,
+        daily_sheet_grouping_enabled=daily_sheet_grouping_enabled,
     )
     return GoogleSheetsBulkReservationService(
         submission_service=submission_service,
         repository=repository,
         google_api_retry=google_api_retry,
+        daily_sheet_grouping_enabled=daily_sheet_grouping_enabled,
     )
 
 
@@ -473,6 +476,52 @@ async def test_urgent_bulk_reservation_creation_creates_daily_separator(tmp_path
     dimension_range = metadata["developerMetadata"]["location"]["dimensionRange"]
     assert dimension_range["startIndex"] == 2
     assert dimension_range["endIndex"] == 3
+
+
+@pytest.mark.asyncio
+async def test_urgent_bulk_reservation_always_uses_daily_structure(tmp_path):
+    repository = DraftRepository(str(tmp_path / "urgent_reservation_daily_forced.db"))
+    await repository.init()
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 100}},
+    )
+    api.rows[(FL_SPREADSHEET, "Срочные")] = [
+        WORKSHEET_HEADERS,
+    ]
+    service = make_reservation_service(
+        repository,
+        api,
+        daily_sheet_grouping_enabled=False,
+    )
+
+    result = await service.create_reservation(
+        make_reservation(
+            reservation_id="RES-URGENT-FORCED-DAY",
+            requested_count=2,
+            change_type=ChangeType.CHIPS,
+            target_kind=BulkTargetKind.URGENT,
+        )
+    )
+
+    assert result.success is True
+    assert result.reservation is not None
+    assert result.reservation.start_row == 5
+    requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+    ]
+    inserted_values = [
+        cell["userEnteredValue"]
+        for request in requests
+        if "updateCells" in request
+        for row in request["updateCells"].get("rows", [])
+        for cell in row.get("values", [])
+        if cell.get("userEnteredValue")
+    ]
+    assert {"stringValue": "23.06.26"} in inserted_values
+    assert {"stringValue": ChangeType.CHIPS.value} in inserted_values
+    assert {"stringValue": CHIPS_WORKSHEET_HEADERS[0]} in inserted_values
 
 
 @pytest.mark.asyncio

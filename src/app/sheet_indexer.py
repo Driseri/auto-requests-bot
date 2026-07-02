@@ -444,12 +444,24 @@ def plan_urgent_chips_layout_migration(
                     ),
                 }
             )
+    all_tracking_updates, all_dashboard_projections = _tracking_updates_for_sheet_rows(
+        spreadsheet_id=spreadsheet_id,
+        sheet_id=sheet_id,
+        sheet_name=sheet_name,
+        rows=top_rows,
+    )
     return {
         "rows": top_rows,
         "migrated": migrated,
         "skipped": skipped,
-        "tracking_updates": tracking_updates,
-        "dashboard_projections": dashboard_projections,
+        "tracking_updates": _merge_tracking_updates(
+            all_tracking_updates,
+            tracking_updates,
+        ),
+        "dashboard_projections": _merge_dashboard_projections(
+            all_dashboard_projections,
+            dashboard_projections,
+        ),
     }
 
 
@@ -800,6 +812,115 @@ def _headers_for_schema(schema: str) -> list[str]:
         "chips": CHIPS_WORKSHEET_HEADERS,
         "previous_chips": PREVIOUS_CHIPS_WORKSHEET_HEADERS,
     }[schema]
+
+
+def _tracking_updates_for_sheet_rows(
+    *,
+    spreadsheet_id: str,
+    sheet_id: int,
+    sheet_name: str,
+    rows: list[list[Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    updates: list[dict[str, Any]] = []
+    projections: list[dict[str, Any]] = []
+    section: SheetSection | None = None
+    default_section: SheetSection | None = None
+    for row_number, row in enumerate(rows, start=1):
+        normalized = _normalize_row(row)
+        detected = _detect_section(normalized)
+        if detected is not None:
+            section = detected
+            if not detected.is_chips:
+                default_section = detected
+            continue
+        if is_daily_separator(normalized):
+            section = default_section
+            continue
+        if _is_marker_or_date_row(normalized) or section is None:
+            continue
+        layout = section.layout
+        application_id = _value(normalized, layout, "ID заявки")
+        if not application_id:
+            continue
+        status = _value(normalized, layout, "Статус") or ApplicationStatus.NEW.value
+        editor = _value(normalized, layout, "Редактор")
+        editor_comment = _value(
+            normalized,
+            layout,
+            "Вопросы/комментарии редактора",
+        )
+        final_answer = _value(normalized, layout, "Итоговый ответ редактора")
+        row_link = spreadsheet_row_link(
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            row_number=row_number,
+            end_column="U" if section.is_chips else "X",
+        )
+        updates.append(
+            {
+                "application_id": application_id,
+                "spreadsheet_id": spreadsheet_id,
+                "sheet_id": sheet_id,
+                "sheet_name": sheet_name,
+                "last_known_status": status,
+                "last_seen_row_number": row_number,
+                "last_seen_editor": editor or None,
+                "last_seen_editor_comment": editor_comment or None,
+                "last_seen_final_answer": final_answer or None,
+                "last_seen_scriptwriter_response": _value(
+                    normalized,
+                    layout,
+                    "Ответ сценариста",
+                )
+                or None,
+                "change_type": _value(normalized, layout, "Тип изменения")
+                or (ChangeType.CHIPS.value if section.is_chips else None),
+            }
+        )
+        projections.append(
+            {
+                "entity_type": "APPLICATION",
+                "entity_id": application_id,
+                "snapshot": dashboard_projection(
+                    [
+                        application_id,
+                        _value(normalized, layout, "ID пачки"),
+                        _value(normalized, layout, "Дата заявки"),
+                        _value(normalized, layout, "Направление"),
+                        _value(normalized, layout, "Тип заявки")
+                        or ApplicationType.SINGLE.value,
+                        _value(normalized, layout, "Тип ответа") or AnswerType.URGENT.value,
+                        _value(normalized, layout, "Срочная"),
+                        _value(normalized, layout, "Автор заявки"),
+                        status,
+                        editor,
+                        "Нет" if section.is_chips else bool_to_sheet_value(bool(final_answer)),
+                        row_link,
+                    ]
+                ),
+            }
+        )
+    return updates, projections
+
+
+def _merge_tracking_updates(
+    base: list[dict[str, Any]],
+    override: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = {item["application_id"]: item for item in base}
+    for item in override:
+        merged[item["application_id"]] = {**merged.get(item["application_id"], {}), **item}
+    return list(merged.values())
+
+
+def _merge_dashboard_projections(
+    base: list[dict[str, Any]],
+    override: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = {item["entity_id"]: item for item in base}
+    for item in override:
+        merged[item["entity_id"]] = item
+    return list(merged.values())
 
 
 def _legacy_global_chips_marker_index(rows: list[list[Any]]) -> int | None:

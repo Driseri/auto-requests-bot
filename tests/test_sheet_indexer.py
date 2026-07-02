@@ -138,3 +138,8 @@ def test_plan_urgent_chips_layout_migration_moves_legacy_chips_into_day():
         CHIPS_WORKSHEET_HEADERS,
         chips_row,
     ]
+    updates = {
+        item["application_id"]: item["last_seen_row_number"]
+        for item in report["tracking_updates"]
+    }
+    assert updates == {"ADD00001": 3, "CHIP0001": 6}

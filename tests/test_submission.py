@@ -606,7 +606,7 @@ async def test_single_submission_returns_retry_message_when_section_lock_is_busy
     api = FakeSheetsApi()
     service = make_service(api, repository=repository)
     acquired = await repository.acquire_bulk_section_lock(
-        lock_key=f"{FL_SPREADSHEET}:Срочные:urgent:main",
+        lock_key=f"{FL_SPREADSHEET}:Срочные:urgent:daily",
         owner="bulk:RES-BUSY",
         ttl_seconds=600,
     )
@@ -620,7 +620,27 @@ async def test_single_submission_returns_retry_message_when_section_lock_is_busy
 
 
 @pytest.mark.asyncio
-async def test_single_submission_different_section_is_not_blocked_by_lock(tmp_path):
+async def test_urgent_chips_uses_same_daily_section_lock(tmp_path):
+    repository = DraftRepository(str(tmp_path / "urgent_chips_daily_lock_busy.db"))
+    await repository.init()
+    api = FakeSheetsApi()
+    service = make_service(api, repository=repository)
+    acquired = await repository.acquire_bulk_section_lock(
+        lock_key=f"{FL_SPREADSHEET}:Срочные:urgent:daily",
+        owner="single:ADD-BUSY",
+        ttl_seconds=600,
+    )
+
+    result = await service.submit(urgent_draft(ChangeType.CHIPS))
+
+    assert acquired is True
+    assert result.success is False
+    assert "другой пользователь вносит строки" in result.message
+    assert api.batch_updates == []
+
+
+@pytest.mark.asyncio
+async def test_non_urgent_section_is_not_blocked_by_urgent_daily_lock(tmp_path):
     repository = DraftRepository(str(tmp_path / "single_section_lock_different.db"))
     await repository.init()
     api = FakeSheetsApi(
@@ -634,16 +654,16 @@ async def test_single_submission_different_section_is_not_blocked_by_lock(tmp_pa
     )
     service = make_service(api, repository=repository)
     acquired = await repository.acquire_bulk_section_lock(
-        lock_key=f"{FL_SPREADSHEET}:Срочные:urgent:main",
+        lock_key=f"{FL_SPREADSHEET}:Срочные:urgent:daily",
         owner="bulk:RES-BUSY",
         ttl_seconds=600,
     )
 
-    result = await service.submit(urgent_draft(ChangeType.CHIPS))
+    result = await service.submit(make_draft(change_type=ChangeType.ADD.value))
 
     assert acquired is True
     assert result.success is True
-    assert result.row_number == 5
+    assert result.sheet_name == "08.06 (1)"
 
 
 @pytest.mark.asyncio

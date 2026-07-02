@@ -146,7 +146,7 @@ def load_settings() -> Settings:
     )
     daily_sheet_maintenance_enabled = _env_bool(
         "DAILY_SHEET_MAINTENANCE_ENABLED",
-        default=True,
+        default=False,
     )
     daily_sheet_maintenance_time = (
         os.getenv("DAILY_SHEET_MAINTENANCE_TIME", "00:01").strip() or "00:01"

@@ -549,12 +549,7 @@ class GoogleSheetsSubmissionService:
             shift_from_row = insert_result.shift_from_row
             shift_delta = insert_result.shift_delta
         elif layout.startswith("urgent:"):
-            insert_urgent_row = (
-                self._insert_urgent_row
-                if self.daily_sheet_grouping_enabled
-                else self._insert_urgent_row_without_daily
-            )
-            insert_result = insert_urgent_row(
+            insert_result = self._insert_urgent_row(
                 api,
                 spreadsheet_id,
                 sheet_id,
@@ -1394,95 +1389,6 @@ class GoogleSheetsSubmissionService:
             shift_delta=plan["shift_delta"],
         )
 
-    def _insert_urgent_row_without_daily(
-        self,
-        api: Any,
-        spreadsheet_id: str,
-        sheet_id: int,
-        sheet_name: str,
-        change_type: ChangeType | None,
-        row_data: dict[str, Any],
-    ) -> _InsertedRow:
-        if change_type is None:
-            raise SheetConfigurationError(
-                "Для срочной заявки не выбран тип изменения ADD, EDIT или CHIPS."
-            )
-        rows = self._read_rows(api, spreadsheet_id, sheet_name)
-        marker_positions = [
-            index
-            for index, row in enumerate(rows)
-            if _is_exact_marker_row(row, ChangeType.CHIPS.value)
-        ]
-        if len(marker_positions) != 1:
-            raise SheetConfigurationError(
-                "В листе срочных заявок отсутствует однозначная секция CHIPS."
-            )
-        marker_position = marker_positions[0]
-        if (
-            marker_position + 1 >= len(rows)
-            or not _is_chips_header(rows[marker_position + 1])
-        ):
-            raise SheetConfigurationError(
-                "Повреждена шапка секции CHIPS в листе срочных заявок."
-            )
-        if change_type == ChangeType.CHIPS:
-            row_number = len(rows) + 1
-            shift_from_row = None
-            requests = [
-                {
-                    "appendCells": {
-                        "sheetId": sheet_id,
-                        "rows": [row_data],
-                        "fields": (
-                            "userEnteredValue,dataValidation,"
-                            "userEnteredFormat,textFormatRuns"
-                        ),
-                    }
-                }
-            ]
-        else:
-            row_number = marker_position + 1
-            shift_from_row = row_number
-            requests = [
-                {
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": marker_position,
-                            "endIndex": marker_position + 1,
-                        },
-                        "inheritFromBefore": True,
-                    }
-                },
-                {
-                    "updateCells": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": marker_position,
-                            "endRowIndex": marker_position + 1,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": len(row_data["values"]),
-                        },
-                        "rows": [row_data],
-                        "fields": (
-                            "userEnteredValue,dataValidation,"
-                            "userEnteredFormat,textFormatRuns"
-                        ),
-                    }
-                },
-                _basic_filter_request(
-                    sheet_id,
-                    SHEET_COLUMN_COUNT,
-                    end_row_index=marker_position + 1,
-                ),
-            ]
-        api.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": requests},
-        ).execute()
-        return _InsertedRow(row_number=row_number, shift_from_row=shift_from_row)
-
     def _get_sheets_api(self) -> Any:
         if self._sheets_api is None:
             self._sheets_api = build_google_sheets_api(self.credentials_path)
@@ -2004,7 +1910,7 @@ def sheet_section_kind(
     if answer_type == AnswerType.ROLLOUT.value:
         return f"rollout:{(change_type or ChangeType.ADD).value}"
     if answer_type == AnswerType.URGENT.value:
-        return "urgent:chips" if change_type == ChangeType.CHIPS else "urgent:main"
+        return "urgent:daily"
     return "flat:main"
 
 

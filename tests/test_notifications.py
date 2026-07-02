@@ -222,6 +222,23 @@ def test_working_data_rows_reads_daily_mixed_urgent_sheet():
     ]
 
 
+def test_working_data_rows_keeps_legacy_layout_after_daily_separator():
+    row = [""] * len(LEGACY_WORKSHEET_HEADERS)
+    row[0] = "LEGACY01"
+    rows = [
+        LEGACY_WORKSHEET_HEADERS,
+        ["03.06.26"],
+        row,
+    ]
+
+    found = _working_data_rows(rows)
+
+    assert len(found) == 1
+    row_number, _, layout = found[0]
+    assert row_number == 3
+    assert layout["application_id"] == 0
+
+
 class FakeRequest:
     def __init__(self, result):
         self.result = result

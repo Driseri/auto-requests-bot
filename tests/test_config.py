@@ -28,7 +28,7 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert settings.bulk_registration_stale_seconds == 600
     assert settings.bulk_creation_stale_seconds == 600
     assert settings.daily_sheet_grouping_enabled is True
-    assert settings.daily_sheet_maintenance_enabled is True
+    assert settings.daily_sheet_maintenance_enabled is False
     assert settings.daily_sheet_maintenance_time == "00:01"
     assert settings.notification_max_attempts == 10
     assert settings.notification_retry_base_seconds == 30

@@ -585,31 +585,21 @@ class GoogleSheetsBulkReservationService:
     ) -> _BulkReservationRowsInsert:
         rows = self._submission._read_rows(api, spreadsheet_id, sheet_name)
         if layout.startswith("urgent:"):
-            if self.daily_sheet_grouping_enabled:
-                insert_plan = _urgent_daily_bulk_reservation_insert_plan(
-                    rows,
-                    sheet_id=sheet_id,
-                    label=daily_separator_label(
-                        self._submission.clock(),
-                        self._submission.timezone_name,
-                    ),
-                    change_type=change_type,
-                    column_count=(
-                        len(CHIPS_WORKSHEET_HEADERS)
-                        if schema in {"chips", "previous_chips"}
-                        else len(WORKSHEET_HEADERS)
-                    ),
-                    count=count,
-                )
-            else:
-                insert_row = _urgent_bulk_insert_row(rows, change_type)
-                insert_plan = {
-                    "start_row": insert_row,
-                    "insert_row": insert_row,
-                    "inserted_rows": count,
-                    "inserted_header_rows": [],
-                    "prefix_requests": [],
-                }
+            insert_plan = _urgent_daily_bulk_reservation_insert_plan(
+                rows,
+                sheet_id=sheet_id,
+                label=daily_separator_label(
+                    self._submission.clock(),
+                    self._submission.timezone_name,
+                ),
+                change_type=change_type,
+                column_count=(
+                    len(CHIPS_WORKSHEET_HEADERS)
+                    if schema in {"chips", "previous_chips"}
+                    else len(WORKSHEET_HEADERS)
+                ),
+                count=count,
+            )
         elif layout.startswith("sectioned:"):
             insert_row = _sectioned_bulk_insert_row(rows, change_type, target_marker)
             insert_plan = {
@@ -2500,33 +2490,6 @@ def _sectioned_bulk_insert_row(
         raise ValueError(f"Секция {selected_marker} не найдена.")
     following = sorted(row for row in marker_rows.values() if row > selected_row)
     return following[0] if following else len(rows) + 1
-
-
-def _urgent_bulk_insert_row(rows: list[list[Any]], change_type: ChangeType) -> int:
-    marker_positions = [
-        index
-        for index, row in enumerate(rows)
-        if _cell(row, 0).strip() == ChangeType.CHIPS.value
-    ]
-    if len(marker_positions) != 1:
-        raise ValueError("В листе срочных заявок отсутствует однозначная секция CHIPS.")
-    marker_position = marker_positions[0]
-    if change_type == ChangeType.CHIPS:
-        return len(rows) + 1
-    return marker_position + 1
-
-
-def _urgent_bulk_section_start_row(rows: list[list[Any]], change_type: ChangeType) -> int:
-    if change_type != ChangeType.CHIPS:
-        return 2
-    marker_positions = [
-        index
-        for index, row in enumerate(rows)
-        if _cell(row, 0).strip() == ChangeType.CHIPS.value
-    ]
-    if len(marker_positions) != 1:
-        raise ValueError("В листе срочных заявок отсутствует однозначная секция CHIPS.")
-    return marker_positions[0] + 3
 
 
 def _daily_bulk_reservation_insert_plan(
