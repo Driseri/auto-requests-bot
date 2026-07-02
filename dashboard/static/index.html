@@ -20,6 +20,9 @@
           <button class="rail-item" type="button" aria-label="Заявки" data-tab="applications" data-tooltip="Заявки">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h12a2 2 0 0 1 2 2v16H4V5a2 2 0 0 1 2-2Z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
           </button>
+          <button class="rail-item" type="button" aria-label="Удаление" data-tab="delete" data-tooltip="Удаление">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 15H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+          </button>
           <button class="rail-item" type="button" disabled aria-label="Команда, скоро" data-tooltip="Команда - скоро">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>
           </button>
@@ -163,6 +166,53 @@
                   <article class="card table-card report-card" id="report-bulk-table"></article>
                   <article class="card table-card report-card" id="report-workflows-table"></article>
                 </div>
+              </section>
+            </section>
+          </section>
+
+          <section id="view-delete" class="tab-view" data-view="delete">
+            <section class="applications-hero destructive-hero">
+              <div>
+                <h2>Удаление записей из SQLite</h2>
+                <p>Админская write-операция по application_id. Google Sheets не изменяется, контейнер не останавливается, перед удалением обязателен preview и точное подтверждение.</p>
+              </div>
+            </section>
+
+            <section class="card admin-delete-panel">
+              <label class="form-label" for="delete-ids-input">ID заявок</label>
+              <textarea id="delete-ids-input" class="admin-textarea" rows="5" placeholder="APP-123&#10;APP-456"></textarea>
+              <div class="admin-actions">
+                <button id="delete-preview-button" class="primary-button" type="button">Проверить</button>
+                <span class="muted">До 20 ID за один запуск. Разделители: пробел, запятая или новая строка.</span>
+              </div>
+            </section>
+
+            <section id="delete-error" class="empty-state error-state hidden">
+              <h2>Операция не выполнена</h2>
+              <p id="delete-error-text">-</p>
+            </section>
+
+            <section id="delete-preview-content" class="hidden">
+              <div class="grid report-summary-grid">
+                <article class="card summary-tile"><span>Заявки</span><strong id="delete-count-applications">0</strong></article>
+                <article class="card summary-tile"><span>Dashboard outbox</span><strong id="delete-count-dashboard">0</strong></article>
+                <article class="card summary-tile"><span>Notification outbox</span><strong id="delete-count-notification">0</strong></article>
+                <article class="card summary-tile"><span>Пачки затронуты</span><strong id="delete-count-bulk">0</strong></article>
+              </div>
+
+              <article class="card table-card report-card" id="delete-preview-table"></article>
+
+              <section class="card admin-delete-confirm">
+                <h2>Подтверждение удаления</h2>
+                <p class="muted">Введите фразу точно как показано. Execute включается только если в локальном config стоит <code>admin.destructive_actions_enabled = true</code>.</p>
+                <code id="delete-confirmation-phrase" class="confirmation-phrase">-</code>
+                <input id="delete-confirmation-input" class="admin-input" type="text" autocomplete="off" placeholder="DELETE APP-123" />
+                <button id="delete-execute-button" class="danger-button" type="button" disabled>Удалить из SQLite</button>
+              </section>
+
+              <section id="delete-result" class="empty-state hidden">
+                <h2>Результат удаления</h2>
+                <p id="delete-result-text">-</p>
               </section>
             </section>
           </section>

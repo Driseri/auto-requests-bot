@@ -18,6 +18,7 @@ class JsonStorage:
         self.application_reports_dir = data_dir / "application-reports"
         self.application_report_history_dir = self.application_reports_dir / "history"
         self.application_report_latest_path = self.application_reports_dir / "latest.json"
+        self.admin_deletes_dir = data_dir / "admin-deletes"
         self.latest_path = data_dir / "latest.json"
         self.state_path = data_dir / "collector-state.json"
 
@@ -26,6 +27,7 @@ class JsonStorage:
 
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self.application_report_history_dir.mkdir(parents=True, exist_ok=True)
+        self.admin_deletes_dir.mkdir(parents=True, exist_ok=True)
 
     def is_writable(self) -> bool:
         """Check that the local dashboard can write its JSON state."""
@@ -105,6 +107,15 @@ class JsonStorage:
                 if len(rows) >= limit:
                     return rows
         return rows
+
+    def append_admin_delete_audit(self, payload: dict[str, Any]) -> str:
+        """Append one local audit row for a destructive admin action."""
+
+        self.ensure_ready()
+        audit_id = str(payload.get("audit_id") or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f"))
+        row = {**payload, "audit_id": audit_id}
+        self._append_history(row, history_dir=self.admin_deletes_dir)
+        return audit_id
 
     def _append_history(self, payload: dict[str, Any], *, history_dir: Path) -> None:
         day = datetime.now(timezone.utc).date().isoformat()

@@ -15,9 +15,11 @@ const icons = {
   target: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><path d="M12 7v5l3 2"/></svg>',
   users: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>',
   compass: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m16 8-3 7-7 3 3-7 7-3Z"/><circle cx="12" cy="12" r="10"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 15H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>',
 };
 
 let activeTab = "monitoring";
+let lastDeletePreview = null;
 
 const qs = (selector) => document.querySelector(selector);
 const qsa = (selector) => [...document.querySelectorAll(selector)];
@@ -120,15 +122,22 @@ function switchTab(tab) {
     button.classList.toggle("is-active", isActive);
     button.setAttribute("aria-current", isActive ? "page" : "false");
   });
-  qs("#page-title").textContent = tab === "applications" ? "Заявки" : "Мониторинг";
-  qs("#page-subtitle").textContent = tab === "applications" ? "Проблемные и зависшие заявки" : "Alfa Auto Requests Bot";
-  qs("#refresh-button").classList.toggle("hidden", tab === "applications");
+  const titles = {
+    monitoring: ["Мониторинг", "Alfa Auto Requests Bot"],
+    applications: ["Заявки", "Проблемные и зависшие заявки"],
+    delete: ["Удаление", "Админское удаление SQLite-записей"],
+  };
+  qs("#page-title").textContent = titles[tab]?.[0] || "Мониторинг";
+  qs("#page-subtitle").textContent = titles[tab]?.[1] || "Alfa Auto Requests Bot";
+  qs("#refresh-button").classList.toggle("hidden", tab !== "monitoring");
   if (tab === "applications") loadApplicationReportLatest().catch(() => {});
 }
 
 function initialTabFromHash() {
   // Deep links keep the static app simple while allowing direct navigation to tabs.
-  return window.location.hash === "#applications" ? "applications" : "monitoring";
+  if (window.location.hash === "#applications") return "applications";
+  if (window.location.hash === "#delete") return "delete";
+  return "monitoring";
 }
 
 function renderTop(snapshot) {
@@ -504,6 +513,111 @@ function renderApplicationReport(report) {
   ], "Незавершенных пользовательских процессов нет.");
 }
 
+function parseDeleteIds() {
+  return qs("#delete-ids-input").value
+    .split(/[\s,;]+/)
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function showDeleteError(message) {
+  qs("#delete-error").classList.remove("hidden");
+  qs("#delete-error-text").textContent = message;
+}
+
+function clearDeleteError() {
+  qs("#delete-error").classList.add("hidden");
+  qs("#delete-error-text").textContent = "-";
+}
+
+function updateDeleteConfirmationState() {
+  const expected = qs("#delete-confirmation-phrase").textContent.trim();
+  const actual = qs("#delete-confirmation-input").value.trim();
+  qs("#delete-execute-button").disabled = !expected || expected === "-" || actual !== expected;
+}
+
+function renderDeletePreview(result) {
+  const preview = result.preview || {};
+  const counts = preview.counts || {};
+  lastDeletePreview = preview;
+  qs("#delete-preview-content").classList.remove("hidden");
+  qs("#delete-result").classList.add("hidden");
+  qs("#delete-count-applications").textContent = number(counts.submitted_applications);
+  qs("#delete-count-dashboard").textContent = number(counts.dashboard_outbox);
+  qs("#delete-count-notification").textContent = number(counts.notification_outbox);
+  qs("#delete-count-bulk").textContent = number(counts.affected_bulk_batches);
+  qs("#delete-confirmation-phrase").textContent = preview.confirmation_phrase || "-";
+  qs("#delete-confirmation-input").value = "";
+  updateDeleteConfirmationState();
+
+  renderTable("#delete-preview-table", "Будет удалено", preview.export?.submitted_applications || [], [
+    ["ID", (item) => esc(item.application_id)],
+    ["User ID", (item) => esc(item.telegram_user_id)],
+    ["Статус", (item) => esc(item.last_known_status || "-")],
+    ["Направление", (item) => esc(item.direction || "-")],
+    ["Лист", (item) => esc(item.sheet_name || "-")],
+    ["Строка", (item) => esc(item.last_seen_row_number || "-")],
+    ["Batch", (item) => esc(item.batch_id || "-")],
+    ["Polling", (item) => esc(item.polling_state || "-")],
+    ["Обновлено", (item) => esc(dateTime(item.updated_at))],
+  ], "По указанным ID заявки в submitted_applications не найдены.");
+}
+
+async function previewDelete() {
+  clearDeleteError();
+  const button = qs("#delete-preview-button");
+  button.disabled = true;
+  button.textContent = "Проверяю...";
+  try {
+    const response = await fetch("/api/admin/delete/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ application_ids: parseDeleteIds() }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || `preview failed: ${response.status}`);
+    if (payload.result?.status === "failed") {
+      throw new Error((payload.result.errors || []).join("; ") || "preview failed");
+    }
+    renderDeletePreview(payload.result);
+  } catch (error) {
+    showDeleteError(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Проверить";
+  }
+}
+
+async function executeDelete() {
+  clearDeleteError();
+  const button = qs("#delete-execute-button");
+  button.disabled = true;
+  button.textContent = "Удаляю...";
+  try {
+    const response = await fetch("/api/admin/delete/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        application_ids: parseDeleteIds(),
+        confirmation: qs("#delete-confirmation-input").value.trim(),
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || `delete failed: ${response.status}`);
+    if (payload.result?.status === "failed") {
+      throw new Error((payload.result.errors || []).join("; ") || "delete failed");
+    }
+    const deleted = payload.result?.execution?.deleted || {};
+    qs("#delete-result").classList.remove("hidden");
+    qs("#delete-result-text").textContent = `Audit: ${payload.audit_id}. Удалено: submitted_applications=${number(deleted.submitted_applications)}, dashboard_outbox=${number(deleted.dashboard_outbox)}, notification_outbox=${number(deleted.notification_outbox)}.`;
+  } catch (error) {
+    showDeleteError(error.message);
+  } finally {
+    button.textContent = "Удалить из SQLite";
+    updateDeleteConfirmationState();
+  }
+}
+
 async function loadLatest() {
   const response = await fetch("/api/snapshot/latest", { cache: "no-store" });
   if (response.status === 404) {
@@ -566,6 +680,14 @@ qsa(".rail-item[data-tab]").forEach((button) => {
 });
 qs("#refresh-button").addEventListener("click", collect);
 qs("#applications-report-button").addEventListener("click", collectApplicationReport);
+qs("#delete-preview-button").addEventListener("click", previewDelete);
+qs("#delete-execute-button").addEventListener("click", executeDelete);
+qs("#delete-confirmation-input").addEventListener("input", updateDeleteConfirmationState);
+qs("#delete-ids-input").addEventListener("input", () => {
+  lastDeletePreview = null;
+  qs("#delete-preview-content").classList.add("hidden");
+  clearDeleteError();
+});
 
 loadLatest().catch((error) => {
   qs("#empty-state").classList.remove("hidden");

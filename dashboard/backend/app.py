@@ -9,10 +9,17 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .admin_delete import AdminDeleteService
 from .application_report import ApplicationReportCollector
 from .collector import DashboardCollector
 from .config import DEFAULT_CONFIG_PATH, load_config, validate_config
-from .schemas import ApplicationReportResponse, CollectResponse
+from .schemas import (
+    AdminDeleteExecuteRequest,
+    AdminDeleteRequest,
+    AdminDeleteResponse,
+    ApplicationReportResponse,
+    CollectResponse,
+)
 from .storage import JsonStorage
 
 
@@ -21,6 +28,7 @@ def create_app(
     config_path: Path | str | None = None,
     collector: DashboardCollector | None = None,
     application_report_collector: ApplicationReportCollector | None = None,
+    admin_delete_service: AdminDeleteService | None = None,
 ) -> FastAPI:
     """Create FastAPI app; tests can inject a collector to avoid real SSH."""
 
@@ -32,6 +40,10 @@ def create_app(
     storage.ensure_ready()
     active_collector = collector or DashboardCollector(config=config, storage=storage)
     active_application_report_collector = application_report_collector or ApplicationReportCollector(
+        config=config,
+        storage=storage,
+    )
+    active_admin_delete_service = admin_delete_service or AdminDeleteService(
         config=config,
         storage=storage,
     )
@@ -56,6 +68,7 @@ def create_app(
     app.state.storage = storage
     app.state.collector = active_collector
     app.state.application_report_collector = active_application_report_collector
+    app.state.admin_delete_service = active_admin_delete_service
     static_dir = Path(__file__).resolve().parents[1] / "static"
     if static_dir.exists():
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -126,6 +139,34 @@ def create_app(
         if app.state.config_errors:
             raise HTTPException(status_code=400, detail=app.state.config_errors)
         return await app.state.application_report_collector.collect()
+
+    @app.post("/api/admin/delete/preview", response_model=AdminDeleteResponse)
+    async def admin_delete_preview(request: AdminDeleteRequest) -> AdminDeleteResponse:
+        """Preview application deletion without writing to production SQLite."""
+
+        if app.state.config_errors:
+            raise HTTPException(status_code=400, detail=app.state.config_errors)
+        try:
+            return await app.state.admin_delete_service.preview(request.application_ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/admin/delete/execute", response_model=AdminDeleteResponse)
+    async def admin_delete_execute(request: AdminDeleteExecuteRequest) -> AdminDeleteResponse:
+        """Execute confirmed destructive application deletion."""
+
+        if app.state.config_errors:
+            raise HTTPException(status_code=400, detail=app.state.config_errors)
+        try:
+            result = await app.state.admin_delete_service.execute(
+                application_ids=request.application_ids,
+                confirmation=request.confirmation,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if result.skipped:
+            raise HTTPException(status_code=400, detail=result.reason)
+        return result
 
     return app
 

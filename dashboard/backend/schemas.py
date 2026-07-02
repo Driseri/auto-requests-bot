@@ -83,3 +83,24 @@ class ApplicationReportResponse(BaseModel):
     skipped: bool = False
     reason: str | None = None
     report: ApplicationReport | None = None
+
+
+class AdminDeleteRequest(BaseModel):
+    """Request for previewing application deletion by application IDs."""
+
+    application_ids: list[str] = Field(default_factory=list)
+
+
+class AdminDeleteExecuteRequest(AdminDeleteRequest):
+    """Request for executing destructive deletion after exact confirmation."""
+
+    confirmation: str = ""
+
+
+class AdminDeleteResponse(BaseModel):
+    """Preview or execution result for destructive SQLite cleanup."""
+
+    skipped: bool = False
+    reason: str | None = None
+    audit_id: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)

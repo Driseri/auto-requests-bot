@@ -41,6 +41,14 @@ class CollectorConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminConfig:
+    """Local-only switch for destructive dashboard actions."""
+
+    destructive_actions_enabled: bool = False
+    max_delete_ids: int = 20
+
+
+@dataclass(frozen=True, slots=True)
 class StorageConfig:
     """Local JSON storage settings."""
 
@@ -54,6 +62,7 @@ class AppConfig:
     ssh: SshConfig
     remote: RemoteConfig
     collector: CollectorConfig
+    admin: AdminConfig
     storage: StorageConfig
 
     def safe_dict(self) -> dict[str, Any]:
@@ -79,6 +88,10 @@ class AppConfig:
                 "heavy_interval_seconds": self.collector.heavy_interval_seconds,
                 "auto_collect": self.collector.auto_collect,
             },
+            "admin": {
+                "destructive_actions_enabled": self.admin.destructive_actions_enabled,
+                "max_delete_ids": self.admin.max_delete_ids,
+            },
             "storage": {"data_dir": str(self.storage.data_dir)},
         }
 
@@ -93,6 +106,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     ssh = raw.get("ssh", {})
     remote = raw.get("remote", {})
     collector = raw.get("collector", {})
+    admin = raw.get("admin", {})
     storage = raw.get("storage", {})
     data_dir = Path(storage.get("data_dir", "data"))
     if not data_dir.is_absolute():
@@ -118,6 +132,10 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             heavy_interval_seconds=int(collector.get("heavy_interval_seconds", 300)),
             auto_collect=bool(collector.get("auto_collect", True)),
         ),
+        admin=AdminConfig(
+            destructive_actions_enabled=bool(admin.get("destructive_actions_enabled", False)),
+            max_delete_ids=int(admin.get("max_delete_ids", 20)),
+        ),
         storage=StorageConfig(data_dir=data_dir),
     )
 
@@ -140,4 +158,6 @@ def validate_config(config: AppConfig) -> list[str]:
         errors.append("collector.logs_interval_seconds must be positive")
     if config.collector.heavy_interval_seconds <= 0:
         errors.append("collector.heavy_interval_seconds must be positive")
+    if config.admin.max_delete_ids <= 0:
+        errors.append("admin.max_delete_ids must be positive")
     return errors

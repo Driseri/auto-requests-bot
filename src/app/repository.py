@@ -872,6 +872,65 @@ class DraftRepository:
             raise LookupError(f"Submitted application not found: {application_id}")
         return submitted
 
+    async def index_submitted_application(
+        self,
+        *,
+        application_id: str,
+        telegram_user_id: int,
+        sheet_name: str,
+        last_known_status: str,
+        spreadsheet_id: str | None,
+        sheet_id: int | None,
+        direction: str | None,
+        answer_type: str | None,
+        application_type: str | None,
+        change_type: str | None,
+        is_urgent: bool | None,
+        last_seen_row_number: int | None,
+        last_seen_editor: str | None = None,
+        last_seen_editor_comment: str | None = None,
+        last_seen_final_answer: str | None = None,
+        submitted_at: str | None = None,
+        dashboard_projection: dict[str, Any] | None = None,
+    ) -> SubmittedApplication:
+        """Атомарно поставить вручную найденную строку в tracking и dashboard outbox."""
+        now = utc_now_iso()
+        item = {
+            "application_id": application_id,
+            "telegram_user_id": telegram_user_id,
+            "spreadsheet_id": spreadsheet_id,
+            "sheet_id": sheet_id,
+            "sheet_name": sheet_name,
+            "last_known_status": last_known_status,
+            "direction": direction,
+            "answer_type": answer_type,
+            "application_type": application_type,
+            "change_type": change_type,
+            "is_urgent": is_urgent,
+            "batch_id": None,
+            "last_seen_row_number": last_seen_row_number,
+            "last_seen_editor": last_seen_editor,
+            "last_seen_editor_comment": last_seen_editor_comment,
+            "last_seen_final_answer": last_seen_final_answer,
+            "submitted_at": submitted_at,
+        }
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await self._save_submitted_application_in_connection(db, item, now)
+            if dashboard_projection is not None:
+                await self._upsert_dashboard_projection_in_connection(
+                    db,
+                    entity_type="APPLICATION",
+                    entity_id=application_id,
+                    snapshot=dashboard_projection,
+                    now=now,
+                )
+            await db.commit()
+        submitted = await self.get_submitted_application(application_id)
+        if submitted is None:
+            raise LookupError(f"Submitted application not found: {application_id}")
+        return submitted
+
     @staticmethod
     async def _save_submitted_application_in_connection(
         db: aiosqlite.Connection,

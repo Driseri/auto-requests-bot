@@ -17,5 +17,9 @@ logs_interval_seconds = 120
 heavy_interval_seconds = 300
 auto_collect = true
 
+[admin]
+destructive_actions_enabled = false
+max_delete_ids = 20
+
 [storage]
 data_dir = "data"

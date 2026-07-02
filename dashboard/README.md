@@ -10,7 +10,8 @@ FastAPI backend and static web UI for local, read-only monitoring of the product
 - Reads production SQLite with `file:/data/app.db?mode=ro` and `PRAGMA query_only=ON`.
 - Stores snapshots and application reports locally in `dashboard/data`.
 - Does not expose SSH password through API.
-- Does not provide restart, cleanup, delete, rollback, or database write actions.
+- Restart, rollback, and Google Sheets writes are not implemented.
+- SQLite delete actions are disabled by default and require `[admin].destructive_actions_enabled = true`.
 
 ## Setup
 
@@ -47,6 +48,8 @@ Useful endpoints:
 - `GET http://127.0.0.1:8080/api/config/safe`
 - `POST http://127.0.0.1:8080/api/applications/report`
 - `GET http://127.0.0.1:8080/api/applications/report/latest`
+- `POST http://127.0.0.1:8080/api/admin/delete/preview`
+- `POST http://127.0.0.1:8080/api/admin/delete/execute`
 
 ## Frontend
 
@@ -76,6 +79,27 @@ The application report includes:
 - applications without movement for more than 24 hours;
 - problematic bulk batches;
 - unfinished user workflows.
+
+## Admin Delete
+
+The `Удаление` tab is a local administrator tool for deleting SQLite metadata by
+`application_id`. It does not delete rows from Google Sheets and does not stop the bot
+container.
+
+Destructive execution is disabled until this is set in `config.local.toml`:
+
+```toml
+[admin]
+destructive_actions_enabled = true
+max_delete_ids = 20
+```
+
+The delete flow is:
+
+- preview target IDs through `/api/admin/delete/preview`;
+- verify affected rows and exact confirmation phrase;
+- execute through `/api/admin/delete/execute`;
+- write a local audit/export row into `dashboard/data/admin-deletes/YYYY-MM-DD.jsonl`.
 
 ## Tests
 
