@@ -197,6 +197,31 @@ def test_working_data_rows_reads_mixed_urgent_sheet():
     assert found[1][2]["scriptwriter_response"] == 8
 
 
+def test_working_data_rows_reads_daily_mixed_urgent_sheet():
+    urgent_add = app_row("URGADD01")
+    urgent_add_next_day = app_row("URGADD02")
+    urgent_chips = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    urgent_chips[11] = "URGCHIP1"
+    rows = [
+        SHEET_HEADERS,
+        ["03.06.26"],
+        urgent_add,
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+        urgent_chips,
+        ["04.06.26"],
+        urgent_add_next_day,
+    ]
+
+    found = _working_data_rows(rows)
+
+    assert [(row_number, row[layout["application_id"]]) for row_number, row, layout in found] == [
+        (3, "URGADD01"),
+        (6, "URGCHIP1"),
+        (8, "URGADD02"),
+    ]
+
+
 class FakeRequest:
     def __init__(self, result):
         self.result = result

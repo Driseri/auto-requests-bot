@@ -586,15 +586,14 @@ class GoogleSheetsBulkReservationService:
         rows = self._submission._read_rows(api, spreadsheet_id, sheet_name)
         if layout.startswith("urgent:"):
             if self.daily_sheet_grouping_enabled:
-                insert_plan = _daily_bulk_reservation_insert_plan(
+                insert_plan = _urgent_daily_bulk_reservation_insert_plan(
                     rows,
                     sheet_id=sheet_id,
                     label=daily_separator_label(
                         self._submission.clock(),
                         self._submission.timezone_name,
                     ),
-                    section_start_row=_urgent_bulk_section_start_row(rows, change_type),
-                    section_end_row=_urgent_bulk_insert_row(rows, change_type),
+                    change_type=change_type,
                     column_count=(
                         len(CHIPS_WORKSHEET_HEADERS)
                         if schema in {"chips", "previous_chips"}
@@ -2581,6 +2580,124 @@ def _daily_bulk_reservation_insert_plan(
         "prefix_requests": [],
         "group_request": group_request,
     }
+
+
+def _urgent_daily_bulk_reservation_insert_plan(
+    rows: list[list[Any]],
+    *,
+    sheet_id: int,
+    label: str,
+    change_type: ChangeType,
+    column_count: int,
+    count: int,
+) -> dict[str, Any]:
+    separator_rows = [
+        row_number
+        for row_number in range(2, len(rows) + 1)
+        if is_daily_separator_row(rows[row_number - 1])
+    ]
+    today_row = next(
+        (
+            row_number
+            for row_number in reversed(separator_rows)
+            if _cell(rows[row_number - 1], 0).strip() == label
+        ),
+        None,
+    )
+    group_request: dict[str, Any] | None = None
+    if today_row is None:
+        day_start = len(rows) + 1
+        day_end = len(rows) + 1
+        group_request = _previous_daily_group_request(
+            separator_rows,
+            new_separator_row=day_start,
+            sheet_id=sheet_id,
+        )
+    else:
+        day_start = today_row
+        day_end = next(
+            (row_number for row_number in separator_rows if row_number > today_row),
+            len(rows) + 1,
+        )
+    chips_marker = _chips_marker_row_in_day(rows, day_start=day_start, day_end=day_end)
+    inserted_header_rows: list[dict[str, Any]] = []
+    if today_row is None:
+        physical_insert_row = day_start
+        inserted_header_rows.append(_daily_separator_row_data(label, column_count))
+        if change_type == ChangeType.CHIPS:
+            inserted_header_rows.extend(
+                [
+                    _bulk_section_marker_row_data(
+                        ChangeType.CHIPS.value,
+                        len(CHIPS_WORKSHEET_HEADERS),
+                    ),
+                    {"values": [_cell_data(value) for value in CHIPS_WORKSHEET_HEADERS]},
+                ]
+            )
+        start_row = physical_insert_row + len(inserted_header_rows)
+        inserted_rows = len(inserted_header_rows) + count
+    elif change_type == ChangeType.CHIPS and chips_marker is None:
+        physical_insert_row = day_end
+        inserted_header_rows.extend(
+            [
+                _bulk_section_marker_row_data(
+                    ChangeType.CHIPS.value,
+                    len(CHIPS_WORKSHEET_HEADERS),
+                ),
+                {"values": [_cell_data(value) for value in CHIPS_WORKSHEET_HEADERS]},
+            ]
+        )
+        start_row = physical_insert_row + len(inserted_header_rows)
+        inserted_rows = len(inserted_header_rows) + count
+    elif change_type == ChangeType.CHIPS:
+        physical_insert_row = day_end
+        start_row = physical_insert_row
+        inserted_rows = count
+    else:
+        physical_insert_row = chips_marker or day_end
+        start_row = physical_insert_row
+        inserted_rows = count
+    return {
+        "insert_row": physical_insert_row,
+        "start_row": start_row,
+        "inserted_rows": inserted_rows,
+        "inserted_header_rows": inserted_header_rows,
+        "prefix_requests": [],
+        "group_request": group_request,
+    }
+
+
+def _chips_marker_row_in_day(
+    rows: list[list[Any]],
+    *,
+    day_start: int,
+    day_end: int,
+) -> int | None:
+    for row_number in range(day_start + 1, min(day_end, len(rows) + 1)):
+        if _cell(rows[row_number - 1], 0).strip() != ChangeType.CHIPS.value:
+            continue
+        header_row_number = row_number + 1
+        if header_row_number >= day_end or header_row_number > len(rows):
+            raise ValueError("Повреждена CHIPS-секция внутри дневного блока.")
+        if not _is_chips_header_row(rows[header_row_number - 1]):
+            raise ValueError("Повреждена CHIPS-шапка внутри дневного блока.")
+        return row_number
+    return None
+
+
+def _is_chips_header_row(row: list[Any]) -> bool:
+    normalized = [str(value).strip() for value in row]
+    return normalized[: len(CHIPS_WORKSHEET_HEADERS)] == CHIPS_WORKSHEET_HEADERS
+
+
+def _bulk_section_marker_row_data(marker: str, column_count: int) -> dict[str, Any]:
+    values = [_cell_data(marker if index == 0 else "") for index in range(column_count)]
+    for cell in values:
+        cell["userEnteredFormat"] = {
+            "backgroundColor": {"red": 0.90, "green": 0.90, "blue": 0.90},
+            "textFormat": {"bold": True},
+        }
+    return {"values": values}
 
 
 def _reservation_required_indices(schema: str) -> tuple[int, ...]:

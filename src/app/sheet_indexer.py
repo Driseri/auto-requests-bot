@@ -105,13 +105,19 @@ def find_index_candidates(
     candidates: list[IndexCandidate] = []
     skipped: list[SkippedRow] = []
     section: SheetSection | None = None
+    default_section: SheetSection | None = None
     for row_number, row in enumerate(rows, start=1):
         normalized = _normalize_row(row)
         detected = _detect_section(normalized)
         if detected is not None:
             section = detected
+            if not detected.is_chips:
+                default_section = detected
             continue
         if _outside_range(row_number, from_row, to_row):
+            continue
+        if is_daily_separator(normalized):
+            section = default_section
             continue
         if _is_marker_or_date_row(normalized):
             continue
@@ -231,6 +237,222 @@ async def index_candidates(
     return indexed
 
 
+async def migrate_urgent_chips_layout(
+    *,
+    repository: DraftRepository,
+    api: Any,
+    spreadsheet_id: str,
+    sheet_id: int,
+    sheet_name: str,
+    rows: list[list[Any]],
+    execute: bool,
+    retry_config: Any,
+) -> dict[str, Any]:
+    migration = plan_urgent_chips_layout_migration(
+        spreadsheet_id=spreadsheet_id,
+        sheet_id=sheet_id,
+        sheet_name=sheet_name,
+        rows=rows,
+    )
+    if execute and migration["migrated"]:
+        execute_with_retry(
+            lambda: api.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{quote_sheet_name(sheet_name)}!A1:X{len(migration['rows'])}",
+                valueInputOption="USER_ENTERED",
+                body={"values": migration["rows"]},
+            )
+            .execute(),
+            config=retry_config,
+            operation_id=f"urgent-chips-layout-migration:{spreadsheet_id}:{sheet_name}",
+        )
+        if len(rows) > len(migration["rows"]):
+            execute_with_retry(
+                lambda: api.spreadsheets()
+                .values()
+                .clear(
+                    spreadsheetId=spreadsheet_id,
+                    range=(
+                        f"{quote_sheet_name(sheet_name)}!"
+                        f"A{len(migration['rows']) + 1}:X{len(rows)}"
+                    ),
+                    body={},
+                )
+                .execute(),
+                config=retry_config,
+                operation_id=(
+                    f"urgent-chips-layout-migration-clear:{spreadsheet_id}:{sheet_name}"
+                ),
+            )
+        await repository.update_application_tracking_batch(
+            migration["tracking_updates"],
+            dashboard_projections=migration["dashboard_projections"],
+        )
+    report = {
+        "execute": execute,
+        "spreadsheet_id": spreadsheet_id,
+        "sheet_id": sheet_id,
+        "sheet_name": sheet_name,
+        "migrated_count": len(migration["migrated"]),
+        "skipped_count": len(migration["skipped"]),
+        "migrated": migration["migrated"],
+        "skipped": migration["skipped"],
+    }
+    return report
+
+
+def plan_urgent_chips_layout_migration(
+    *,
+    spreadsheet_id: str,
+    sheet_id: int,
+    sheet_name: str,
+    rows: list[list[Any]],
+) -> dict[str, Any]:
+    global_marker_index = _legacy_global_chips_marker_index(rows)
+    if global_marker_index is None:
+        return {
+            "rows": rows,
+            "migrated": [],
+            "skipped": [{"reason": "legacy_global_chips_section_not_found"}],
+            "tracking_updates": [],
+            "dashboard_projections": [],
+        }
+    top_rows = [list(row) for row in rows[:global_marker_index]]
+    chips_rows = rows[global_marker_index + 2 :]
+    chips_layout = {header: index for index, header in enumerate(CHIPS_WORKSHEET_HEADERS)}
+    by_date: dict[str, list[tuple[int, list[Any]]]] = {}
+    skipped: list[dict[str, Any]] = []
+    active_date = ""
+    for source_index, source_row in enumerate(chips_rows, start=global_marker_index + 3):
+        row = _normalize_row(list(source_row))
+        if is_daily_separator(row):
+            active_date = row[0]
+            continue
+        if not _row_has_any_value(row):
+            continue
+        application_id = _value(row, chips_layout, "ID заявки")
+        if not application_id:
+            skipped.append({"source_row": source_index, "reason": "missing_application_id"})
+            continue
+        row_date = active_date or _date_label_from_technical_value(
+            _value(row, chips_layout, "Дата заявки")
+        )
+        if not row_date:
+            skipped.append(
+                {
+                    "source_row": source_index,
+                    "application_id": application_id,
+                    "reason": "date_not_found",
+                }
+            )
+            continue
+        by_date.setdefault(row_date, []).append((source_index, list(source_row)))
+
+    migrated: list[dict[str, Any]] = []
+    tracking_updates: list[dict[str, Any]] = []
+    dashboard_projections: list[dict[str, Any]] = []
+    for date_label, entries in by_date.items():
+        date_row = _find_date_row(top_rows, date_label)
+        if date_row is None:
+            top_rows.append([date_label])
+            date_row = len(top_rows)
+        day_end = _day_end_row(top_rows, date_row)
+        chips_marker = _chips_marker_row(top_rows, date_row, day_end)
+        if chips_marker is None:
+            insert_at = day_end - 1
+            top_rows[insert_at:insert_at] = [
+                [ChangeType.CHIPS.value],
+                list(CHIPS_WORKSHEET_HEADERS),
+            ]
+            chips_marker = insert_at + 1
+            day_end += 2
+        insert_at = day_end - 1
+        copied_rows = [list(row) for _, row in entries]
+        top_rows[insert_at:insert_at] = copied_rows
+        for offset, (source_row, row) in enumerate(entries):
+            new_row_number = insert_at + offset + 1
+            application_id = _value(
+                _normalize_row(row),
+                chips_layout,
+                "ID заявки",
+            )
+            status = _value(_normalize_row(row), chips_layout, "Статус") or ApplicationStatus.NEW.value
+            editor = _value(_normalize_row(row), chips_layout, "Редактор")
+            editor_comment = _value(
+                _normalize_row(row),
+                chips_layout,
+                "Вопросы/комментарии редактора",
+            )
+            row_link = spreadsheet_row_link(
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+                row_number=new_row_number,
+                end_column="U",
+            )
+            migrated.append(
+                {
+                    "application_id": application_id,
+                    "source_row": source_row,
+                    "target_row": new_row_number,
+                    "date": date_label,
+                    "row_link": row_link,
+                }
+            )
+            tracking_updates.append(
+                {
+                    "application_id": application_id,
+                    "spreadsheet_id": spreadsheet_id,
+                    "sheet_id": sheet_id,
+                    "sheet_name": sheet_name,
+                    "last_known_status": status,
+                    "last_seen_row_number": new_row_number,
+                    "last_seen_editor": editor or None,
+                    "last_seen_editor_comment": editor_comment or None,
+                    "last_seen_final_answer": None,
+                    "last_seen_scriptwriter_response": _value(
+                        _normalize_row(row),
+                        chips_layout,
+                        "Ответ сценариста",
+                    )
+                    or None,
+                    "change_type": ChangeType.CHIPS.value,
+                }
+            )
+            dashboard_projections.append(
+                {
+                    "entity_type": "APPLICATION",
+                    "entity_id": application_id,
+                    "snapshot": dashboard_projection(
+                        [
+                            application_id,
+                            "",
+                            _value(_normalize_row(row), chips_layout, "Дата заявки"),
+                            _value(_normalize_row(row), chips_layout, "Направление"),
+                            _value(_normalize_row(row), chips_layout, "Тип заявки")
+                            or ApplicationType.SINGLE.value,
+                            _value(_normalize_row(row), chips_layout, "Тип ответа")
+                            or AnswerType.URGENT.value,
+                            _value(_normalize_row(row), chips_layout, "Срочная") or "Да",
+                            _value(_normalize_row(row), chips_layout, "Автор заявки"),
+                            status,
+                            editor,
+                            "Нет",
+                            row_link,
+                        ]
+                    ),
+                }
+            )
+    return {
+        "rows": top_rows,
+        "migrated": migrated,
+        "skipped": skipped,
+        "tracking_updates": tracking_updates,
+        "dashboard_projections": dashboard_projections,
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Index manually inserted Google Sheets rows into SQLite tracking."
@@ -251,6 +473,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow-unknown-user", action="store_true")
     parser.add_argument("--author", default=DEFAULT_AUTHOR)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--migrate-urgent-chips-layout",
+        action="store_true",
+        help="Move legacy global urgent CHIPS rows into per-day CHIPS sections.",
+    )
     parser.add_argument("--output-json", help="Optional path for JSON report.")
     return parser.parse_args(argv)
 
@@ -267,6 +494,21 @@ async def run(argv: list[str] | None = None) -> dict[str, Any]:
         sheet_name=args.sheet_name,
         retry_config=settings.google_api_retry,
     )
+    if args.migrate_urgent_chips_layout:
+        report = await migrate_urgent_chips_layout(
+            repository=repository,
+            api=api,
+            spreadsheet_id=args.spreadsheet_id,
+            sheet_id=sheet_id,
+            sheet_name=args.sheet_name,
+            rows=rows,
+            execute=args.execute,
+            retry_config=settings.google_api_retry,
+        )
+        if args.output_json:
+            with open(args.output_json, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, ensure_ascii=False, indent=2)
+        return report
     direction = args.direction or _infer_direction(args.spreadsheet_id, settings)
     answer_type = args.answer_type or _infer_answer_type(args.sheet_name)
     candidates, skipped = find_index_candidates(
@@ -560,6 +802,71 @@ def _headers_for_schema(schema: str) -> list[str]:
     }[schema]
 
 
+def _legacy_global_chips_marker_index(rows: list[list[Any]]) -> int | None:
+    for index, row in enumerate(rows[:-2]):
+        if not _is_exact_marker(row, ChangeType.CHIPS.value):
+            continue
+        next_row = _normalize_row(rows[index + 1])
+        if next_row[: len(CHIPS_WORKSHEET_HEADERS)] != CHIPS_WORKSHEET_HEADERS:
+            continue
+        following_rows = rows[index + 2 :]
+        if any(is_daily_separator(_normalize_row(item)) for item in following_rows):
+            return index
+    return None
+
+
+def _is_exact_marker(row: list[Any], marker: str) -> bool:
+    normalized = _normalize_row(row)
+    return bool(normalized) and normalized[0] == marker and all(
+        not value for value in normalized[1:]
+    )
+
+
+def _date_label_from_technical_value(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    for fmt in ("%d.%m.%y", "%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return parsed.strftime("%d.%m.%y")
+    return ""
+
+
+def _find_date_row(rows: list[list[Any]], label: str) -> int | None:
+    for row_number, row in enumerate(rows, start=1):
+        if _normalize_row(row)[0:1] == [label] and is_daily_separator(_normalize_row(row)):
+            return row_number
+    return None
+
+
+def _day_end_row(rows: list[list[Any]], date_row: int) -> int:
+    next_date = next(
+        (
+            row_number
+            for row_number in range(date_row + 1, len(rows) + 1)
+            if is_daily_separator(_normalize_row(rows[row_number - 1]))
+        ),
+        None,
+    )
+    return next_date or len(rows) + 1
+
+
+def _chips_marker_row(rows: list[list[Any]], date_row: int, day_end: int) -> int | None:
+    for row_number in range(date_row + 1, min(day_end, len(rows) + 1)):
+        if not _is_exact_marker(rows[row_number - 1], ChangeType.CHIPS.value):
+            continue
+        header_row_number = row_number + 1
+        if header_row_number >= day_end or header_row_number > len(rows):
+            return None
+        header = _normalize_row(rows[header_row_number - 1])
+        if header[: len(CHIPS_WORKSHEET_HEADERS)] == CHIPS_WORKSHEET_HEADERS:
+            return row_number
+    return None
+
+
 def _required_headers(section: SheetSection) -> list[str]:
     if section.is_chips:
         return [
@@ -654,6 +961,11 @@ def _is_marker_or_date_row(row: list[str]) -> bool:
     first = row[0].strip() if row else ""
     if first in {item.value for item in ChangeType} | {"CHIPS V2"}:
         return True
+    return is_daily_separator(row)
+
+
+def is_daily_separator(row: list[str]) -> bool:
+    first = row[0].strip() if row else ""
     if len(first) == DATE_SEPARATOR_LENGTH:
         try:
             datetime.strptime(first, "%d.%m.%y")

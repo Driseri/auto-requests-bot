@@ -588,11 +588,7 @@ async def test_new_urgent_sheet_creates_chips_section_and_inserts_add_above_it()
 
     assert result.success is True
     assert result.sheet_name == "Срочные"
-    assert api.rows[(FL_SPREADSHEET, "Срочные")] == [
-        SHEET_HEADERS,
-        [ChangeType.CHIPS.value],
-        CHIPS_WORKSHEET_HEADERS,
-    ]
+    assert api.rows[(FL_SPREADSHEET, "Срочные")] == [SHEET_HEADERS]
     requests = api.batch_updates[-1]["body"]["requests"]
     assert requests[0]["insertDimension"]["range"]["startIndex"] == 1
     assert requests[0]["insertDimension"]["range"]["endIndex"] == 3
@@ -600,7 +596,6 @@ async def test_new_urgent_sheet_creates_chips_section_and_inserts_add_above_it()
     rows = requests[1]["updateCells"]["rows"]
     assert rows[0]["values"][0]["userEnteredValue"] == {"stringValue": "03.06.26"}
     assert rows[1]["values"][11]["userEnteredValue"] == {"stringValue": "A1B2C3D4"}
-    assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 3
     assert result.row_number == 3
 
 
@@ -634,8 +629,6 @@ async def test_single_submission_different_section_is_not_blocked_by_lock(tmp_pa
         rows={
             (FL_SPREADSHEET, "Срочные"): [
                 SHEET_HEADERS,
-                [ChangeType.CHIPS.value],
-                CHIPS_WORKSHEET_HEADERS,
             ]
         },
     )
@@ -695,8 +688,6 @@ async def test_single_submission_shift_rows_after_insert_dimension(tmp_path):
             (FL_SPREADSHEET, "Срочные"): [
                 SHEET_HEADERS,
                 draft_to_sheet_row(urgent_draft(ChangeType.ADD, application_id="OLDROW001")),
-                [ChangeType.CHIPS.value],
-                CHIPS_WORKSHEET_HEADERS,
             ]
         },
     )
@@ -709,10 +700,10 @@ async def test_single_submission_shift_rows_after_insert_dimension(tmp_path):
     existing = await repository.get_submitted_application("EXISTING1")
     reservation = await repository.get_bulk_reservation("RES-BELOW")
     assert existing is not None
-    assert existing.last_seen_row_number == 7
+    assert existing.last_seen_row_number == 5
     assert reservation is not None
-    assert reservation.start_row == 9
-    assert reservation.end_row == 11
+    assert reservation.start_row == 7
+    assert reservation.end_row == 9
 
 
 @pytest.mark.asyncio
@@ -728,7 +719,14 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
     assert update_request["rows"][0]["values"][0]["userEnteredValue"] == {
         "stringValue": "03.06.26"
     }
-    cells = update_request["rows"][1]["values"]
+    assert update_request["rows"][1]["values"][0]["userEnteredValue"] == {
+        "stringValue": ChangeType.CHIPS.value
+    }
+    assert [
+        cell["userEnteredValue"]["stringValue"]
+        for cell in update_request["rows"][2]["values"]
+    ] == CHIPS_WORKSHEET_HEADERS
+    cells = update_request["rows"][3]["values"]
     assert len(cells) == len(CHIPS_WORKSHEET_HEADERS)
     assert cells[3]["userEnteredValue"] == {"stringValue": "before"}
     assert cells[4]["userEnteredValue"] == {"stringValue": "chip"}
@@ -757,6 +755,37 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
 
 
 @pytest.mark.asyncio
+async def test_urgent_add_inserts_before_same_day_chips_section():
+    chips_row = chips_draft_to_sheet_row(
+        urgent_draft(ChangeType.CHIPS, application_id="CHIP0001")
+    )
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 42}},
+        headers={(FL_SPREADSHEET, "Срочные"): SHEET_HEADERS},
+        rows={
+            (FL_SPREADSHEET, "Срочные"): [
+                SHEET_HEADERS,
+                ["03.06.26"],
+                [ChangeType.CHIPS.value],
+                CHIPS_WORKSHEET_HEADERS,
+                chips_row,
+            ]
+        },
+    )
+    service = make_service(api)
+
+    result = await service.submit(urgent_draft(ChangeType.ADD, application_id="ADDNEW01"))
+
+    assert result.success is True
+    assert result.row_number == 3
+    request = api.batch_updates[-1]["body"]["requests"][1]["updateCells"]
+    assert request["range"]["startRowIndex"] == 2
+    assert request["rows"][0]["values"][11]["userEnteredValue"] == {
+        "stringValue": "ADDNEW01"
+    }
+
+
+@pytest.mark.asyncio
 async def test_existing_urgent_sheet_gets_chips_section_without_changing_rows():
     existing_row = draft_to_sheet_row(urgent_draft(ChangeType.ADD))
     rows = [SHEET_HEADERS, existing_row]
@@ -776,17 +805,13 @@ async def test_existing_urgent_sheet_gets_chips_section_without_changing_rows():
         SHEET_HEADERS,
         existing_row,
     ]
-    assert api.rows[(FL_SPREADSHEET, "Срочные")][2:4] == [
-        [ChangeType.CHIPS.value],
-        CHIPS_WORKSHEET_HEADERS,
-    ]
+    assert len(api.rows[(FL_SPREADSHEET, "Срочные")]) == 2
     requests = api.batch_updates[-1]["body"]["requests"]
     assert requests[0]["insertDimension"]["range"]["startIndex"] == 2
     assert requests[0]["insertDimension"]["range"]["endIndex"] == 4
     assert requests[1]["updateCells"]["rows"][0]["values"][0]["userEnteredValue"] == {
         "stringValue": "03.06.26"
     }
-    assert requests[2]["setBasicFilter"]["filter"]["range"]["endRowIndex"] == 4
     assert result.row_number == 4
 
 
@@ -900,7 +925,7 @@ async def test_daily_grouping_failure_does_not_block_submission():
                 "range": {
                     "sheetId": 42,
                     "dimension": "ROWS",
-                    "startIndex": 2,
+                    "startIndex": 1,
                     "endIndex": 3,
                 }
             }
@@ -935,7 +960,7 @@ async def test_urgent_add_supports_all_existing_base_headers(headers):
 
 @pytest.mark.asyncio
 async def test_urgent_sheet_rejects_damaged_chips_header():
-    rows = [SHEET_HEADERS, [ChangeType.CHIPS.value], ["wrong"]]
+    rows = [SHEET_HEADERS, ["03.06.26"], [ChangeType.CHIPS.value], ["wrong"]]
     api = FakeSheetsApi(
         sheets={FL_SPREADSHEET: {"Срочные": 42}},
         headers={(FL_SPREADSHEET, "Срочные"): SHEET_HEADERS},
@@ -946,7 +971,7 @@ async def test_urgent_sheet_rejects_damaged_chips_header():
     result = await service.submit(urgent_draft(ChangeType.CHIPS))
 
     assert result.success is False
-    assert "Повреждена шапка секции CHIPS" in result.message
+    assert "Повреждена CHIPS-шапка внутри дневного блока" in result.message
 
 
 @pytest.mark.asyncio

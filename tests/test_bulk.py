@@ -439,8 +439,6 @@ async def test_urgent_bulk_reservation_creation_creates_daily_separator(tmp_path
     )
     api.rows[(FL_SPREADSHEET, "Срочные")] = [
         WORKSHEET_HEADERS,
-        [ChangeType.CHIPS.value],
-        CHIPS_WORKSHEET_HEADERS,
     ]
     service = make_reservation_service(repository, api)
 
@@ -457,7 +455,7 @@ async def test_urgent_bulk_reservation_creation_creates_daily_separator(tmp_path
     assert result.reservation is not None
     assert result.reservation.start_row == 3
     assert result.reservation.end_row == 4
-    assert result.shifted_rows == 3
+    assert result.shifted_rows == 0
     requests = [
         request
         for update in api.batch_updates

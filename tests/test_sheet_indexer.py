@@ -1,5 +1,5 @@
 from app.models import AnswerType, ChangeType, Direction
-from app.sheet_indexer import find_index_candidates
+from app.sheet_indexer import find_index_candidates, plan_urgent_chips_layout_migration
 from app.submission import CHIPS_WORKSHEET_HEADERS, WORKSHEET_HEADERS
 
 
@@ -93,3 +93,48 @@ def test_sheet_indexer_finds_chips_row():
     assert skipped == []
     assert len(candidates) == 1
     assert candidates[0].change_type == ChangeType.CHIPS.value
+
+
+def test_plan_urgent_chips_layout_migration_moves_legacy_chips_into_day():
+    add_row = [""] * len(WORKSHEET_HEADERS)
+    add_row[11] = "ADD00001"
+    chips_row = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    chips_row[11] = "CHIP0001"
+    chips_row[14] = "03.06.2026 10:00"
+    rows = [
+        WORKSHEET_HEADERS,
+        ["03.06.26"],
+        add_row,
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+        ["03.06.26"],
+        chips_row,
+    ]
+
+    report = plan_urgent_chips_layout_migration(
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="Срочные",
+        rows=rows,
+    )
+
+    assert report["migrated"] == [
+        {
+            "application_id": "CHIP0001",
+            "source_row": 7,
+            "target_row": 6,
+            "date": "03.06.26",
+            "row_link": (
+                "https://docs.google.com/spreadsheets/d/spreadsheet/edit"
+                "#gid=123&range=A6:U6"
+            ),
+        }
+    ]
+    assert report["rows"][:6] == [
+        WORKSHEET_HEADERS,
+        ["03.06.26"],
+        add_row,
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+        chips_row,
+    ]

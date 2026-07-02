@@ -1487,6 +1487,39 @@ docker compose -f docker-compose.prod.yml exec -T bot python -m app.sheet_indexe
 Если `dry-run` показывает частично заполненную строку в `skipped`, не индексируйте
 её до ручной проверки. Инструмент специально не угадывает неполные заявки.
 
+### 4. Мигрировать старую CHIPS-секцию срочного листа
+
+Старый формат срочного листа хранил все CHIPS в отдельной нижней секции. Новый
+формат хранит CHIPS внутри дневного блока рядом с ADD/EDIT заявками того же дня.
+Перед миграцией обязательно выполните dry-run:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python -m app.sheet_indexer \
+  --spreadsheet-id "<spreadsheet_id>" \
+  --sheet-name "Срочные" \
+  --migrate-urgent-chips-layout
+```
+
+Проверьте:
+
+- какие `application_id` будут перенесены;
+- из каких строк и в какие строки они попадут;
+- нет ли строк в `skipped`.
+
+Применение:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python -m app.sheet_indexer \
+  --spreadsheet-id "<spreadsheet_id>" \
+  --sheet-name "Срочные" \
+  --migrate-urgent-chips-layout \
+  --execute
+```
+
+Команда обновляет Google Sheets, `submitted_applications.last_seen_row_number` и
+dashboard projection. Строки, для которых нельзя определить дату, не переносятся
+автоматически.
+
 ## Удаление заявок из SQLite
 
 Используйте этот раздел только для локального tracking в SQLite. Эти команды не

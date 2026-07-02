@@ -2375,12 +2375,16 @@ def _working_data_rows(
 ) -> list[tuple[int, list[Any], dict[str, Any]]]:
     result: list[tuple[int, list[Any], dict[str, Any]]] = []
     active_layout: dict[str, Any] | None = None
+    default_layout = _working_row_layout(WORKSHEET_HEADERS)
     for row_number, row in enumerate(rows, start=start_row):
         if is_daily_separator_row(row):
+            active_layout = default_layout
             continue
         row_layout = _working_row_layout(row)
         if row_layout is not None:
             active_layout = row_layout
+            continue
+        if _cell(row, 0).strip() in {ChangeType.ADD.value, ChangeType.EDIT.value, ChangeType.CHIPS.value, "CHIPS V2"}:
             continue
         if active_layout is None:
             continue
