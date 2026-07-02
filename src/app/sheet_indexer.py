@@ -330,10 +330,12 @@ def plan_urgent_chips_layout_migration(
         if is_daily_separator(row):
             active_date = row[0]
             continue
+        if _detect_section(row) is not None or _is_marker_or_date_row(row):
+            continue
         if not _row_has_any_value(row):
             continue
         application_id = _value(row, chips_layout, "ID заявки")
-        if not application_id:
+        if not application_id or application_id == "ID заявки":
             skipped.append({"source_row": source_index, "reason": "missing_application_id"})
             continue
         row_date = active_date or _date_label_from_technical_value(

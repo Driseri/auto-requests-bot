@@ -143,3 +143,27 @@ def test_plan_urgent_chips_layout_migration_moves_legacy_chips_into_day():
         for item in report["tracking_updates"]
     }
     assert updates == {"ADD00001": 3, "CHIP0001": 6}
+
+
+def test_plan_urgent_chips_layout_migration_skips_nested_headers():
+    chips_row = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    chips_row[11] = "CHIP0001"
+    chips_row[14] = "03.06.2026 10:00"
+    rows = [
+        WORKSHEET_HEADERS,
+        ["03.06.26"],
+        [ChangeType.CHIPS.value],
+        CHIPS_WORKSHEET_HEADERS,
+        ["03.06.26"],
+        chips_row,
+        CHIPS_WORKSHEET_HEADERS,
+    ]
+
+    report = plan_urgent_chips_layout_migration(
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="Срочные",
+        rows=rows,
+    )
+
+    assert [item["application_id"] for item in report["migrated"]] == ["CHIP0001"]
