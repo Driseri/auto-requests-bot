@@ -746,6 +746,15 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
         cell["userEnteredValue"]["stringValue"]
         for cell in update_request["rows"][2]["values"]
     ] == CHIPS_WORKSHEET_HEADERS
+    header_cell_format = update_request["rows"][2]["values"][0]["userEnteredFormat"]
+    assert header_cell_format["backgroundColor"] == {
+        "red": 0.94,
+        "green": 0.94,
+        "blue": 0.94,
+    }
+    assert header_cell_format["horizontalAlignment"] == "CENTER"
+    assert header_cell_format["textFormat"] == {"bold": True}
+    assert header_cell_format["wrapStrategy"] == "WRAP"
     cells = update_request["rows"][3]["values"]
     assert len(cells) == len(CHIPS_WORKSHEET_HEADERS)
     assert cells[3]["userEnteredValue"] == {"stringValue": "before"}
@@ -758,7 +767,7 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
         if "setBasicFilter" in request
     )
     assert urgent_filter["filter"]["range"]["endRowIndex"] == 1
-    urgent_format = next(
+    urgent_formats = [
         request["addConditionalFormatRule"]["rule"]["booleanRule"]["condition"]["values"][0][
             "userEnteredValue"
         ]
@@ -767,11 +776,15 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
         and "$R2" in request["addConditionalFormatRule"]["rule"]["booleanRule"]["condition"][
             "values"
         ][0]["userEnteredValue"]
-    )
-    assert urgent_format.startswith("=AND(")
-    assert "$R2=" in urgent_format
-    assert '$U2<>"CHIPS"' in urgent_format
+    ]
+    assert urgent_formats == []
     assert result.row_number == 5
+    structure_reads = [
+        call
+        for call in api.value_get_calls
+        if call["range"] == "'Срочные'!A:X"
+    ]
+    assert structure_reads[-1]["valueRenderOption"] == "FORMATTED_VALUE"
 
 
 @pytest.mark.asyncio
@@ -803,6 +816,43 @@ async def test_urgent_add_inserts_before_same_day_chips_section():
     assert request["rows"][0]["values"][11]["userEnteredValue"] == {
         "stringValue": "ADDNEW01"
     }
+
+
+@pytest.mark.asyncio
+async def test_urgent_chips_formats_header_when_added_to_existing_day():
+    existing_row = draft_to_sheet_row(
+        urgent_draft(ChangeType.ADD, application_id="ADD00001")
+    )
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"Срочные": 42}},
+        headers={(FL_SPREADSHEET, "Срочные"): SHEET_HEADERS},
+        rows={
+            (FL_SPREADSHEET, "Срочные"): [
+                SHEET_HEADERS,
+                ["03.06.26"],
+                existing_row,
+            ]
+        },
+    )
+    service = make_service(api)
+
+    result = await service.submit(urgent_draft(ChangeType.CHIPS, application_id="CHIPNEW1"))
+
+    assert result.success is True
+    assert result.row_number == 6
+    update_request = api.batch_updates[-1]["body"]["requests"][1]["updateCells"]
+    assert update_request["rows"][0]["values"][0]["userEnteredValue"] == {
+        "stringValue": ChangeType.CHIPS.value
+    }
+    header_cell_format = update_request["rows"][1]["values"][0]["userEnteredFormat"]
+    assert header_cell_format["backgroundColor"] == {
+        "red": 0.94,
+        "green": 0.94,
+        "blue": 0.94,
+    }
+    assert header_cell_format["horizontalAlignment"] == "CENTER"
+    assert header_cell_format["textFormat"] == {"bold": True}
+    assert header_cell_format["wrapStrategy"] == "WRAP"
 
 
 @pytest.mark.asyncio
@@ -874,10 +924,7 @@ async def test_existing_urgent_sheet_replaces_urgent_conditional_formatting():
             "values"
         ][0]["userEnteredValue"]
     ]
-    assert len(urgent_rules) == 1
-    assert urgent_rules[0].startswith("=AND(")
-    assert "$R2=" in urgent_rules[0]
-    assert '$U2<>"CHIPS"' in urgent_rules[0]
+    assert urgent_rules == []
 
 
 @pytest.mark.asyncio
@@ -1417,6 +1464,15 @@ def test_new_worksheet_formatting_has_active_group_border():
     assert border["range"]["startColumnIndex"] == 10
     assert border["range"]["endColumnIndex"] == 11
     assert border["cell"]["userEnteredFormat"]["borders"]["right"]["style"] == "SOLID_THICK"
+    conditional_formulas = [
+        request["addConditionalFormatRule"]["rule"]["booleanRule"]["condition"]["values"][0][
+            "userEnteredValue"
+        ]
+        for request in requests
+        if "addConditionalFormatRule" in request
+    ]
+    assert conditional_formulas
+    assert not any("$R2" in formula for formula in conditional_formulas)
 
 
 def test_chips_row_preserves_rich_text_in_all_three_fragments():

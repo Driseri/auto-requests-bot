@@ -50,6 +50,7 @@ from app.submission import (
     _cell_data,
     _daily_separator_row_data,
     _previous_daily_group_request,
+    _section_header_row_data,
     _status_cell_data,
     _status_data_validation_rule,
     _worksheet_schema_layout,
@@ -2594,7 +2595,7 @@ def _urgent_daily_bulk_reservation_insert_plan(
                         ChangeType.CHIPS.value,
                         len(CHIPS_WORKSHEET_HEADERS),
                     ),
-                    {"values": [_cell_data(value) for value in CHIPS_WORKSHEET_HEADERS]},
+                    _section_header_row_data(CHIPS_WORKSHEET_HEADERS),
                 ]
             )
         start_row = physical_insert_row + len(inserted_header_rows)
@@ -2607,7 +2608,7 @@ def _urgent_daily_bulk_reservation_insert_plan(
                     ChangeType.CHIPS.value,
                     len(CHIPS_WORKSHEET_HEADERS),
                 ),
-                {"values": [_cell_data(value) for value in CHIPS_WORKSHEET_HEADERS]},
+                _section_header_row_data(CHIPS_WORKSHEET_HEADERS),
             ]
         )
         start_row = physical_insert_row + len(inserted_header_rows)

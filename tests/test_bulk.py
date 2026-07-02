@@ -522,6 +522,16 @@ async def test_urgent_bulk_reservation_always_uses_daily_structure(tmp_path):
     assert {"stringValue": "23.06.26"} in inserted_values
     assert {"stringValue": ChangeType.CHIPS.value} in inserted_values
     assert {"stringValue": CHIPS_WORKSHEET_HEADERS[0]} in inserted_values
+    update_cells = next(request["updateCells"] for request in requests if "updateCells" in request)
+    header_cell_format = update_cells["rows"][2]["values"][0]["userEnteredFormat"]
+    assert header_cell_format["backgroundColor"] == {
+        "red": 0.94,
+        "green": 0.94,
+        "blue": 0.94,
+    }
+    assert header_cell_format["horizontalAlignment"] == "CENTER"
+    assert header_cell_format["textFormat"] == {"bold": True}
+    assert header_cell_format["wrapStrategy"] == "WRAP"
 
 
 @pytest.mark.asyncio

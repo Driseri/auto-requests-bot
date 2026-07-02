@@ -790,6 +790,7 @@ class GoogleSheetsSubmissionService:
             spreadsheetId=spreadsheet_id,
             range=f"{quote_sheet_name(sheet_name)}!A:X",
             majorDimension="ROWS",
+            valueRenderOption="FORMATTED_VALUE",
         ).execute()
         return result.get("values", [])
 
@@ -2640,7 +2641,6 @@ def worksheet_formatting_requests(
         _right_border_request(sheet_id, column_index=10),
     ]
     requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=1))
-    requests.append(_urgent_conditional_formatting_request(sheet_id))
     return requests
 
 
@@ -2714,7 +2714,6 @@ def sectioned_worksheet_formatting_requests(
             }
         )
     requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=1))
-    requests.append(_urgent_conditional_formatting_request(sheet_id))
     return requests
 
 
@@ -3012,7 +3011,7 @@ def _urgent_daily_insert_plan(
             prefix_rows.extend(
                 [
                     _section_marker_row_data(ChangeType.CHIPS.value, len(CHIPS_WORKSHEET_HEADERS)),
-                    {"values": [_cell_data(value) for value in CHIPS_WORKSHEET_HEADERS]},
+                    _section_header_row_data(CHIPS_WORKSHEET_HEADERS),
                 ]
             )
         update_rows = [*prefix_rows, row_data]
@@ -3023,7 +3022,7 @@ def _urgent_daily_insert_plan(
         if chips_marker is None:
             update_rows = [
                 _section_marker_row_data(ChangeType.CHIPS.value, len(CHIPS_WORKSHEET_HEADERS)),
-                {"values": [_cell_data(value) for value in CHIPS_WORKSHEET_HEADERS]},
+                _section_header_row_data(CHIPS_WORKSHEET_HEADERS),
                 row_data,
             ]
             insert_row = day_end
@@ -3106,6 +3105,18 @@ def _section_marker_row_data(marker: str, column_count: int) -> dict[str, Any]:
         cell["userEnteredFormat"] = {
             "backgroundColor": {"red": 0.90, "green": 0.90, "blue": 0.90},
             "textFormat": {"bold": True},
+        }
+    return {"values": values}
+
+
+def _section_header_row_data(headers: list[str]) -> dict[str, Any]:
+    values = [_cell_data(value) for value in headers]
+    for cell in values:
+        cell["userEnteredFormat"] = {
+            "backgroundColor": {"red": 0.94, "green": 0.94, "blue": 0.94},
+            "horizontalAlignment": "CENTER",
+            "textFormat": {"bold": True},
+            "wrapStrategy": "WRAP",
         }
     return {"values": values}
 
@@ -3306,24 +3317,6 @@ def _status_conditional_formatting_requests(
     return requests
 
 
-def _urgent_conditional_formatting_request(sheet_id: int) -> dict[str, Any]:
-    return {
-        "addConditionalFormatRule": {
-            "index": 100,
-            "rule": {
-                "ranges": [{"sheetId": sheet_id, "startRowIndex": 1}],
-                "booleanRule": {
-                    "condition": {
-                        "type": "CUSTOM_FORMULA",
-                        "values": [{"userEnteredValue": '=AND($R2="Да",$U2<>"CHIPS")'}],
-                    },
-                    "format": {"backgroundColor": {"red": 1.0, "green": 0.90, "blue": 0.82}},
-                },
-            },
-        }
-    }
-
-
 def _replace_urgent_conditional_formatting_requests(
     api: Any,
     *,
@@ -3350,7 +3343,6 @@ def _replace_urgent_conditional_formatting_requests(
         for index in range(conditional_count - 1, -1, -1)
     ]
     requests.extend(_status_conditional_formatting_requests(sheet_id, status_column_index=1))
-    requests.append(_urgent_conditional_formatting_request(sheet_id))
     return requests
 
 

@@ -616,7 +616,7 @@ def _read_sheet(
             spreadsheetId=spreadsheet_id,
             range=f"{quote_sheet_name(sheet_name)}!{DEFAULT_INDEX_RANGE}",
             majorDimension="ROWS",
-            valueRenderOption="UNFORMATTED_VALUE",
+            valueRenderOption="FORMATTED_VALUE",
         )
         .execute(),
         config=retry_config,
