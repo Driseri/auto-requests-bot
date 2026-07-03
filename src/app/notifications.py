@@ -54,6 +54,8 @@ from app.submission import (
     dashboard_tracked_row,
     is_daily_separator_row,
     quote_sheet_name,
+    sheet_section_kind,
+    sheet_section_lock_key,
 )
 
 
@@ -157,6 +159,8 @@ class SheetApplicationStatus:
     scriptwriter: str | None = None
     intent: str | None = None
     end_column: str = "W"
+    application_id_column_index: int = 11
+    status_column_index: int = 1
 
 
 @dataclass(slots=True)
@@ -289,6 +293,12 @@ class GoogleSheetsStatusReader:
             "status-bulk-comments",
         )
 
+    async def delete_application_row(self, current: SheetApplicationStatus) -> None:
+        return await self._run_with_retry(
+            lambda: self._delete_application_row_sync(current),
+            f"status-delete-application:{current.application_id}",
+        )
+
     async def _run_with_retry(self, operation: Callable[[], Any], operation_id: str) -> Any:
         return await execute_with_retry_async(
             operation,
@@ -336,8 +346,50 @@ class GoogleSheetsStatusReader:
                             layout.get("scriptwriter_response", -1),
                         ).strip(),
                         end_column=layout["end_column"],
+                        application_id_column_index=layout["application_id"],
+                        status_column_index=layout["status"],
                     )
         return result
+
+    def _delete_application_row_sync(self, current: SheetApplicationStatus) -> None:
+        api = self._get_sheets_api()
+        range_suffix = f"A{current.row_number}:{current.end_column}{current.row_number}"
+        row = self._read_sheet_range(
+            api,
+            current.spreadsheet_id,
+            current.sheet_name,
+            range_suffix,
+        )
+        values = row[0] if row else []
+        application_id = _cell(values, current.application_id_column_index).strip()
+        status = _cell(values, current.status_column_index).strip()
+        if application_id != current.application_id:
+            raise RuntimeError(
+                "Application deletion verification failed: "
+                f"expected application_id={current.application_id} found={application_id or '<empty>'}"
+            )
+        if status != ApplicationStatus.DELETION.value:
+            raise RuntimeError(
+                "Application deletion verification failed: "
+                f"application_id={current.application_id} status={status or '<empty>'}"
+            )
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=current.spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": current.sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": current.row_number - 1,
+                                "endIndex": current.row_number,
+                            }
+                        }
+                    }
+                ]
+            },
+        ).execute()
 
     def _read_statuses_for_sync(
         self,
@@ -602,6 +654,8 @@ class GoogleSheetsStatusReader:
                 ),
                 editor=_cell(row, layout["editor"]).strip(),
                 editor_comment=_cell(row, layout["comment"]).strip(),
+                application_id_column_index=layout["application_id"],
+                status_column_index=layout["status"],
                 final_answer=_cell(row, layout["final_answer"]).strip(),
                 scriptwriter_response=_cell(
                     row,
@@ -1039,6 +1093,7 @@ class StatusNotificationService:
         )
         notifications_by_user: dict[int, list[StatusNotification]] = {}
         non_notified_updates: list[StatusNotification] = []
+        deletion_candidates: list[tuple[SubmittedApplication, SheetApplicationStatus]] = []
 
         for application in tracked:
             current = statuses.get(application.application_id)
@@ -1072,6 +1127,14 @@ class StatusNotificationService:
                         self.status_not_found_threshold,
                     )
                 continue
+
+            if current.status == ApplicationStatus.DELETION.value:
+                deletion_candidates.append((application, current))
+                continue
+            if application.deletion_seen_count:
+                await self.repository.reset_application_deletion_state(
+                    application.application_id
+                )
 
             status_changed = bool(current.status) and current.status != application.last_known_status
             editor_changed = (
@@ -1242,10 +1305,111 @@ class StatusNotificationService:
                 ],
                 current_batch_statuses,
             )
+        for application, current in sorted(
+            deletion_candidates,
+            key=lambda item: (
+                item[1].spreadsheet_id,
+                item[1].sheet_id,
+                item[1].row_number,
+            ),
+            reverse=True,
+        ):
+            await self._process_application_deletion(application, current)
         if completed_bulk_scan_due:
             self._last_completed_bulk_scan_at = self.clock()
         await self._deliver_outbox()
         await self._deliver_dashboard_outbox()
+
+    async def _process_application_deletion(
+        self,
+        application: SubmittedApplication,
+        current: SheetApplicationStatus,
+    ) -> None:
+        if application.batch_id or current.batch_id:
+            message = "Deletion status is unsupported for legacy bulk batch rows"
+            LOGGER.warning(
+                "Application deletion skipped for legacy bulk row: application_id=%s batch_id=%s",
+                application.application_id,
+                application.batch_id or current.batch_id,
+            )
+            await self.repository.record_application_deletion_error(
+                application.application_id,
+                message,
+            )
+            return
+
+        seen_count = await self.repository.mark_application_deletion_seen(
+            application.application_id
+        )
+        if seen_count < 2:
+            LOGGER.info(
+                "Application deletion requested: application_id=%s seen_count=%s",
+                application.application_id,
+                seen_count,
+            )
+            return
+
+        if not current.spreadsheet_id or not current.sheet_id or not current.sheet_name:
+            await self.repository.record_application_deletion_error(
+                application.application_id,
+                "Deletion skipped: missing sheet coordinates",
+            )
+            return
+
+        section_kind = sheet_section_kind(
+            answer_type=current.answer_type or application.answer_type,
+            change_type=ChangeType.normalize(current.change_type or application.change_type),
+        )
+        lock_key = sheet_section_lock_key(
+            spreadsheet_id=current.spreadsheet_id,
+            sheet_name=current.sheet_name,
+            section_kind=section_kind,
+        )
+        owner = f"delete:{application.application_id}"
+        acquired = await self.repository.acquire_bulk_section_lock(
+            lock_key=lock_key,
+            owner=owner,
+            ttl_seconds=600,
+        )
+        if not acquired:
+            await self.repository.record_application_deletion_error(
+                application.application_id,
+                "Deletion deferred: section lock is busy",
+            )
+            LOGGER.info(
+                "Application deletion deferred by section lock: application_id=%s lock_key=%s",
+                application.application_id,
+                lock_key,
+            )
+            return
+        try:
+            await self.status_reader.delete_application_row(current)
+            result = await self.repository.complete_application_deletion(
+                application_id=application.application_id,
+                spreadsheet_id=current.spreadsheet_id,
+                sheet_id=current.sheet_id,
+                deleted_row_number=current.row_number,
+            )
+            LOGGER.warning(
+                "Application deleted by status: application_id=%s sheet=%s row=%s result=%s",
+                application.application_id,
+                current.sheet_name,
+                current.row_number,
+                result,
+            )
+        except Exception as exc:
+            await self.repository.record_application_deletion_error(
+                application.application_id,
+                f"{type(exc).__name__}: {exc}",
+            )
+            LOGGER.exception(
+                "Application deletion failed: application_id=%s sheet=%s row=%s",
+                application.application_id,
+                current.sheet_name,
+                current.row_number,
+            )
+        finally:
+            await self.repository.release_bulk_section_lock(lock_key=lock_key, owner=owner)
 
     async def _resolve_bulk_batch_locations(
         self,
@@ -2252,6 +2416,8 @@ def _status_from_working_row(
         final_answer=_cell(row, layout["final_answer"]).strip(),
         scriptwriter_response=_cell(row, layout.get("scriptwriter_response", -1)).strip(),
         end_column=layout["end_column"],
+        application_id_column_index=layout["application_id"],
+        status_column_index=layout["status"],
     )
 
 

@@ -608,6 +608,7 @@ class GoogleSheetsBulkReservationService:
                 "insert_row": insert_row,
                 "inserted_rows": count,
                 "prefix_requests": [],
+                "protected_rows": [],
             }
         elif self.daily_sheet_grouping_enabled:
             insert_plan = _daily_bulk_reservation_insert_plan(
@@ -634,6 +635,7 @@ class GoogleSheetsBulkReservationService:
                 "inserted_rows": count,
                 "inserted_header_rows": [],
                 "prefix_requests": [],
+                "protected_rows": [],
             }
         insert_row = insert_plan["start_row"]
         physical_insert_row = insert_plan["insert_row"]
@@ -711,6 +713,13 @@ class GoogleSheetsBulkReservationService:
             api,
             spreadsheet_id=spreadsheet_id,
             group_request=insert_plan.get("group_request"),
+        )
+        self._submission._apply_sheet_protection_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            column_count=column_count,
+            row_numbers=insert_plan.get("protected_rows", []),
         )
         return _BulkReservationRowsInsert(
             start_row=insert_row,
@@ -2526,11 +2535,13 @@ def _daily_bulk_reservation_insert_plan(
         physical_insert_row = next_separator or section_end_row
         start_row = physical_insert_row
         inserted_rows = count
+        protected_rows: list[int] = []
     else:
         physical_insert_row = section_end_row
         start_row = section_end_row + 1
         inserted_rows = count + 1
         inserted_header_rows = [_daily_separator_row_data(label, column_count)]
+        protected_rows = [physical_insert_row]
         group_request = _previous_daily_group_request(
             separator_rows,
             new_separator_row=physical_insert_row,
@@ -2543,6 +2554,7 @@ def _daily_bulk_reservation_insert_plan(
         "inserted_header_rows": inserted_header_rows,
         "prefix_requests": [],
         "group_request": group_request,
+        "protected_rows": protected_rows,
     }
 
 
@@ -2598,6 +2610,7 @@ def _urgent_daily_bulk_reservation_insert_plan(
                     _section_header_row_data(CHIPS_WORKSHEET_HEADERS),
                 ]
             )
+        protected_rows = list(range(physical_insert_row, physical_insert_row + len(inserted_header_rows)))
         start_row = physical_insert_row + len(inserted_header_rows)
         inserted_rows = len(inserted_header_rows) + count
     elif change_type == ChangeType.CHIPS and chips_marker is None:
@@ -2611,16 +2624,19 @@ def _urgent_daily_bulk_reservation_insert_plan(
                 _section_header_row_data(CHIPS_WORKSHEET_HEADERS),
             ]
         )
+        protected_rows = list(range(physical_insert_row, physical_insert_row + len(inserted_header_rows)))
         start_row = physical_insert_row + len(inserted_header_rows)
         inserted_rows = len(inserted_header_rows) + count
     elif change_type == ChangeType.CHIPS:
         physical_insert_row = day_end
         start_row = physical_insert_row
         inserted_rows = count
+        protected_rows = []
     else:
         physical_insert_row = chips_marker or day_end
         start_row = physical_insert_row
         inserted_rows = count
+        protected_rows = []
     return {
         "insert_row": physical_insert_row,
         "start_row": start_row,
@@ -2628,6 +2644,7 @@ def _urgent_daily_bulk_reservation_insert_plan(
         "inserted_header_rows": inserted_header_rows,
         "prefix_requests": [],
         "group_request": group_request,
+        "protected_rows": protected_rows,
     }
 
 

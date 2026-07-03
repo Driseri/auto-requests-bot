@@ -53,6 +53,7 @@ from app.submission import (
     _repair_sheet_bool,
     _working_sheet_schema,
     draft_to_sheet_row,
+    sheet_protection_requests,
     target_sheet_name,
     week_sheet_name,
 )
@@ -735,7 +736,8 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
 
     assert result.success is True
     assert result.sheet_name == "Срочные"
-    update_request = api.batch_updates[-1]["body"]["requests"][1]["updateCells"]
+    requests = _last_requests_with(api, "insertDimension", "updateCells")
+    update_request = requests[1]["updateCells"]
     assert update_request["rows"][0]["values"][0]["userEnteredValue"] == {
         "stringValue": "03.06.26"
     }
@@ -760,7 +762,7 @@ async def test_new_urgent_chips_appends_to_dedicated_section():
     assert cells[3]["userEnteredValue"] == {"stringValue": "before"}
     assert cells[4]["userEnteredValue"] == {"stringValue": "chip"}
     assert cells[5]["userEnteredValue"] == {"stringValue": "after"}
-    initialization_requests = api.batch_updates[-2]["body"]["requests"]
+    initialization_requests = _last_requests_with(api, "setBasicFilter")
     urgent_filter = next(
         request["setBasicFilter"]
         for request in initialization_requests
@@ -811,7 +813,7 @@ async def test_urgent_add_inserts_before_same_day_chips_section():
 
     assert result.success is True
     assert result.row_number == 3
-    request = api.batch_updates[-1]["body"]["requests"][1]["updateCells"]
+    request = _last_requests_with(api, "insertDimension", "updateCells")[1]["updateCells"]
     assert request["range"]["startRowIndex"] == 2
     assert request["rows"][0]["values"][11]["userEnteredValue"] == {
         "stringValue": "ADDNEW01"
@@ -840,7 +842,7 @@ async def test_urgent_chips_formats_header_when_added_to_existing_day():
 
     assert result.success is True
     assert result.row_number == 6
-    update_request = api.batch_updates[-1]["body"]["requests"][1]["updateCells"]
+    update_request = _last_requests_with(api, "insertDimension", "updateCells")[1]["updateCells"]
     assert update_request["rows"][0]["values"][0]["userEnteredValue"] == {
         "stringValue": ChangeType.CHIPS.value
     }
@@ -876,7 +878,7 @@ async def test_existing_urgent_sheet_gets_chips_section_without_changing_rows():
         existing_row,
     ]
     assert len(api.rows[(FL_SPREADSHEET, "Срочные")]) == 2
-    requests = api.batch_updates[-1]["body"]["requests"]
+    requests = _last_requests_with(api, "insertDimension", "updateCells")
     assert requests[0]["insertDimension"]["range"]["startIndex"] == 2
     assert requests[0]["insertDimension"]["range"]["endIndex"] == 4
     assert requests[1]["updateCells"]["rows"][0]["values"][0]["userEnteredValue"] == {
@@ -907,7 +909,7 @@ async def test_existing_urgent_sheet_replaces_urgent_conditional_formatting():
     result = await service.submit(urgent_draft(ChangeType.ADD, application_id="COND0001"))
 
     assert result.success is True
-    requests = api.batch_updates[-2]["body"]["requests"]
+    requests = _last_requests_with(api, "deleteConditionalFormatRule")
     deleted_indices = [
         request["deleteConditionalFormatRule"]["index"]
         for request in requests
@@ -942,7 +944,7 @@ async def test_integration_submission_creates_daily_separator():
 
     assert result.success is True
     assert result.sheet_name == "Интеграции"
-    requests = api.batch_updates[-1]["body"]["requests"]
+    requests = _last_requests_with(api, "insertDimension", "updateCells")
     assert requests[0]["insertDimension"]["range"]["startIndex"] == 1
     assert requests[0]["insertDimension"]["range"]["endIndex"] == 3
     update_rows = requests[1]["updateCells"]["rows"]
@@ -981,11 +983,11 @@ async def test_daily_grouping_failure_does_not_block_submission():
 
     assert result.success is True
     assert result.row_number == 5
-    critical_requests = api.batch_updates[-2]["body"]["requests"]
+    critical_requests = _last_requests_with(api, "insertDimension", "updateCells")
     assert all("addDimensionGroup" not in request for request in critical_requests)
     assert "insertDimension" in critical_requests[0]
     assert "updateCells" in critical_requests[1]
-    best_effort_requests = api.batch_updates[-1]["body"]["requests"]
+    best_effort_requests = _last_requests_with(api, "addDimensionGroup")
     assert best_effort_requests == [
         {
             "addDimensionGroup": {
@@ -1815,11 +1817,112 @@ def test_dashboard_sync_batches_updates_and_merges_duplicates():
     assert update_values[10]["userEnteredValue"] == {"stringValue": "Да"}
 
 
+def test_dashboard_sync_deletes_application_row_for_delete_action():
+    existing_rows = [
+        DASHBOARD_HEADERS,
+        [
+            "A1B2C3D4",
+            "",
+            "01.07.2026 12:00",
+            Direction.FL.value,
+            ApplicationType.SINGLE.value,
+            AnswerType.URGENT.value,
+            "Да",
+            "Автор",
+            ApplicationStatus.NEW.value,
+            "Редактор не выбран",
+            "Нет",
+            "https://example.test/row",
+        ],
+    ]
+    api = FakeSheetsApi(
+        sheets={DASHBOARD_SPREADSHEET: {DASHBOARD_SHEET_NAME: 200}},
+        headers={(DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): DASHBOARD_HEADERS},
+        rows={(DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): existing_rows},
+    )
+    service = DashboardSyncService(
+        spreadsheet_id=DASHBOARD_SPREADSHEET,
+        credentials_path="missing-for-test.json",
+        sheets_api=api,
+    )
+    item = DashboardOutboxItem(
+        entity_type="APPLICATION",
+        entity_id="A1B2C3D4",
+        snapshot_json=json.dumps(
+            {"action": "delete", "application_id": "A1B2C3D4"},
+            ensure_ascii=False,
+        ),
+    )
+
+    service.sync_projections([item])
+
+    requests = api.batch_updates[-1]["body"]["requests"]
+    assert requests == [
+        {
+            "deleteDimension": {
+                "range": {
+                    "sheetId": 200,
+                    "dimension": "ROWS",
+                    "startIndex": 1,
+                    "endIndex": 2,
+                }
+            }
+        }
+    ]
+
+
+def test_sheet_protection_requests_replace_bot_managed_ranges():
+    api = FakeSheetsApi(sheets={FL_SPREADSHEET: {"Срочные": 100}})
+    api.sheets_by_spreadsheet[FL_SPREADSHEET][0]["protectedRanges"] = [
+        {
+            "protectedRangeId": 77,
+            "description": "bot:protected:first-column:100",
+        },
+        {
+            "protectedRangeId": 88,
+            "description": "manual-protection",
+        },
+    ]
+
+    requests = sheet_protection_requests(
+        api,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        column_count=24,
+        row_numbers=[1, 5],
+    )
+
+    assert requests[0] == {"deleteProtectedRange": {"protectedRangeId": 77}}
+    added = [request["addProtectedRange"]["protectedRange"] for request in requests[1:]]
+    descriptions = {item["description"] for item in added}
+    assert descriptions == {
+        "bot:protected:technical-columns:100:24",
+        "bot:protected:service-row:100:1",
+        "bot:protected:service-row:100:5",
+    }
+    technical = next(
+        item for item in added if item["description"] == "bot:protected:technical-columns:100:24"
+    )
+    assert technical["range"] == {
+        "sheetId": 100,
+        "startColumnIndex": 11,
+        "endColumnIndex": 24,
+    }
+
+
 def _sheet_name_from_range(range_name: str) -> str:
     quoted_name = range_name.split("!", maxsplit=1)[0]
     if quoted_name.startswith("'") and quoted_name.endswith("'"):
         return quoted_name[1:-1].replace("''", "'")
     return quoted_name
+
+
+def _last_requests_with(api: FakeSheetsApi, *request_keys: str) -> list[dict]:
+    for update in reversed(api.batch_updates):
+        requests = update["body"]["requests"]
+        if all(any(key in request for request in requests) for key in request_keys):
+            return requests
+    raise AssertionError(f"batchUpdate with keys {request_keys!r} not found")
 
 
 def _append_cell_values(append_cells: dict) -> list:

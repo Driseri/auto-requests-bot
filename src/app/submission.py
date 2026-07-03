@@ -817,6 +817,13 @@ class GoogleSheetsSubmissionService:
                 )
             },
         ).execute()
+        self._apply_sheet_protection_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            column_count=SHEET_COLUMN_COUNT,
+            row_numbers=[1],
+        )
 
     def _next_row_number(self, api: Any, spreadsheet_id: str, sheet_name: str) -> int:
         result = api.spreadsheets().values().get(
@@ -879,6 +886,13 @@ class GoogleSheetsSubmissionService:
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
         ).execute()
+        self._apply_sheet_protection_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            column_count=column_count,
+            row_numbers=plan.get("protected_rows", []),
+        )
         self._apply_daily_group_best_effort(
             api,
             spreadsheet_id=spreadsheet_id,
@@ -1053,6 +1067,13 @@ class GoogleSheetsSubmissionService:
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
         ).execute()
+        self._apply_sheet_protection_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            column_count=column_count,
+            row_numbers=[insert_row],
+        )
         self._apply_daily_group_best_effort(
             api,
             spreadsheet_id=spreadsheet_id,
@@ -1079,6 +1100,38 @@ class GoogleSheetsSubmissionService:
                 "Daily sheet previous block grouping failed; continuing without grouping: "
                 "spreadsheet_id=%s error=%r",
                 spreadsheet_id,
+                exc,
+            )
+
+    def _apply_sheet_protection_best_effort(
+        self,
+        api: Any,
+        *,
+        spreadsheet_id: str,
+        sheet_id: int,
+        column_count: int,
+        row_numbers: list[int] | None = None,
+    ) -> None:
+        try:
+            requests = sheet_protection_requests(
+                api,
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+                column_count=column_count,
+                row_numbers=row_numbers or [],
+            )
+            if requests:
+                api.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": requests},
+                ).execute()
+        except Exception as exc:
+            LOGGER.warning(
+                "Sheet protection update failed; continuing without protection: "
+                "spreadsheet_id=%s sheet_id=%s rows=%s error=%r",
+                spreadsheet_id,
+                sheet_id,
+                row_numbers or [],
                 exc,
             )
 
@@ -1112,6 +1165,13 @@ class GoogleSheetsSubmissionService:
                 )
             },
         ).execute()
+        self._apply_sheet_protection_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            column_count=SHEET_COLUMN_COUNT,
+            row_numbers=[1, 2, 3, 4, 5, 6],
+        )
 
     def _initialize_urgent_sheet(
         self,
@@ -1142,6 +1202,13 @@ class GoogleSheetsSubmissionService:
             spreadsheetId=spreadsheet_id,
             body={"requests": requests},
         ).execute()
+        self._apply_sheet_protection_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            column_count=SHEET_COLUMN_COUNT,
+            row_numbers=[1],
+        )
 
     def _prepare_urgent_sheet(
         self,
@@ -1177,6 +1244,13 @@ class GoogleSheetsSubmissionService:
             spreadsheetId=spreadsheet_id,
             body={"requests": formatting_requests},
         ).execute()
+        self._apply_sheet_protection_best_effort(
+            api,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            column_count=SHEET_COLUMN_COUNT,
+            row_numbers=[1],
+        )
         return chips_schema if change_type == ChangeType.CHIPS else schema
 
     def _prepare_rollout_section(
@@ -1467,6 +1541,26 @@ class DashboardSyncService:
 
         for item in items:
             snapshot = json.loads(item.snapshot_json)
+            if snapshot.get("action") == "delete":
+                key = (
+                    "batch" if item.entity_type == "BULK_BATCH" else "application",
+                    item.entity_id,
+                )
+                projected_keys.add(key)
+                requests.extend(
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": row_number - 1,
+                                "endIndex": row_number,
+                            }
+                        }
+                    }
+                    for row_number, _ in sorted(groups.get(key, []), reverse=True)
+                )
+                continue
             projected = list(snapshot["row"])
             projected.extend([""] * (len(DASHBOARD_HEADERS) - len(projected)))
             key = _dashboard_entity_key(projected)
@@ -2767,6 +2861,97 @@ def _section_marker_header_format_requests(
     ]
 
 
+def sheet_protection_requests(
+    api: Any,
+    *,
+    spreadsheet_id: str,
+    sheet_id: int,
+    column_count: int,
+    row_numbers: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    protections = [
+        _protected_range_spec(
+            sheet_id=sheet_id,
+            description=f"bot:protected:technical-columns:{sheet_id}:{column_count}",
+            start_column_index=11,
+            end_column_index=column_count,
+        ),
+    ]
+    for row_number in row_numbers or []:
+        protections.append(
+            _protected_range_spec(
+                sheet_id=sheet_id,
+                description=f"bot:protected:service-row:{sheet_id}:{row_number}",
+                start_row_index=row_number - 1,
+                end_row_index=row_number,
+            )
+        )
+    descriptions = {item["description"] for item in protections}
+    obsolete_descriptions = {f"bot:protected:first-column:{sheet_id}"}
+    existing = _existing_protected_ranges_by_description(
+        api,
+        spreadsheet_id=spreadsheet_id,
+        sheet_id=sheet_id,
+        descriptions=descriptions | obsolete_descriptions,
+    )
+    requests: list[dict[str, Any]] = []
+    for protected_range_id in existing.values():
+        requests.append({"deleteProtectedRange": {"protectedRangeId": protected_range_id}})
+    requests.extend({"addProtectedRange": {"protectedRange": item}} for item in protections)
+    return requests
+
+
+def _protected_range_spec(
+    *,
+    sheet_id: int,
+    description: str,
+    start_row_index: int | None = None,
+    end_row_index: int | None = None,
+    start_column_index: int | None = None,
+    end_column_index: int | None = None,
+) -> dict[str, Any]:
+    range_payload: dict[str, Any] = {"sheetId": sheet_id}
+    if start_row_index is not None:
+        range_payload["startRowIndex"] = start_row_index
+    if end_row_index is not None:
+        range_payload["endRowIndex"] = end_row_index
+    if start_column_index is not None:
+        range_payload["startColumnIndex"] = start_column_index
+    if end_column_index is not None:
+        range_payload["endColumnIndex"] = end_column_index
+    return {
+        "description": description,
+        "range": range_payload,
+        "warningOnly": False,
+    }
+
+
+def _existing_protected_ranges_by_description(
+    api: Any,
+    *,
+    spreadsheet_id: str,
+    sheet_id: int,
+    descriptions: set[str],
+) -> dict[str, int]:
+    if not descriptions:
+        return {}
+    metadata = api.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId),protectedRanges(protectedRangeId,description))",
+    ).execute()
+    result: dict[str, int] = {}
+    for sheet in metadata.get("sheets", []):
+        properties = sheet.get("properties", {})
+        if properties.get("sheetId") != sheet_id:
+            continue
+        for protected in sheet.get("protectedRanges", []):
+            description = protected.get("description")
+            protected_range_id = protected.get("protectedRangeId")
+            if description in descriptions and protected_range_id is not None:
+                result[str(description)] = int(protected_range_id)
+    return result
+
+
 def dashboard_formatting_requests(
     sheet_id: int,
     column_count: int,
@@ -2910,6 +3095,7 @@ def _daily_insert_plan(
         insert_row = next_separator or section_end_row
         inserted_rows = 1
         update_rows = [row_data]
+        protected_rows: list[int] = []
     else:
         insert_row = section_end_row
         inserted_rows = 2
@@ -2917,6 +3103,7 @@ def _daily_insert_plan(
             _daily_separator_row_data(label, column_count),
             row_data,
         ]
+        protected_rows = [insert_row]
         group_request = _previous_daily_group_request(
             separator_rows,
             new_separator_row=insert_row,
@@ -2962,6 +3149,7 @@ def _daily_insert_plan(
         "shift_delta": inserted_rows,
         "requests": requests,
         "group_request": group_request,
+        "protected_rows": protected_rows,
     }
 
 
@@ -3018,6 +3206,11 @@ def _urgent_daily_insert_plan(
         insert_row = day_start
         row_number = day_start + len(update_rows) - 1
         inserted_rows = len(update_rows)
+        protected_rows = (
+            [day_start, day_start + 1, day_start + 2]
+            if change_type == ChangeType.CHIPS
+            else [day_start]
+        )
     elif change_type == ChangeType.CHIPS:
         if chips_marker is None:
             update_rows = [
@@ -3028,16 +3221,19 @@ def _urgent_daily_insert_plan(
             insert_row = day_end
             row_number = day_end + 2
             inserted_rows = 3
+            protected_rows = [day_end, day_end + 1]
         else:
             insert_row = day_end
             row_number = day_end
             inserted_rows = 1
             update_rows = [row_data]
+            protected_rows = []
     else:
         insert_row = chips_marker or day_end
         row_number = insert_row
         inserted_rows = 1
         update_rows = [row_data]
+        protected_rows = []
 
     insert_index = insert_row - 1
     column_count = max(len(item.get("values", [])) for item in update_rows)
@@ -3078,6 +3274,7 @@ def _urgent_daily_insert_plan(
         "shift_delta": inserted_rows,
         "requests": requests,
         "group_request": group_request,
+        "protected_rows": protected_rows,
     }
 
 
@@ -3381,6 +3578,7 @@ def _status_color(status: str) -> dict[str, float]:
         ApplicationStatus.ACCEPTED.value: {"red": 0.75, "green": 0.92, "blue": 0.75},
         ApplicationStatus.REJECTED.value: {"red": 1.0, "green": 0.75, "blue": 0.75},
         ApplicationStatus.POSTPONED.value: {"red": 0.86, "green": 0.86, "blue": 0.86},
+        ApplicationStatus.DELETION.value: {"red": 0.95, "green": 0.65, "blue": 0.65},
     }
     return colors.get(status, {"red": 1.0, "green": 1.0, "blue": 1.0})
 

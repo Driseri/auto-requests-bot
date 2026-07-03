@@ -155,6 +155,9 @@ class DraftRepository:
                     not_found_count INTEGER NOT NULL DEFAULT 0,
                     last_not_found_at TEXT,
                     next_status_check_at TEXT,
+                    deletion_seen_count INTEGER NOT NULL DEFAULT 0,
+                    deletion_last_seen_at TEXT,
+                    deletion_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -204,6 +207,13 @@ class DraftRepository:
             )
             await self._ensure_submitted_applications_column(db, "last_not_found_at", "TEXT")
             await self._ensure_submitted_applications_column(db, "next_status_check_at", "TEXT")
+            await self._ensure_submitted_applications_column(
+                db,
+                "deletion_seen_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            await self._ensure_submitted_applications_column(db, "deletion_last_seen_at", "TEXT")
+            await self._ensure_submitted_applications_column(db, "deletion_error", "TEXT")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bulk_batches (
@@ -976,6 +986,9 @@ class DraftRepository:
                 not_found_count = 0,
                 last_not_found_at = NULL,
                 next_status_check_at = NULL,
+                deletion_seen_count = 0,
+                deletion_last_seen_at = NULL,
+                deletion_error = NULL,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1082,6 +1095,9 @@ class DraftRepository:
                     not_found_count = 0,
                     last_not_found_at = NULL,
                     next_status_check_at = NULL,
+                    deletion_seen_count = 0,
+                    deletion_last_seen_at = NULL,
+                    deletion_error = NULL,
                     updated_at = ?
                 WHERE application_id = ?
                 """,
@@ -2776,6 +2792,183 @@ class DraftRepository:
             )
             await db.commit()
 
+    async def mark_application_deletion_seen(
+        self,
+        application_id: str,
+        *,
+        error: str | None = None,
+    ) -> int:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT deletion_seen_count
+                FROM submitted_applications
+                WHERE application_id = ?
+                """,
+                (application_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.commit()
+                return 0
+            count = int(row["deletion_seen_count"] or 0) + 1
+            await db.execute(
+                """
+                UPDATE submitted_applications
+                SET deletion_seen_count = ?,
+                    deletion_last_seen_at = ?,
+                    deletion_error = ?,
+                    updated_at = ?
+                WHERE application_id = ?
+                """,
+                (count, now, error, now, application_id),
+            )
+            await db.commit()
+        return count
+
+    async def reset_application_deletion_state(self, application_id: str) -> None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE submitted_applications
+                SET deletion_seen_count = 0,
+                    deletion_last_seen_at = NULL,
+                    deletion_error = NULL,
+                    updated_at = ?
+                WHERE application_id = ?
+                """,
+                (now, application_id),
+            )
+            await db.commit()
+
+    async def record_application_deletion_error(
+        self,
+        application_id: str,
+        error: str,
+    ) -> None:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute(
+                """
+                UPDATE submitted_applications
+                SET deletion_error = ?,
+                    updated_at = ?
+                WHERE application_id = ?
+                """,
+                (error[:1000], now, application_id),
+            )
+            await db.commit()
+
+    async def complete_application_deletion(
+        self,
+        *,
+        application_id: str,
+        spreadsheet_id: str,
+        sheet_id: int,
+        deleted_row_number: int,
+    ) -> dict[str, int]:
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            notification_deleted = await self._delete_notification_refs_in_connection(
+                db,
+                application_id,
+            )
+            cursor = await db.execute(
+                "DELETE FROM dashboard_outbox WHERE entity_id = ?",
+                (application_id,),
+            )
+            dashboard_deleted = cursor.rowcount
+            await cursor.close()
+            await self._upsert_dashboard_projection_in_connection(
+                db,
+                entity_type="APPLICATION",
+                entity_id=application_id,
+                snapshot={"action": "delete", "application_id": application_id},
+                now=now,
+            )
+            cursor = await db.execute(
+                "DELETE FROM submitted_applications WHERE application_id = ?",
+                (application_id,),
+            )
+            submitted_deleted = cursor.rowcount
+            await cursor.close()
+            cursor = await db.execute(
+                """
+                UPDATE submitted_applications
+                SET last_seen_row_number = last_seen_row_number - 1,
+                    updated_at = ?
+                WHERE spreadsheet_id = ?
+                  AND sheet_id = ?
+                  AND last_seen_row_number > ?
+                """,
+                (now, spreadsheet_id, sheet_id, deleted_row_number),
+            )
+            submitted_shifted = cursor.rowcount
+            await cursor.close()
+            cursor = await db.execute(
+                """
+                UPDATE bulk_reservations
+                SET start_row = CASE
+                        WHEN start_row IS NULL THEN NULL
+                        WHEN start_row > ? THEN start_row - 1
+                        ELSE start_row
+                    END,
+                    end_row = CASE
+                        WHEN end_row IS NULL THEN NULL
+                        WHEN end_row > ? THEN end_row - 1
+                        ELSE end_row
+                    END,
+                    updated_at = ?
+                WHERE spreadsheet_id = ?
+                  AND sheet_id = ?
+                  AND state NOT IN (?, ?, ?)
+                """,
+                (
+                    deleted_row_number,
+                    deleted_row_number,
+                    now,
+                    spreadsheet_id,
+                    sheet_id,
+                    BulkReservationState.REGISTERED.value,
+                    BulkReservationState.CANCELLED.value,
+                    BulkReservationState.FAILED.value,
+                ),
+            )
+            reservations_shifted = cursor.rowcount
+            await cursor.close()
+            await db.commit()
+        return {
+            "submitted_deleted": submitted_deleted,
+            "notification_outbox_deleted": notification_deleted,
+            "dashboard_outbox_deleted": dashboard_deleted,
+            "submitted_shifted": submitted_shifted,
+            "bulk_reservations_shifted": reservations_shifted,
+        }
+
+    @staticmethod
+    async def _delete_notification_refs_in_connection(
+        db: aiosqlite.Connection,
+        application_id: str,
+    ) -> int:
+        cursor = await db.execute(
+            """
+            DELETE FROM notification_outbox
+            WHERE COALESCE(snapshot_json, '') LIKE ?
+               OR COALESCE(dedupe_key, '') LIKE ?
+               OR COALESCE(html, '') LIKE ?
+            """,
+            (f"%{application_id}%", f"%{application_id}%", f"%{application_id}%"),
+        )
+        deleted = cursor.rowcount
+        await cursor.close()
+        return deleted
+
     @staticmethod
     async def _update_submitted_application_in_connection(
         db: aiosqlite.Connection,
@@ -2803,6 +2996,9 @@ class DraftRepository:
                 not_found_count = 0,
                 last_not_found_at = NULL,
                 next_status_check_at = NULL,
+                deletion_seen_count = 0,
+                deletion_last_seen_at = NULL,
+                deletion_error = NULL,
                 updated_at = ?
             WHERE application_id = ?
             """,
@@ -2923,6 +3119,9 @@ class DraftRepository:
             not_found_count=row["not_found_count"] or 0,
             last_not_found_at=row["last_not_found_at"],
             next_status_check_at=row["next_status_check_at"],
+            deletion_seen_count=row["deletion_seen_count"] or 0,
+            deletion_last_seen_at=row["deletion_last_seen_at"],
+            deletion_error=row["deletion_error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

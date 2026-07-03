@@ -334,6 +334,18 @@ class FakeStatusReader:
         return self.statuses
 
 
+class FakeDeletingStatusReader(FakeStatusReader):
+    def __init__(self, statuses: dict[str, SheetApplicationStatus]) -> None:
+        super().__init__(statuses)
+        self.deleted = []
+        self.fail_delete = False
+
+    async def delete_application_row(self, current: SheetApplicationStatus) -> None:
+        if self.fail_delete:
+            raise RuntimeError("google delete failed")
+        self.deleted.append(current.application_id)
+
+
 class FakeStatusReaderWithBatches(FakeStatusReader):
     def __init__(
         self,
@@ -2723,6 +2735,184 @@ async def test_notification_failure_for_one_user_does_not_block_others(tmp_path)
     assert len(failed_outbox) == 1
     assert failed_outbox[0].state == "PENDING"
     assert [message["chat_id"] for message in notifier.messages] == [200]
+
+
+@pytest.mark.asyncio
+async def test_deletion_status_requires_two_stable_polling_cycles(tmp_path):
+    repository = DraftRepository(str(tmp_path / "deletion_status.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="DEL00001",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=5,
+    )
+    await repository.save_submitted_application(
+        application_id="LOWER001",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=6,
+    )
+    statuses = {
+        "DEL00001": SheetApplicationStatus(
+            application_id="DEL00001",
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_name=WEEK_SHEET,
+            sheet_id=100,
+            row_number=5,
+            status=ApplicationStatus.DELETION.value,
+            editor_comment="",
+            final_answer="",
+        )
+    }
+    reader = FakeDeletingStatusReader(statuses)
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+
+    pending = await repository.get_submitted_application("DEL00001")
+    assert pending is not None
+    assert pending.deletion_seen_count == 1
+    assert reader.deleted == []
+
+    await service.run_once()
+
+    assert await repository.get_submitted_application("DEL00001") is None
+    shifted = await repository.get_submitted_application("LOWER001")
+    assert shifted is not None
+    assert shifted.last_seen_row_number == 5
+    assert reader.deleted == ["DEL00001"]
+    dashboard_outbox = await repository.list_dashboard_outbox()
+    assert len(dashboard_outbox) == 1
+    assert json.loads(dashboard_outbox[0].snapshot_json) == {
+        "action": "delete",
+        "application_id": "DEL00001",
+    }
+
+
+@pytest.mark.asyncio
+async def test_deletion_status_processes_same_sheet_rows_bottom_up(tmp_path):
+    repository = DraftRepository(str(tmp_path / "deletion_bottom_up.db"))
+    await repository.init()
+    rows = {
+        "DEL00003": 3,
+        "DEL00006": 6,
+        "DEL00007": 7,
+        "LOWER008": 8,
+    }
+    for application_id, row_number in rows.items():
+        await repository.save_submitted_application(
+            application_id=application_id,
+            telegram_user_id=100,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_id=100,
+            sheet_name=WEEK_SHEET,
+            last_known_status=ApplicationStatus.NEW.value,
+            last_seen_row_number=row_number,
+        )
+    statuses = {
+        application_id: SheetApplicationStatus(
+            application_id=application_id,
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_name=WEEK_SHEET,
+            sheet_id=100,
+            row_number=row_number,
+            status=ApplicationStatus.DELETION.value,
+            editor_comment="",
+            final_answer="",
+        )
+        for application_id, row_number in rows.items()
+        if application_id.startswith("DEL")
+    }
+    statuses["LOWER008"] = SheetApplicationStatus(
+        application_id="LOWER008",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name=WEEK_SHEET,
+        sheet_id=100,
+        row_number=8,
+        status=ApplicationStatus.NEW.value,
+        editor_comment="",
+        final_answer="",
+    )
+    reader = FakeDeletingStatusReader(statuses)
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+    await service.run_once()
+
+    assert reader.deleted == ["DEL00007", "DEL00006", "DEL00003"]
+    assert await repository.get_submitted_application("DEL00003") is None
+    assert await repository.get_submitted_application("DEL00006") is None
+    assert await repository.get_submitted_application("DEL00007") is None
+    lower = await repository.get_submitted_application("LOWER008")
+    assert lower is not None
+    assert lower.last_seen_row_number == 5
+
+
+@pytest.mark.asyncio
+async def test_deletion_status_reset_when_status_changes(tmp_path):
+    repository = DraftRepository(str(tmp_path / "deletion_reset.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="DEL00002",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=5,
+    )
+    statuses = {
+        "DEL00002": SheetApplicationStatus(
+            application_id="DEL00002",
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_name=WEEK_SHEET,
+            sheet_id=100,
+            row_number=5,
+            status=ApplicationStatus.DELETION.value,
+            editor_comment="",
+            final_answer="",
+        )
+    }
+    reader = FakeDeletingStatusReader(statuses)
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+    statuses["DEL00002"] = SheetApplicationStatus(
+        application_id="DEL00002",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name=WEEK_SHEET,
+        sheet_id=100,
+        row_number=5,
+        status=ApplicationStatus.IN_PROGRESS.value,
+        editor_comment="",
+        final_answer="",
+    )
+    await service.run_once()
+
+    tracked = await repository.get_submitted_application("DEL00002")
+    assert tracked is not None
+    assert tracked.deletion_seen_count == 0
+    assert tracked.last_known_status == ApplicationStatus.IN_PROGRESS.value
+    assert reader.deleted == []
 
 
 @pytest.mark.asyncio

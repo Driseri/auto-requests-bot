@@ -160,6 +160,7 @@ class ApplicationStatus(StrEnum):
     ACCEPTED = "Принята"
     REJECTED = "Отклонена"
     POSTPONED = "Отложена"
+    DELETION = "Удаление"
 
     # Backward-compatible aliases for old code/tests while the new model is rolled out.
     NEEDS_SCRIPTWRITER_RESPONSE = "Нужны пояснения"
@@ -402,6 +403,9 @@ class SubmittedApplication:
     not_found_count: int = 0
     last_not_found_at: str | None = None
     next_status_check_at: str | None = None
+    deletion_seen_count: int = 0
+    deletion_last_seen_at: str | None = None
+    deletion_error: str | None = None
     created_at: str = ""
     updated_at: str = ""
 
