@@ -241,7 +241,7 @@ A1:X{max_seen_row}
 - [x] Отключить Google discovery cache.
 - [x] Перевести dashboard на outbox и batchUpdate.
 - [x] Перевести регистрацию нового bulk reservation на один batchUpdate.
-- [ ] Перевести polling одиночных заявок на точечный `values.batchGet`.
+- [x] Перевести polling одиночных заявок на точечный `values.batchGet` с fallback scan.
 - [ ] Заменить полный поиск `application_id` при одиночной отправке на `developerMetadata`.
 - [ ] Ограничить чтение структуры листов диапазоном шапок/маркеров до полного scan.
 - [ ] После стабилизации новой массовой модели составить план отключения/ограничения legacy bulk polling.

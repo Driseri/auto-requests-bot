@@ -621,6 +621,7 @@ docker compose run --rm bot pytest
 
 - Одиночная отправка идемпотентна по `application_id`: маршрут фиксируется до первой записи, а повтор сначала ищет существующую строку.
 - Для временных ошибок Google API (`429`, `5xx`, timeout, broken pipe, reset соединения) используется ограниченный exponential backoff с jitter.
+- Polling одиночных заявок сначала читает сохранённые строки точечно через Google `values.batchGet`. Если координаты устарели, строка пустая или `ID заявки` не совпал, бот использует широкий scan листа как fallback и восстанавливает координаты по `ID заявки`.
 - SQLite работает с `WAL`, `synchronous=NORMAL`, `foreign_keys=ON` и `busy_timeout=10000`.
 - Healthcheck проверяет свежесть heartbeat, целостность SQLite, обязательную конфигурацию,
   Telegram `getMe` и доступ service account к рабочим Google-таблицам. Внешний результат

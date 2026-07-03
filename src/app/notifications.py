@@ -408,63 +408,89 @@ class GoogleSheetsStatusReader:
                 [],
             ).append(application)
 
+        point_checked = 0
+        point_found = 0
+        fallback_needed: dict[tuple[str, str], list[SubmittedApplication]] = {}
         for (spreadsheet_id, sheet_name), group in grouped.items():
             sheet_id = next((item.sheet_id for item in group if item.sheet_id is not None), None)
             if sheet_id is None:
                 sheet_id = self._read_sheet_ids(api, spreadsheet_id).get(sheet_name)
-            wanted_ids = {item.application_id for item in group}
-            max_seen_row = max(
+            point_entries = [
                 (
-                    item.last_seen_row_number
-                    for item in group
-                    if item.last_seen_row_number is not None and item.last_seen_row_number > 1
-                ),
-                default=None,
-            )
-            if max_seen_row is None:
+                    item,
+                    (
+                        f"{quote_sheet_name(sheet_name)}!"
+                        f"A{item.last_seen_row_number}:"
+                        f"{_point_status_end_column(item)}{item.last_seen_row_number}"
+                    ),
+                )
+                for item in group
+                if item.last_seen_row_number is not None and item.last_seen_row_number > 1
+            ]
+            no_coordinate = [
+                item
+                for item in group
+                if item.last_seen_row_number is None or item.last_seen_row_number <= 1
+            ]
+            if no_coordinate:
+                fallback_needed.setdefault((spreadsheet_id, sheet_name), []).extend(no_coordinate)
+            if not point_entries:
                 continue
+            point_checked += len(point_entries)
             try:
-                rows = self._read_sheet_range(
+                rows_by_range = self._read_point_status_rows(
                     api,
                     spreadsheet_id,
-                    sheet_name,
-                    f"A1:X{max_seen_row}",
+                    point_entries,
                 )
             except HttpError as exc:
                 if not _is_unparseable_range_error(exc):
                     raise
                 self.unavailable_single_sources.add((spreadsheet_id, sheet_name))
                 LOGGER.warning(
-                    "Single application sheet range is unavailable; skipping source. "
-                    "spreadsheet_id=%s sheet_name=%s range=%s error=%s",
+                    "Single application point ranges are unavailable; skipping source. "
+                    "spreadsheet_id=%s sheet_name=%s ranges=%s error=%s",
                     spreadsheet_id,
                     sheet_name,
-                    f"A1:X{max_seen_row}",
+                    len(point_entries),
                     exc,
                 )
                 continue
-            for index, row, layout in _working_data_rows(rows):
-                application_id = _cell(row, layout["application_id"]).strip()
-                if application_id not in wanted_ids:
-                    continue
-                result[application_id] = _status_from_working_row(
-                    application_id=application_id,
+            for (application, _), rows in zip(point_entries, rows_by_range, strict=True):
+                row = rows[0] if rows else []
+                current = _status_from_tracked_row(
+                    application=application,
                     spreadsheet_id=spreadsheet_id,
                     sheet_name=sheet_name,
-                    sheet_id=sheet_id or 0,
-                    row_number=index,
+                    sheet_id=sheet_id or application.sheet_id or 0,
                     row=row,
-                    layout=layout,
                 )
+                if current is None:
+                    fallback_needed.setdefault((spreadsheet_id, sheet_name), []).append(application)
+                    continue
+                result[current.application_id] = current
+                point_found += 1
 
         missing_ids = {
             item.application_id
             for item in applications
             if not item.batch_id
         } - set(result)
-        if fallback_full_scan and missing_ids:
+        if missing_ids:
+            fallback_count = sum(len(items) for items in fallback_needed.values())
             LOGGER.info(
-                "Running fallback full scan for missing applications: count=%s",
+                "Single status polling point check completed: "
+                "tracked=%s point_checked=%s point_found=%s fallback_needed=%s "
+                "fallback_full_scan=%s",
+                len([item for item in applications if not item.batch_id]),
+                point_checked,
+                point_found,
+                fallback_count,
+                fallback_full_scan,
+            )
+        if missing_ids and (fallback_needed or fallback_full_scan):
+            LOGGER.info(
+                "Running fallback sheet scan for missing applications: count=%s",
                 len(missing_ids),
             )
             for (spreadsheet_id, sheet_name), group in grouped.items():
@@ -505,6 +531,39 @@ class GoogleSheetsStatusReader:
                         layout=layout,
                     )
         return result
+
+    @staticmethod
+    def _read_point_status_rows(
+        api: Any,
+        spreadsheet_id: str,
+        entries: list[tuple[SubmittedApplication, str]],
+    ) -> list[list[list[Any]]]:
+        rows_by_range: list[list[list[Any]]] = []
+        values_resource = api.spreadsheets().values()
+        for chunk_start in range(0, len(entries), 100):
+            chunk = entries[chunk_start : chunk_start + 100]
+            ranges = [range_name for _, range_name in chunk]
+            if hasattr(values_resource, "batchGet"):
+                response = values_resource.batchGet(
+                    spreadsheetId=spreadsheet_id,
+                    ranges=ranges,
+                    majorDimension="ROWS",
+                ).execute()
+                chunk_rows = [
+                    item.get("values", [])
+                    for item in response.get("valueRanges", [])
+                ]
+                chunk_rows.extend([[]] * (len(chunk) - len(chunk_rows)))
+                rows_by_range.extend(chunk_rows)
+                continue
+            for _, range_name in chunk:
+                response = values_resource.get(
+                    spreadsheetId=spreadsheet_id,
+                    range=range_name,
+                    majorDimension="ROWS",
+                ).execute()
+                rows_by_range.append(response.get("values", []))
+        return rows_by_range
 
     def _read_expected_application_status(
         self,
@@ -2419,6 +2478,66 @@ def _status_from_working_row(
         application_id_column_index=layout["application_id"],
         status_column_index=layout["status"],
     )
+
+
+def _status_from_tracked_row(
+    *,
+    application: SubmittedApplication,
+    spreadsheet_id: str,
+    sheet_name: str,
+    sheet_id: int,
+    row: list[Any],
+) -> SheetApplicationStatus | None:
+    row_number = application.last_seen_row_number
+    if row_number is None or row_number <= 1:
+        return None
+    for layout in _point_status_layouts(application):
+        application_id = _cell(row, layout["application_id"]).strip()
+        if application_id != application.application_id:
+            continue
+        application_type = _cell(row, layout["application_type"]).strip()
+        if application_type and application_type not in {
+            ApplicationType.SINGLE.value,
+            ApplicationType.BULK.value,
+        }:
+            continue
+        return _status_from_working_row(
+            application_id=application_id,
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=sheet_name,
+            sheet_id=sheet_id,
+            row_number=row_number,
+            row=row,
+            layout=layout,
+        )
+    return None
+
+
+def _point_status_end_column(application: SubmittedApplication) -> str:
+    if ChangeType.normalize(application.change_type) == ChangeType.CHIPS:
+        return "U"
+    return "X"
+
+
+def _point_status_layouts(application: SubmittedApplication) -> list[dict[str, Any]]:
+    change_type = ChangeType.normalize(application.change_type)
+    if change_type == ChangeType.CHIPS:
+        return [
+            _working_row_layout(CHIPS_WORKSHEET_HEADERS),
+            _working_row_layout(PREVIOUS_CHIPS_WORKSHEET_HEADERS),
+            _working_row_layout(WORKSHEET_HEADERS),
+            _working_row_layout(PREVIOUS_WORKSHEET_HEADERS),
+            _working_row_layout(CURRENT_WORKSHEET_HEADERS),
+            _working_row_layout(LEGACY_WORKSHEET_HEADERS),
+        ]
+    return [
+        _working_row_layout(WORKSHEET_HEADERS),
+        _working_row_layout(PREVIOUS_WORKSHEET_HEADERS),
+        _working_row_layout(CURRENT_WORKSHEET_HEADERS),
+        _working_row_layout(LEGACY_WORKSHEET_HEADERS),
+        _working_row_layout(CHIPS_WORKSHEET_HEADERS),
+        _working_row_layout(PREVIOUS_CHIPS_WORKSHEET_HEADERS),
+    ]
 
 
 def _working_row_layout(header_row: list[Any]) -> dict[str, Any] | None:

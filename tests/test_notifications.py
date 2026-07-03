@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 
 import pytest
 from googleapiclient.errors import HttpError
@@ -263,7 +264,8 @@ class FakeValuesResource:
             if isinstance(stored, BaseException):
                 return FakeRequest(stored)
             return FakeRequest({"values": stored})
-        return FakeRequest({"values": self.api.rows.get((spreadsheet_id, sheet_name), [])})
+        rows = self.api.rows.get((spreadsheet_id, sheet_name), [])
+        return FakeRequest({"values": _slice_fake_rows(range_name, rows)})
 
 
 class FakeSpreadsheetsResource:
@@ -302,10 +304,15 @@ class FakeBatchGetValuesResource(FakeValuesResource):
             sheet_name = _sheet_name_from_range(range_name)
             stored = self.api.rows.get(
                 (spreadsheet_id, range_name),
-                self.api.rows.get((spreadsheet_id, sheet_name), []),
+                None,
             )
             if isinstance(stored, BaseException):
                 return FakeRequest(stored)
+            if stored is None:
+                stored = _slice_fake_rows(
+                    range_name,
+                    self.api.rows.get((spreadsheet_id, sheet_name), []),
+                )
             value_ranges.append({"range": range_name, "values": stored})
         return FakeRequest({"valueRanges": value_ranges})
 
@@ -548,7 +555,7 @@ async def test_status_reader_indexes_direction_spreadsheets_by_application_id():
 
 @pytest.mark.asyncio
 async def test_status_reader_reads_only_tracked_application_sheets():
-    api = FakeSheetsApi(
+    api = FakeBatchGetSheetsApi(
         rows={
             (FL_SPREADSHEET, WEEK_SHEET): [
                 SHEET_HEADERS,
@@ -588,7 +595,8 @@ async def test_status_reader_reads_only_tracked_application_sheets():
     )
 
     assert set(statuses) == {"A1B2C3D4"}
-    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A1:X2"]
+    assert api.value_get_calls == []
+    assert [call["ranges"] for call in api.batch_get_calls] == [[f"'{WEEK_SHEET}'!A2:X2"]]
     assert api.metadata_get_calls == []
 
 
@@ -596,8 +604,7 @@ async def test_status_reader_reads_only_tracked_application_sheets():
 async def test_status_reader_does_not_accept_mismatched_expected_row():
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A1:X5"): [
-                SHEET_HEADERS,
+            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A5:X5"): [
                 app_row("OTHER001", status=ApplicationStatus.ACCEPTED.value),
             ],
             (FL_SPREADSHEET, WEEK_SHEET): [
@@ -625,8 +632,12 @@ async def test_status_reader_does_not_accept_mismatched_expected_row():
 
     statuses = await reader.read_statuses_for(tracked)
 
-    assert statuses == {}
-    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A1:X5"]
+    assert set(statuses) == {"A1B2C3D4"}
+    assert statuses["A1B2C3D4"].row_number == 2
+    assert [call["range"] for call in api.value_get_calls] == [
+        f"'{WEEK_SHEET}'!A5:X5",
+        f"'{WEEK_SHEET}'!A:X",
+    ]
 
 
 @pytest.mark.asyncio
@@ -640,7 +651,7 @@ async def test_status_reader_skips_single_source_when_sheet_range_is_missing():
     sheet_name = "15.06 ср"
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, f"'{sheet_name}'!A1:X152"): missing_range_error,
+            (FL_SPREADSHEET, f"'{sheet_name}'!A152:X152"): missing_range_error,
         }
     )
     reader = GoogleSheetsStatusReader(
@@ -670,7 +681,7 @@ async def test_status_reader_skips_single_source_when_sheet_range_is_missing():
 async def test_status_reader_finds_multiple_single_rows_under_same_header():
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A1:X5"): [
+            (FL_SPREADSHEET, WEEK_SHEET): [
                 ["ADD"],
                 SHEET_HEADERS,
                 app_row("APPROW03", status=ApplicationStatus.ACCEPTED.value),
@@ -722,15 +733,17 @@ async def test_status_reader_finds_multiple_single_rows_under_same_header():
     assert statuses["APPROW05"].row_number == 5
     assert statuses["APPROW05"].status == ApplicationStatus.NEEDS_CLARIFICATION.value
     assert statuses["APPROW05"].editor_comment == "РљРѕРјРјРµРЅС‚Р°СЂРёР№"
-    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A1:X5"]
+    assert [call["range"] for call in api.value_get_calls] == [
+        f"'{WEEK_SHEET}'!A4:X4",
+        f"'{WEEK_SHEET}'!A5:X5",
+    ]
 
 
 @pytest.mark.asyncio
 async def test_status_reader_uses_full_sheet_only_for_fallback():
     api = FakeSheetsApi(
         rows={
-            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A1:X5"): [
-                SHEET_HEADERS,
+            (FL_SPREADSHEET, f"'{WEEK_SHEET}'!A5:X5"): [
                 app_row("OTHER001", status=ApplicationStatus.ACCEPTED.value),
             ],
             (FL_SPREADSHEET, WEEK_SHEET): [
@@ -760,7 +773,7 @@ async def test_status_reader_uses_full_sheet_only_for_fallback():
 
     assert set(statuses) == {"A1B2C3D4"}
     assert [call["range"] for call in api.value_get_calls] == [
-        f"'{WEEK_SHEET}'!A1:X5",
+        f"'{WEEK_SHEET}'!A5:X5",
         f"'{WEEK_SHEET}'!A:X",
     ]
 
@@ -796,9 +809,12 @@ async def test_status_reader_uses_fallback_when_tracked_row_is_unknown():
     fast_statuses = await reader.read_statuses_for(tracked)
     fallback_statuses = await reader.read_statuses_for(tracked, fallback_full_scan=True)
 
-    assert fast_statuses == {}
+    assert set(fast_statuses) == {"A1B2C3D4"}
     assert set(fallback_statuses) == {"A1B2C3D4"}
-    assert [call["range"] for call in api.value_get_calls] == [f"'{WEEK_SHEET}'!A:X"]
+    assert [call["range"] for call in api.value_get_calls] == [
+        f"'{WEEK_SHEET}'!A:X",
+        f"'{WEEK_SHEET}'!A:X",
+    ]
 
 
 @pytest.mark.asyncio
@@ -3468,3 +3484,17 @@ def _sheet_name_from_range(range_name: str) -> str:
     if quoted_name.startswith("'") and quoted_name.endswith("'"):
         return quoted_name[1:-1].replace("''", "'")
     return quoted_name
+
+
+def _slice_fake_rows(range_name: str, rows: list[list[str]]) -> list[list[str]]:
+    if "!" not in range_name:
+        return rows
+    suffix = range_name.split("!", maxsplit=1)[1]
+    match = re.fullmatch(r"[A-Z]+(?P<start>\d+):[A-Z]+(?P<end>\d+)", suffix)
+    if match is not None:
+        start = int(match.group("start"))
+        end = int(match.group("end"))
+        return rows[start - 1 : end]
+    if re.fullmatch(r"[A-Z]+:[A-Z]+", suffix):
+        return rows
+    return rows
