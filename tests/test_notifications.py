@@ -2817,6 +2817,45 @@ async def test_deletion_status_requires_two_stable_polling_cycles(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_deletion_status_allows_zero_sheet_id(tmp_path):
+    repository = DraftRepository(str(tmp_path / "deletion_zero_sheet_id.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="DEL00000",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=0,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=5,
+    )
+    statuses = {
+        "DEL00000": SheetApplicationStatus(
+            application_id="DEL00000",
+            spreadsheet_id=FL_SPREADSHEET,
+            sheet_name=WEEK_SHEET,
+            sheet_id=0,
+            row_number=5,
+            status=ApplicationStatus.DELETION.value,
+            editor_comment="",
+            final_answer="",
+        )
+    }
+    reader = FakeDeletingStatusReader(statuses)
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=reader,
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+    await service.run_once()
+
+    assert await repository.get_submitted_application("DEL00000") is None
+    assert reader.deleted == ["DEL00000"]
+
+
+@pytest.mark.asyncio
 async def test_deletion_status_processes_same_sheet_rows_bottom_up(tmp_path):
     repository = DraftRepository(str(tmp_path / "deletion_bottom_up.db"))
     await repository.init()

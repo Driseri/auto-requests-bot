@@ -9,7 +9,7 @@ from typing import Any, Protocol
 from .config import AppConfig
 from .log_classifier import classify_logs
 from .remote_script import build_remote_command
-from .schemas import CollectResponse, CollectionState, Snapshot
+from .schemas import CollectResponse, Snapshot
 from .ssh_client import ParamikoSshClient
 from .storage import JsonStorage
 from .thresholds import heartbeat_age_seconds, summarize_snapshot

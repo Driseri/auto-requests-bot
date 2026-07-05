@@ -1408,7 +1408,7 @@ class StatusNotificationService:
             )
             return
 
-        if not current.spreadsheet_id or not current.sheet_id or not current.sheet_name:
+        if not current.spreadsheet_id or current.sheet_id is None or not current.sheet_name:
             await self.repository.record_application_deletion_error(
                 application.application_id,
                 "Deletion skipped: missing sheet coordinates",

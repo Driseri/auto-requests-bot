@@ -6,7 +6,7 @@ import json
 import re
 import shlex
 import textwrap
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 
 from .config import AppConfig, RemoteConfig
 from .schemas import AdminDeleteResponse
