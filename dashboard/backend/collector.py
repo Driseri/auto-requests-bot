@@ -35,6 +35,8 @@ VALID_APPLICATION_STATUSES = {
 }
 VALID_BULK_APPLICATION_STATUSES = {"Новая", "Нужны пояснения", "Принято"}
 VALID_MONITORING_STATUSES = VALID_APPLICATION_STATUSES | VALID_BULK_APPLICATION_STATUSES
+FINAL_ANSWER_READY_STATUS = "Итоговый ответ готов"
+EDITOR_NOT_SELECTED = "Редактор не выбран"
 PILOT_PERIOD_DAYS = (7, 14, 30)
 
 
@@ -372,8 +374,8 @@ class DashboardCollector:
         oldest_created_at, oldest_age_seconds = _oldest_age(rows, "created_at")
         return {
             "open": len(rows),
-            "no_editor": sum(1 for row in rows if not row.get("last_seen_editor")),
-            "no_final_answer": sum(1 for row in rows if not row.get("has_final_answer")),
+            "no_editor": sum(1 for row in rows if not _has_editor(row)),
+            "no_final_answer": sum(1 for row in rows if not _has_final_answer(row)),
             "oldest_created_at": oldest_created_at,
             "oldest_age_seconds": oldest_age_seconds,
             "rows": rows,
@@ -432,8 +434,8 @@ class DashboardCollector:
             "today": {
                 "created": int(applications.get("created_today", 0) or 0),
                 "urgent_created": int(applications.get("urgent_today", 0) or 0),
-                "final_answers": int(applications.get("with_final_answer", 0) or 0),
-                "bulk_registered": int(bulk.get("registered", 0) or 0),
+                "final_answers": int(applications.get("with_final_answer_today", 0) or 0),
+                "bulk_registered": int(bulk.get("registered_today", 0) or 0),
             },
             "team_load": {
                 "without_editor": int(applications.get("without_editor", 0) or 0),
@@ -564,28 +566,50 @@ def _pilot_funnel(applications: list[dict[str, Any]], events: list[dict[str, Any
     """Return stage counts and conversion from the previous stage."""
 
     event_types = {str(event.get("event_type") or "") for event in events}
+    events_by_app: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        app_id = str(event.get("application_id") or "")
+        if app_id:
+            events_by_app.setdefault(app_id, []).append(event)
     app_total = len(applications)
     status_changed_count = sum(1 for event in events if event.get("event_type") == "status_changed")
     editor_comment_count = sum(1 for event in events if event.get("event_type") == "editor_comment_added")
     final_answer_count = sum(1 for event in events if event.get("event_type") == "final_answer_added")
     deletion_count = sum(1 for event in events if event.get("event_type") == "application_deleted")
     stages = [
-        ("draft_started", "Черновик начат", sum(1 for event in events if event.get("event_type") == "draft_started")),
-        ("submitted", "Заявка отправлена", app_total),
-        ("sheets_visible", "Появилась в Sheets", sum(1 for app in applications if app.get("last_seen_row_number"))),
-        ("status_changed", "Статус изменен", status_changed_count or sum(1 for app in applications if str(app.get("last_known_status") or "") not in {"", "Новая"})),
-        ("editor_comment", "Комментарий редактора", editor_comment_count or sum(1 for app in applications if app.get("has_editor_comment"))),
-        ("user_response", "Ответ пользователя", sum(1 for app in applications if app.get("has_scriptwriter_response")) + sum(1 for event in events if event.get("event_type") in {"user_comment_added", "scriptwriter_response_added"})),
-        ("final_answer", "Итоговый ответ", final_answer_count or sum(1 for app in applications if app.get("has_final_answer"))),
-        ("deletion", "Удаление", deletion_count + sum(1 for app in applications if app.get("deletion_seen_count") or app.get("last_known_status") == "Удаление")),
+        ("draft_started", "Черновик начат", sum(1 for event in events if event.get("event_type") == "draft_started"), {"draft_started"}),
+        ("submitted", "Заявка отправлена", app_total, {"application_submitted", "submitted", "sent_to_sheets"}),
+        ("sheets_visible", "Появилась в Sheets", sum(1 for app in applications if app.get("last_seen_row_number")), {"application_indexed"}),
+        ("status_changed", "Статус изменен", status_changed_count or sum(1 for app in applications if str(app.get("last_known_status") or "") not in {"", "Новая"}), {"status_changed", "editor_changed"}),
+        ("editor_comment", "Комментарий редактора", editor_comment_count or sum(1 for app in applications if app.get("has_editor_comment")), {"editor_comment_added", "clarification_requested"}),
+        ("user_response", "Ответ пользователя", sum(1 for app in applications if app.get("has_scriptwriter_response")) + sum(1 for event in events if event.get("event_type") in {"user_comment_added", "scriptwriter_response_added"}), {"user_comment_added", "scriptwriter_response_added"}),
+        ("final_answer", "Итоговый ответ", final_answer_count or sum(1 for app in applications if _has_final_answer(app)), {"final_answer_added", "status_final_answer_ready"}),
+        ("deletion", "Удаление", deletion_count + sum(1 for app in applications if app.get("deletion_seen_count") or app.get("last_known_status") == "Удаление"), {"application_deleted"}),
     ]
     result = []
     previous: int | None = None
-    for key, label, count in stages:
+    previous_event_types: set[str] | None = None
+    for key, label, count, current_event_types in stages:
         conversion = None if previous in (None, 0) else round(count / previous * 100)
         source = "events" if key == "draft_started" and "draft_started" in event_types else "applications"
-        result.append({"key": key, "label": label, "count": count, "conversion_percent": conversion, "source": source})
+        average_transition, transition_sample = _average_transition(
+            events_by_app,
+            previous_event_types,
+            current_event_types,
+        )
+        result.append(
+            {
+                "key": key,
+                "label": label,
+                "count": count,
+                "conversion_percent": conversion,
+                "source": source,
+                "average_transition_seconds": average_transition,
+                "transition_sample_size": transition_sample,
+            }
+        )
         previous = count
+        previous_event_types = current_event_types
     return result
 
 
@@ -605,7 +629,7 @@ def _pilot_problem_rows(
         reasons: list[str] = []
         if not _has_first_editor_action(app, app_events) and now - submitted_at > timedelta(hours=24):
             reasons.append("нет первого действия редактора >24ч")
-        if not app.get("has_final_answer") and now - submitted_at > timedelta(hours=72):
+        if not _has_final_answer(app) and now - submitted_at > timedelta(hours=72):
             reasons.append("нет итогового ответа >72ч")
         if int(app.get("not_found_count", 0) or 0) > 0 or app.get("polling_state") != "ACTIVE":
             reasons.append("tracking/not_found")
@@ -677,7 +701,7 @@ def _first_editor_durations(applications: list[dict[str, Any]], events_by_app: d
 def _full_cycle_durations(applications: list[dict[str, Any]], events_by_app: dict[str, list[dict[str, Any]]]) -> list[int]:
     durations: list[int] = []
     for app in applications:
-        if not app.get("has_final_answer"):
+        if not _has_final_answer(app):
             continue
         submitted_at = _row_time(app, "submitted_at", "created_at")
         events = events_by_app.get(str(app.get("application_id") or ""), [])
@@ -699,6 +723,19 @@ def _durations_between(events_by_app: dict[str, list[dict[str, Any]]], start_typ
     return durations
 
 
+def _average_transition(
+    events_by_app: dict[str, list[dict[str, Any]]],
+    previous_types: set[str] | None,
+    current_types: set[str],
+) -> tuple[int | None, int]:
+    if not previous_types:
+        return None, 0
+    durations = _durations_between(events_by_app, previous_types, current_types)
+    if not durations:
+        return None, 0
+    return round(sum(durations) / len(durations)), len(durations)
+
+
 def _duration_stats(values: list[int]) -> dict[str, Any]:
     if not values:
         return {"average_seconds": None, "median_seconds": None, "sample_size": 0}
@@ -715,11 +752,20 @@ def _first_event_at(events: list[dict[str, Any]], event_types: set[str]) -> date
     return min(moments) if moments else None
 
 
+def _has_final_answer(app: dict[str, Any]) -> bool:
+    return bool(app.get("has_final_answer") or app.get("last_known_status") == FINAL_ANSWER_READY_STATUS)
+
+
+def _has_editor(app: dict[str, Any]) -> bool:
+    editor = str(app.get("last_seen_editor") or "").strip()
+    return bool(editor and editor != EDITOR_NOT_SELECTED)
+
+
 def _has_first_editor_action(app: dict[str, Any], events: list[dict[str, Any]]) -> bool:
     return bool(
-        app.get("last_seen_editor")
+        _has_editor(app)
         or app.get("has_editor_comment")
-        or app.get("has_final_answer")
+        or _has_final_answer(app)
         or str(app.get("last_known_status") or "") not in {"", "Новая"}
         or _first_event_at(events, {"editor_changed", "status_changed", "editor_comment_added", "final_answer_added"})
     )

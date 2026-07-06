@@ -69,10 +69,12 @@ def sample_remote_payload() -> dict:
                         "urgent_total": 0,
                         "urgent_today": 0,
                         "not_found_total": 0,
+                        "with_final_answer_today": 1,
+                        "with_final_answer": 9,
                     },
                     "applications_by_status": [{"status": "Новая", "count": 1}],
                     "applications_by_direction": [{"direction": "ФЛ", "count": 1}],
-                    "bulk_summary": {"total": 0, "unfinished": 0, "registering": 0, "registered": 0},
+                    "bulk_summary": {"total": 4, "unfinished": 0, "registering": 0, "registered": 4, "registered_today": 1},
                     "urgent_applications": [],
                     "drafts_summary": [],
                     "user_workflow_pending": [],
@@ -165,6 +167,14 @@ def sample_pilot_payload() -> dict:
             {
                 "application_id": "APP-1",
                 "telegram_user_id": 100,
+                "event_type": "application_indexed",
+                "event_at": "2026-07-06T08:05:00+00:00",
+                "old_value": None,
+                "new_value": None,
+            },
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
                 "event_type": "editor_changed",
                 "event_at": "2026-07-06T08:30:00+00:00",
                 "old_value": "",
@@ -237,6 +247,8 @@ def test_api_collect_and_latest_snapshot(tmp_path: Path) -> None:
     assert latest.status_code == 200
     assert latest.json()["container"]["app_version"] == "pilot"
     assert latest.json()["business"]["today"]["created"] == 1
+    assert latest.json()["business"]["today"]["final_answers"] == 1
+    assert latest.json()["business"]["today"]["bulk_registered"] == 1
     assert latest.json()["business"]["directions"]["top"][0]["direction"] == "ФЛ"
     assert "pilot" in latest.json()
 
@@ -266,6 +278,57 @@ def test_urgent_oldest_age_is_calculated(tmp_path: Path) -> None:
     assert urgent["open"] == 1
     assert urgent["oldest_created_at"] == "2026-06-18T09:00:00+00:00"
     assert urgent["oldest_age_seconds"] >= 0
+
+
+def test_urgent_final_status_is_not_counted_without_final(tmp_path: Path) -> None:
+    payload = sample_remote_payload()
+    payload["container_payload"]["sqlite"]["metrics"]["urgent_applications"] = [
+        {
+            "application_id": "APP-FINAL",
+            "telegram_user_id": 100,
+            "direction": "ФЛ",
+            "created_at": "2026-06-18T09:00:00+00:00",
+            "last_seen_editor": "Редактор",
+            "last_known_status": "Итоговый ответ готов",
+            "has_final_answer": 0,
+        }
+    ]
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    app = create_app(config_path=tmp_path / "config.local.toml", collector=collector)
+    client = TestClient(app)
+
+    response = client.post("/api/collect")
+
+    assert response.status_code == 200
+    urgent = response.json()["snapshot"]["urgent"]
+    assert urgent["no_final_answer"] == 0
+
+
+def test_urgent_editor_not_selected_is_counted_without_owner(tmp_path: Path) -> None:
+    payload = sample_remote_payload()
+    payload["container_payload"]["sqlite"]["metrics"]["urgent_applications"] = [
+        {
+            "application_id": "APP-NO-OWNER",
+            "telegram_user_id": 100,
+            "direction": "ФЛ",
+            "created_at": "2026-06-18T09:00:00+00:00",
+            "last_seen_editor": "Редактор не выбран",
+            "last_known_status": "Новая",
+            "has_final_answer": 0,
+        }
+    ]
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    app = create_app(config_path=tmp_path / "config.local.toml", collector=collector)
+    client = TestClient(app)
+
+    response = client.post("/api/collect")
+
+    assert response.status_code == 200
+    assert response.json()["snapshot"]["urgent"]["no_editor"] == 1
 
 
 def test_api_safe_config_never_returns_password(tmp_path: Path) -> None:
@@ -320,8 +383,12 @@ def test_pilot_metrics_are_normalized_from_snapshot(tmp_path: Path) -> None:
     assert period["kpi"]["full_cycle_seconds"]["median_seconds"] == 3600
     assert period["kpi"]["not_found_or_tracking_errors"] == 1
     assert period["problem_rows"]
-    funnel = {item["key"]: item["count"] for item in period["funnel"]}
-    assert funnel["user_response"] == 1
+    funnel = {item["key"]: item for item in period["funnel"]}
+    assert funnel["user_response"]["count"] == 1
+    assert funnel["submitted"]["average_transition_seconds"] == 600
+    assert funnel["sheets_visible"]["average_transition_seconds"] == 300
+    assert funnel["status_changed"]["average_transition_seconds"] == 1500
+    assert funnel["submitted"]["transition_sample_size"] == 1
     assert snapshot["applications"]["by_status"] == [
         {"status": "Некорректные статусы/интенты", "count": 3},
         {"status": "Новая", "count": 2},
@@ -348,7 +415,7 @@ def test_pilot_metrics_match_actual_application_event_names(tmp_path: Path) -> N
     payload = sample_pilot_payload()
     events = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]["events"]
     events[:] = [
-        event for event in events if event["event_type"] not in {"draft_started", "application_submitted"}
+        event for event in events if event["event_type"] not in {"draft_started", "application_submitted", "application_indexed"}
     ]
     events.extend(
         [
@@ -412,5 +479,13 @@ def test_remote_command_collects_pilot_metrics_read_only() -> None:
     assert "PRAGMA query_only=ON" in command
     assert "LIMIT 2000" in command
     assert "LIMIT 5000" in command
+    assert "COALESCE(last_known_status" in command
+    assert "Итоговый ответ готов" in command
+    assert "Редактор не выбран" in command
+    assert "+3 hours" in command
+    assert "with_final_answer_today" in command
+    assert "final_answer_added" in command
+    assert "status_final_answer_ready" in command
+    assert "registered_today" in command
     assert "VACUUM" not in command
     assert "BEGIN IMMEDIATE" not in command

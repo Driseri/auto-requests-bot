@@ -284,15 +284,33 @@ _CONTAINER_SCRIPT = textwrap.dedent(
             }
             metrics["applications_summary"] = fetch_one(db, """
                 SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN date(COALESCE(submitted_at, created_at)) = date('now') THEN 1 ELSE 0 END) AS created_today,
+                       SUM(CASE WHEN date(COALESCE(submitted_at, created_at), '+3 hours') = date('now', '+3 hours') THEN 1 ELSE 0 END) AS created_today,
                        SUM(CASE WHEN is_urgent = 1 THEN 1 ELSE 0 END) AS urgent_total,
-                       SUM(CASE WHEN is_urgent = 1 AND date(COALESCE(submitted_at, created_at)) = date('now') THEN 1 ELSE 0 END) AS urgent_today,
+                       SUM(CASE WHEN is_urgent = 1 AND date(COALESCE(submitted_at, created_at), '+3 hours') = date('now', '+3 hours') THEN 1 ELSE 0 END) AS urgent_today,
                        SUM(CASE WHEN polling_state = 'NOT_FOUND' THEN 1 ELSE 0 END) AS not_found_total,
                        SUM(CASE WHEN not_found_count > 0 THEN 1 ELSE 0 END) AS not_found_count_positive,
-                       SUM(CASE WHEN COALESCE(last_seen_editor, '') = '' THEN 1 ELSE 0 END) AS without_editor,
+                       SUM(CASE
+                         WHEN COALESCE(last_seen_editor, '') IN ('', 'Редактор не выбран')
+                              AND COALESCE(last_seen_final_answer, '') = ''
+                              AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
+                         THEN 1 ELSE 0
+                       END) AS without_editor,
+                       SUM(CASE
+                         WHEN (COALESCE(last_seen_final_answer, '') != '' OR COALESCE(last_known_status, '') = 'Итоговый ответ готов')
+                              AND date(updated_at, '+3 hours') = date('now', '+3 hours')
+                         THEN 1 ELSE 0
+                       END) AS with_final_answer_today,
                        SUM(CASE WHEN COALESCE(last_seen_final_answer, '') != '' THEN 1 ELSE 0 END) AS with_final_answer
                 FROM submitted_applications
             """)
+            if table_exists(db, "application_events"):
+                final_answer_events = fetch_one(db, """
+                    SELECT COUNT(DISTINCT application_id) AS count
+                    FROM application_events
+                    WHERE event_type IN ('final_answer_added', 'status_final_answer_ready')
+                      AND date(event_at, '+3 hours') = date('now', '+3 hours')
+                """)
+                metrics["applications_summary"]["with_final_answer_today"] = final_answer_events.get("count", 0) or 0
             metrics["applications_problem_rows"] = fetch_all(db, """
                 SELECT application_id, telegram_user_id, direction, sheet_name,
                        last_seen_row_number, last_known_status, polling_state,
@@ -305,10 +323,16 @@ _CONTAINER_SCRIPT = textwrap.dedent(
             metrics["urgent_applications"] = fetch_all(db, """
                 SELECT application_id, telegram_user_id, direction, sheet_name,
                        last_seen_row_number, last_known_status, last_seen_editor,
-                       CASE WHEN COALESCE(last_seen_final_answer, '') != '' THEN 1 ELSE 0 END AS has_final_answer,
+                       CASE
+                         WHEN COALESCE(last_seen_final_answer, '') != ''
+                              OR last_known_status = 'Итоговый ответ готов'
+                         THEN 1 ELSE 0
+                       END AS has_final_answer,
                        COALESCE(submitted_at, created_at) AS created_at, updated_at
                 FROM submitted_applications
-                WHERE is_urgent = 1 AND COALESCE(last_seen_final_answer, '') = ''
+                WHERE is_urgent = 1
+                  AND COALESCE(last_seen_final_answer, '') = ''
+                  AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
                 ORDER BY COALESCE(submitted_at, created_at) ASC
                 LIMIT 50
             """)
@@ -318,7 +342,10 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 SELECT COUNT(*) AS total,
                        SUM(CASE WHEN registration_state != 'REGISTERED' THEN 1 ELSE 0 END) AS unfinished,
                        SUM(CASE WHEN registration_state = 'REGISTERING' THEN 1 ELSE 0 END) AS registering,
-                       SUM(CASE WHEN registration_state = 'REGISTERED' THEN 1 ELSE 0 END) AS registered
+                       SUM(CASE WHEN registration_state = 'REGISTERED' THEN 1 ELSE 0 END) AS registered,
+                       SUM(CASE WHEN registration_state = 'REGISTERED'
+                                  AND date(updated_at, '+3 hours') = date('now', '+3 hours')
+                                THEN 1 ELSE 0 END) AS registered_today
                 FROM bulk_batches
             """)
             metrics["bulk_unfinished_by_user"] = fetch_all(db, """

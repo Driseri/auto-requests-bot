@@ -13,6 +13,9 @@ from .ssh_client import ParamikoSshClient
 from .storage import JsonStorage
 
 
+FINAL_ANSWER_READY_STATUS = "\u0418\u0442\u043e\u0433\u043e\u0432\u044b\u0439 \u043e\u0442\u0432\u0435\u0442 \u0433\u043e\u0442\u043e\u0432"
+
+
 class ReportCommandRunner(Protocol):
     """Protocol used by tests to replace the real Paramiko SSH client."""
 
@@ -129,7 +132,10 @@ def _normalize_application_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(row)
     normalized["problem"] = _application_problem(row)
     normalized["type_label"] = _application_type(row)
-    normalized["has_final_answer"] = bool(row.get("has_final_answer"))
+    normalized["has_final_answer"] = (
+        bool(row.get("has_final_answer"))
+        or row.get("last_known_status") == FINAL_ANSWER_READY_STATUS
+    )
     normalized["row_link"] = _row_link(row)
     normalized["problem_age_seconds"] = _age_from(row.get("last_not_found_at") or row.get("updated_at"))
     return normalized
@@ -262,7 +268,11 @@ _CONTAINER_SCRIPT = textwrap.dedent(
         application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
         last_seen_row_number, last_known_status, direction, answer_type,
         application_type, change_type, is_urgent, batch_id, last_seen_editor,
-        CASE WHEN COALESCE(last_seen_final_answer, '') != '' THEN 1 ELSE 0 END AS has_final_answer,
+        CASE
+          WHEN COALESCE(last_seen_final_answer, '') != ''
+               OR last_known_status = 'Итоговый ответ готов'
+          THEN 1 ELSE 0
+        END AS has_final_answer,
         submitted_at, polling_state, not_found_count, last_not_found_at,
         next_status_check_at, created_at, updated_at
     """
@@ -287,7 +297,9 @@ _CONTAINER_SCRIPT = textwrap.dedent(
             report["urgent_without_final_answer"] = fetch_all(db, f"""
                 SELECT {APPLICATION_COLUMNS}
                 FROM submitted_applications
-                WHERE is_urgent = 1 AND COALESCE(last_seen_final_answer, '') = ''
+                WHERE is_urgent = 1
+                  AND COALESCE(last_seen_final_answer, '') = ''
+                  AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
                 ORDER BY COALESCE(submitted_at, created_at) ASC
                 LIMIT ?
             """, (LIMIT,))
@@ -296,6 +308,7 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 FROM submitted_applications
                 WHERE COALESCE(last_seen_editor, '') IN ('', 'Редактор не выбран')
                   AND COALESCE(last_seen_final_answer, '') = ''
+                  AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
                 ORDER BY updated_at ASC
                 LIMIT ?
             """, (LIMIT,))
@@ -310,6 +323,7 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 SELECT {APPLICATION_COLUMNS}
                 FROM submitted_applications
                 WHERE COALESCE(last_seen_final_answer, '') = ''
+                  AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
                   AND datetime(updated_at) <= datetime('now', '-24 hours')
                 ORDER BY updated_at ASC
                 LIMIT ?

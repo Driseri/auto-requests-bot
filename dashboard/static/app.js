@@ -374,6 +374,13 @@ function renderPilotFunnel(period) {
       <strong>${esc(number(item.count))}</strong>
       <div class="funnel-track"><span style="width:${Math.round((Number(item.count || 0) / max) * 100)}%"></span></div>
       <small>${item.conversion_percent === null || item.conversion_percent === undefined ? "-" : `${esc(item.conversion_percent)}%`}</small>
+      <small class="funnel-duration">
+        ${
+          item.average_transition_seconds === null || item.average_transition_seconds === undefined
+            ? "нет данных"
+            : `${esc(age(item.average_transition_seconds))} <span>n=${esc(number(item.transition_sample_size))}</span>`
+        }
+      </small>
     </div>
   `).join("");
   qs("#pilot-funnel").innerHTML = html || '<div class="muted">Нет данных для воронки</div>';
@@ -393,6 +400,52 @@ function renderPilotProblems(period) {
   ], "Проблемных заявок за выбранный период нет.");
 }
 
+function renderPilotEvents(pilot) {
+  const quality = pilot?.data_quality || {};
+  const counts = quality.event_count_by_type || {};
+  const eventRows = [
+    ["draft_started", "Черновик начат", "время создания"],
+    ["application_submitted", "Заявка отправлена", "воронка"],
+    ["application_indexed", "Строка в Sheets", "индексация"],
+    ["status_changed", "Статус изменен", "движение"],
+    ["editor_changed", "Редактор назначен", "первое действие"],
+    ["editor_comment_added", "Комментарий редактора", "пояснения"],
+    ["scriptwriter_response_added", "Ответ сценариста", "ответ пользователя"],
+    ["final_answer_added", "Итоговый ответ", "полный цикл"],
+    ["application_not_found", "not_found", "tracking"],
+    ["application_deleted", "Удаление", "аудит"],
+    ["application_deletion_error", "Ошибка удаления", "риск"],
+  ];
+  const totalEvents = Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0);
+  const rows = eventRows.map(([key, label, purpose]) => {
+    const count = Number(counts[key] || 0);
+    return `
+      <div class="pilot-event-item ${count ? "is-present" : "is-empty"}">
+        <div>
+          <strong>${esc(label)}</strong>
+          <small>${esc(key)}</small>
+        </div>
+        <span>${esc(number(count))}</span>
+        <em>${esc(purpose)}</em>
+      </div>
+    `;
+  }).join("");
+
+  qs("#pilot-events").innerHTML = `
+    <div class="pilot-events-summary">
+      <div>
+        <span>Всего событий в snapshot</span>
+        <strong>${esc(number(totalEvents))}</strong>
+      </div>
+      <div>
+        <span>Качество данных</span>
+        <strong>${esc(quality.status || "unknown")}</strong>
+      </div>
+    </div>
+    <div class="pilot-events-grid">${rows}</div>
+  `;
+}
+
 function renderPilot(snapshot) {
   const pilot = snapshot.pilot || {};
   const periodKey = activePilotPeriod || pilot.default_period || "7d";
@@ -401,8 +454,10 @@ function renderPilot(snapshot) {
   const quality = pilot.data_quality || {};
   qsa("[data-pilot-period]").forEach((button) => button.classList.toggle("is-active", button.dataset.pilotPeriod === periodKey));
 
-  const qualityMissing = quality.status === "missing_events";
-  qs("#pilot-quality").classList.toggle("hidden", !qualityMissing);
+  const qualityNotes = quality.notes || [];
+  const showQuality = quality.status === "missing_events" || qualityNotes.length > 0;
+  qs("#pilot-quality").classList.toggle("hidden", !showQuality);
+  qs("#pilot-quality-title").textContent = quality.status === "missing_events" ? "Часть метрик пока недоступна" : "Качество данных";
   qs("#pilot-quality-text").textContent = (quality.notes || []).join(" ") || "Событий пока нет, временные метрики появятся после накопления application_events.";
 
   const creation = durationMetric(kpi.creation_time_seconds);
@@ -416,8 +471,12 @@ function renderPilot(snapshot) {
   renderPilotKpiCard("#pilot-kpi-quality", "Пояснения / ошибки", `${number(kpi.clarification_share_percent)}%`, `not_found ${number(kpi.not_found_or_tracking_errors)}, уведомления ${number(kpi.notification_errors)}`, kpi.not_found_or_tracking_errors ? "warn" : "");
 
   renderPilotChart("#pilot-chart-applications", "Заявки по дням", period.daily || [], "applications", number);
+  renderPilotChart("#pilot-chart-users", "Активные пользователи", period.daily || [], "active_users", number);
   renderPilotChart("#pilot-chart-creation", "Медиана создания", period.daily || [], "creation_time_median_seconds", age);
+  renderPilotChart("#pilot-chart-editor", "Медиана до редактора", period.daily || [], "first_editor_action_median_seconds", age);
   renderPilotChart("#pilot-chart-cycle", "Медиана полного цикла", period.daily || [], "full_cycle_median_seconds", age);
+  renderPilotChart("#pilot-chart-issues", "not_found и ошибки", period.daily || [], "not_found_or_errors", number);
+  renderPilotEvents(pilot);
   renderPilotFunnel(period);
   renderPilotProblems(period);
 }

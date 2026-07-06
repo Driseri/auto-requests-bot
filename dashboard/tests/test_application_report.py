@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import create_app
 from backend.application_report import (
+    FINAL_ANSWER_READY_STATUS,
     ApplicationReportCollector,
     build_application_report_command,
     normalize_application_report,
@@ -219,10 +220,32 @@ def test_application_report_normalizes_repeat_not_found_label() -> None:
     assert report.lost[0]["problem"] == "повторные not_found"
 
 
+def test_application_report_treats_final_status_as_final_answer() -> None:
+    payload = sample_report_payload()
+    row = payload["container_payload"]["report"]["urgent_without_final_answer"][0]
+    row["last_known_status"] = FINAL_ANSWER_READY_STATUS
+    row["has_final_answer"] = 0
+
+    report = normalize_application_report(payload, source_host="vps")
+
+    assert report.urgent_without_final_answer[0]["has_final_answer"] is True
+
+
+def test_application_report_command_counts_editor_not_selected_without_owner() -> None:
+    command = build_application_report_command(RemoteConfig())
+
+    assert "COALESCE(last_seen_editor" in command
+    assert "Редактор не выбран" in command
+    assert "COALESCE(last_known_status" in command
+    assert "Итоговый ответ готов" in command
+
+
 def test_application_report_command_is_read_only() -> None:
     command = build_application_report_command(RemoteConfig())
 
     assert "file:/data/app.db?mode=ro" in command
     assert "PRAGMA query_only=ON" in command
+    assert "COALESCE(last_known_status" in command
+    assert "Итоговый ответ готов" in command
     assert "DELETE FROM" not in command.upper()
     assert "UPDATE submitted_applications".upper() not in command.upper()
