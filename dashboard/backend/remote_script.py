@@ -192,6 +192,14 @@ _CONTAINER_SCRIPT = textwrap.dedent(
         return fetch_all(connection, f"SELECT state, COUNT(*) AS count FROM {table} GROUP BY state")
 
 
+    def table_exists(connection, table):
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+
     def main():
         # This code runs inside the bot container and only opens SQLite read-only.
         result = {
@@ -240,6 +248,40 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 "SELECT last_known_status AS status, COUNT(*) AS count FROM submitted_applications GROUP BY last_known_status")
             metrics["applications_by_direction"] = fetch_all(db,
                 "SELECT COALESCE(direction, '') AS direction, COUNT(*) AS count FROM submitted_applications GROUP BY direction")
+            metrics["pilot_metrics_raw"] = {
+                "applications": fetch_all(db, """
+                    SELECT application_id, telegram_user_id, direction, answer_type,
+                           application_type, change_type, is_urgent, batch_id, sheet_name,
+                           last_seen_row_number, last_known_status, last_seen_editor,
+                           CASE WHEN COALESCE(last_seen_editor_comment, '') != '' THEN 1 ELSE 0 END AS has_editor_comment,
+                           CASE WHEN COALESCE(last_seen_final_answer, '') != '' THEN 1 ELSE 0 END AS has_final_answer,
+                           CASE WHEN COALESCE(last_seen_scriptwriter_response, '') != '' THEN 1 ELSE 0 END AS has_scriptwriter_response,
+                           COALESCE(submitted_at, created_at) AS submitted_at,
+                           created_at, updated_at, polling_state, not_found_count,
+                           last_not_found_at, deletion_seen_count, deletion_last_seen_at
+                    FROM submitted_applications
+                    WHERE datetime(COALESCE(submitted_at, created_at)) >= datetime('now', '-30 days')
+                    ORDER BY datetime(COALESCE(submitted_at, created_at)) DESC
+                    LIMIT 2000
+                """),
+                "events": fetch_all(db, """
+                    SELECT application_id, telegram_user_id, event_type, event_at,
+                           old_value, new_value
+                    FROM application_events
+                    WHERE datetime(event_at) >= datetime('now', '-30 days')
+                    ORDER BY datetime(event_at) DESC, id DESC
+                    LIMIT 5000
+                """) if table_exists(db, "application_events") else [],
+                "notification_errors": fetch_all(db, """
+                    SELECT event_type, telegram_user_id, state, attempts, created_at, updated_at,
+                           substr(COALESCE(last_error, ''), 1, 300) AS last_error
+                    FROM notification_outbox
+                    WHERE COALESCE(last_error, '') != ''
+                      AND datetime(updated_at) >= datetime('now', '-30 days')
+                    ORDER BY datetime(updated_at) DESC
+                    LIMIT 100
+                """),
+            }
             metrics["applications_summary"] = fetch_one(db, """
                 SELECT COUNT(*) AS total,
                        SUM(CASE WHEN date(COALESCE(submitted_at, created_at)) = date('now') THEN 1 ELSE 0 END) AS created_today,

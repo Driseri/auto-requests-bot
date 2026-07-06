@@ -46,6 +46,7 @@ class Snapshot(BaseModel):
     bulk: dict[str, Any] = Field(default_factory=dict)
     urgent: dict[str, Any] = Field(default_factory=dict)
     business: dict[str, Any] = Field(default_factory=dict)
+    pilot: dict[str, Any] = Field(default_factory=dict)
     drafts: dict[str, Any] = Field(default_factory=dict)
     log_events: dict[str, Any] = Field(default_factory=dict)
     thresholds: dict[str, Any] = Field(default_factory=dict)

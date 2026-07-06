@@ -346,6 +346,105 @@ tbody tr:hover { background: var(--surface-muted); }
 a { color: var(--brand); font-weight: 700; text-decoration: none; }
 a:hover { color: var(--brand-dark); text-decoration: underline; }
 
+/* Pilot metrics tab */
+.pilot-hero { border-left: 3px solid var(--info); }
+
+.segmented-control {
+  display: inline-flex;
+  overflow: hidden;
+  flex: 0 0 auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-muted);
+}
+
+.segment {
+  min-height: 38px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  padding: 0 13px;
+  cursor: pointer;
+  color: var(--muted);
+  background: transparent;
+  font-weight: 750;
+}
+
+.segment:last-child { border-right: 0; }
+.segment.is-active { color: #fff; background: var(--brand); }
+
+.pilot-kpi-grid {
+  grid-template-columns: repeat(6, minmax(150px, 1fr));
+  margin-bottom: 24px;
+}
+
+.pilot-kpi {
+  min-height: 116px;
+  display: grid;
+  align-content: center;
+  gap: 8px;
+}
+
+.pilot-kpi span { color: var(--muted); font-size: 12px; font-weight: 700; }
+.pilot-kpi strong { font-size: 26px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.pilot-kpi small { color: var(--muted); line-height: 1.35; }
+
+.pilot-charts-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pilot-chart { min-height: 260px; }
+
+.pilot-bars {
+  display: flex;
+  height: 165px;
+  align-items: end;
+  gap: 6px;
+  padding-top: 10px;
+}
+
+.pilot-bar-item {
+  display: grid;
+  height: 100%;
+  min-width: 16px;
+  flex: 1 1 0;
+  align-items: end;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: center;
+}
+
+.pilot-bar {
+  display: block;
+  min-height: 4px;
+  border-radius: 4px 4px 0 0;
+  background: var(--brand);
+}
+
+.funnel-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 70px minmax(160px, 2fr) 58px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.funnel-row:last-child { border-bottom: 0; }
+.funnel-row strong { text-align: right; font-variant-numeric: tabular-nums; }
+.funnel-row small { color: var(--muted); text-align: right; }
+
+.funnel-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e7e9ed;
+}
+
+.funnel-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brand);
+}
+
 /* Admin delete tab */
 .destructive-hero {
   border-left: 3px solid var(--critical);
@@ -465,6 +564,8 @@ footer { display: flex; justify-content: space-between; gap: 20px; padding: 10px
   .update-meta { grid-row: 2; }
   .status-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .systems-grid, .business-grid, .processes-grid, .lower-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pilot-kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .pilot-charts-grid { grid-template-columns: 1fr; }
   .report-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .report-detail-grid { grid-template-columns: 1fr; }
 }
@@ -487,7 +588,12 @@ footer { display: flex; justify-content: space-between; gap: 20px; padding: 10px
   .applications-hero h2 { font-size: 19px; }
   .primary-button { width: 100%; }
   .danger-button { width: 100%; }
+  .segmented-control { width: 100%; }
+  .segment { flex: 1 1 0; padding-inline: 6px; }
   .report-meta { display: grid; }
+  .pilot-kpi-grid { grid-template-columns: 1fr; }
+  .funnel-row { grid-template-columns: 1fr 58px; }
+  .funnel-track { grid-column: 1 / -1; }
   .report-summary-grid { grid-template-columns: 1fr; }
   .section-heading { display: block; }
   .section-heading span { display: block; margin-top: 3px; }

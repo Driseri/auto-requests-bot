@@ -17,6 +17,9 @@
           <button class="rail-item is-active" type="button" aria-current="page" aria-label="Мониторинг" data-tab="monitoring" data-tooltip="Мониторинг">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg>
           </button>
+          <button class="rail-item" type="button" aria-label="Пилот" data-tab="pilot" data-tooltip="Пилот">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15v-4M12 15V8M16 15v-7"/><path d="M7 5h10l-2 3 2 3H7z"/></svg>
+          </button>
           <button class="rail-item" type="button" aria-label="Заявки" data-tab="applications" data-tooltip="Заявки">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h12a2 2 0 0 1 2 2v16H4V5a2 2 0 0 1 2-2Z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
           </button>
@@ -113,6 +116,53 @@
             <section class="grid lower-grid" aria-label="Последние проблемы">
               <article class="card table-card" id="card-errors"></article>
               <article class="card" id="card-notification"></article>
+            </section>
+          </section>
+
+          <section id="view-pilot" class="tab-view" data-view="pilot">
+            <section class="applications-hero pilot-hero">
+              <div>
+                <h2>Метрики пилота</h2>
+                <p>Продуктовые и операционные метрики за период. Данные берутся из локального snapshot, без дополнительных SSH-запросов при переключении периода.</p>
+              </div>
+              <div class="segmented-control" aria-label="Период пилотных метрик">
+                <button class="segment is-active" type="button" data-pilot-period="7d">7 дней</button>
+                <button class="segment" type="button" data-pilot-period="14d">14 дней</button>
+                <button class="segment" type="button" data-pilot-period="30d">30 дней</button>
+              </div>
+            </section>
+
+            <section id="pilot-quality" class="empty-state hidden">
+              <h2>Часть метрик пока недоступна</h2>
+              <p id="pilot-quality-text">-</p>
+            </section>
+
+            <section class="grid pilot-kpi-grid" aria-label="KPI пилота">
+              <article class="card pilot-kpi" id="pilot-kpi-total"></article>
+              <article class="card pilot-kpi" id="pilot-kpi-users"></article>
+              <article class="card pilot-kpi" id="pilot-kpi-creation"></article>
+              <article class="card pilot-kpi" id="pilot-kpi-editor"></article>
+              <article class="card pilot-kpi" id="pilot-kpi-cycle"></article>
+              <article class="card pilot-kpi" id="pilot-kpi-quality"></article>
+            </section>
+
+            <section class="dashboard-section">
+              <div class="section-heading"><h2>Динамика по дням</h2><span>Объем, активность и задержки</span></div>
+              <div class="grid pilot-charts-grid">
+                <article class="card pilot-chart" id="pilot-chart-applications"></article>
+                <article class="card pilot-chart" id="pilot-chart-creation"></article>
+                <article class="card pilot-chart" id="pilot-chart-cycle"></article>
+              </div>
+            </section>
+
+            <section class="dashboard-section">
+              <div class="section-heading"><h2>Воронка заявки</h2><span>Где теряется скорость процесса</span></div>
+              <article class="card pilot-funnel-card" id="pilot-funnel"></article>
+            </section>
+
+            <section class="dashboard-section">
+              <div class="section-heading"><h2>Проблемные заявки</h2><span>Операционный контроль пилота</span></div>
+              <article class="card table-card" id="pilot-problems"></article>
             </section>
           </section>
 

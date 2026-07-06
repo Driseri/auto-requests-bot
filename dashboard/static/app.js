@@ -20,6 +20,20 @@ const icons = {
 
 let activeTab = "monitoring";
 let lastDeletePreview = null;
+let currentSnapshot = null;
+let activePilotPeriod = "7d";
+
+const VALID_MONITORING_STATUSES = new Set([
+  "Новая",
+  "В работе",
+  "Нужны пояснения",
+  "Итоговый ответ готов",
+  "Принята",
+  "Принято",
+  "Отклонена",
+  "Отложена",
+  "Удаление",
+]);
 
 const qs = (selector) => document.querySelector(selector);
 const qsa = (selector) => [...document.querySelectorAll(selector)];
@@ -124,18 +138,21 @@ function switchTab(tab) {
   });
   const titles = {
     monitoring: ["Мониторинг", "Alfa Auto Requests Bot"],
+    pilot: ["Пилот", "Метрики пользы и скорости процесса"],
     applications: ["Заявки", "Проблемные и зависшие заявки"],
     delete: ["Удаление", "Админское удаление SQLite-записей"],
   };
   qs("#page-title").textContent = titles[tab]?.[0] || "Мониторинг";
   qs("#page-subtitle").textContent = titles[tab]?.[1] || "Alfa Auto Requests Bot";
   qs("#refresh-button").classList.toggle("hidden", tab !== "monitoring");
+  if (tab === "pilot" && currentSnapshot) renderPilot(currentSnapshot);
   if (tab === "applications") loadApplicationReportLatest().catch(() => {});
 }
 
 function initialTabFromHash() {
   // Deep links keep the static app simple while allowing direct navigation to tabs.
   if (window.location.hash === "#applications") return "applications";
+  if (window.location.hash === "#pilot") return "pilot";
   if (window.location.hash === "#delete") return "delete";
   return "monitoring";
 }
@@ -312,6 +329,99 @@ function renderDirections(snapshot) {
   `;
 }
 
+function durationMetric(stats) {
+  const median = stats?.median_seconds;
+  const average = stats?.average_seconds;
+  const sample = stats?.sample_size || 0;
+  if (median === null || median === undefined) return { main: "нет данных", detail: "нет событий", css: "muted" };
+  return { main: age(median), detail: `среднее ${age(average)}, n=${sample}`, css: "" };
+}
+
+function renderPilotKpiCard(target, title, valueText, detailText, css = "") {
+  qs(target).innerHTML = `
+    <span>${esc(title)}</span>
+    <strong class="${css}">${esc(valueText)}</strong>
+    <small>${esc(detailText || "")}</small>
+  `;
+}
+
+function renderPilotChart(target, title, rows, valueKey, formatter = number) {
+  const values = (rows || []).map((item) => Number(item[valueKey] || 0));
+  const max = Math.max(1, ...values);
+  const bars = (rows || []).map((item) => {
+    const raw = Number(item[valueKey] || 0);
+    const height = Math.max(4, Math.round((raw / max) * 100));
+    const label = String(item.date || "").slice(5);
+    return `
+      <div class="pilot-bar-item" title="${esc(item.date)}: ${esc(formatter(raw))}">
+        <span class="pilot-bar" style="height:${height}%"></span>
+        <small>${esc(label)}</small>
+      </div>
+    `;
+  }).join("");
+  qs(target).innerHTML = `
+    ${cardHeader("", title, "pulse")}
+    <div class="pilot-bars">${bars || '<div class="muted">Нет данных за период</div>'}</div>
+  `;
+}
+
+function renderPilotFunnel(period) {
+  const rows = period?.funnel || [];
+  const max = Math.max(1, ...rows.map((item) => Number(item.count || 0)));
+  const html = rows.map((item) => `
+    <div class="funnel-row">
+      <span>${esc(item.label)}</span>
+      <strong>${esc(number(item.count))}</strong>
+      <div class="funnel-track"><span style="width:${Math.round((Number(item.count || 0) / max) * 100)}%"></span></div>
+      <small>${item.conversion_percent === null || item.conversion_percent === undefined ? "-" : `${esc(item.conversion_percent)}%`}</small>
+    </div>
+  `).join("");
+  qs("#pilot-funnel").innerHTML = html || '<div class="muted">Нет данных для воронки</div>';
+}
+
+function renderPilotProblems(period) {
+  renderTable("#pilot-problems", "Проблемные заявки", period?.problem_rows || [], [
+    ["ID", (item) => esc(item.application_id || "-")],
+    ["Проблема", (item) => esc(item.problem || "-")],
+    ["Статус", (item) => esc(item.status || "-")],
+    ["Направление", (item) => esc(item.direction || "-")],
+    ["User ID", (item) => esc(item.telegram_user_id || "-")],
+    ["Лист", (item) => esc(item.sheet_name || "-")],
+    ["Строка", (item) => esc(item.row_number || "-")],
+    ["Возраст", (item) => esc(age(item.age_seconds))],
+    ["Обновлено", (item) => esc(dateTime(item.updated_at))],
+  ], "Проблемных заявок за выбранный период нет.");
+}
+
+function renderPilot(snapshot) {
+  const pilot = snapshot.pilot || {};
+  const periodKey = activePilotPeriod || pilot.default_period || "7d";
+  const period = pilot.periods?.[periodKey] || { kpi: {}, daily: [], funnel: [], problem_rows: [] };
+  const kpi = period.kpi || {};
+  const quality = pilot.data_quality || {};
+  qsa("[data-pilot-period]").forEach((button) => button.classList.toggle("is-active", button.dataset.pilotPeriod === periodKey));
+
+  const qualityMissing = quality.status === "missing_events";
+  qs("#pilot-quality").classList.toggle("hidden", !qualityMissing);
+  qs("#pilot-quality-text").textContent = (quality.notes || []).join(" ") || "Событий пока нет, временные метрики появятся после накопления application_events.";
+
+  const creation = durationMetric(kpi.creation_time_seconds);
+  const editor = durationMetric(kpi.first_editor_action_seconds);
+  const cycle = durationMetric(kpi.full_cycle_seconds);
+  renderPilotKpiCard("#pilot-kpi-total", "Всего заявок", number(kpi.total_applications), `за ${period.days || periodKey} дней`);
+  renderPilotKpiCard("#pilot-kpi-users", "Активные пользователи", number(kpi.active_users), "создали хотя бы одну заявку");
+  renderPilotKpiCard("#pilot-kpi-creation", "Создание заявки", creation.main, creation.detail, creation.css);
+  renderPilotKpiCard("#pilot-kpi-editor", "До действия редактора", editor.main, editor.detail, editor.css);
+  renderPilotKpiCard("#pilot-kpi-cycle", "Полный цикл", cycle.main, cycle.detail, cycle.css);
+  renderPilotKpiCard("#pilot-kpi-quality", "Пояснения / ошибки", `${number(kpi.clarification_share_percent)}%`, `not_found ${number(kpi.not_found_or_tracking_errors)}, уведомления ${number(kpi.notification_errors)}`, kpi.not_found_or_tracking_errors ? "warn" : "");
+
+  renderPilotChart("#pilot-chart-applications", "Заявки по дням", period.daily || [], "applications", number);
+  renderPilotChart("#pilot-chart-creation", "Медиана создания", period.daily || [], "creation_time_median_seconds", age);
+  renderPilotChart("#pilot-chart-cycle", "Медиана полного цикла", period.daily || [], "full_cycle_median_seconds", age);
+  renderPilotFunnel(period);
+  renderPilotProblems(period);
+}
+
 function renderGiga(snapshot) {
   const event = snapshot.log_events?.gigachat_failed;
   qs("#card-gigachat").innerHTML = `
@@ -340,7 +450,20 @@ function renderDashboardOutbox(snapshot) {
 
 function renderApplications(snapshot) {
   const app = snapshot.applications || {};
-  const statusRows = (app.by_status || []).slice(0, 5).map((item) => row(item.status || "-", esc(number(item.count)))).join("");
+  const grouped = new Map();
+  let invalid = 0;
+  (app.by_status || []).forEach((item) => {
+    const status = String(item.status || "").trim();
+    const count = Number(item.count || 0);
+    if (VALID_MONITORING_STATUSES.has(status)) grouped.set(status, (grouped.get(status) || 0) + count);
+    else invalid += count;
+  });
+  if (invalid) grouped.set("Некорректные статусы/интенты", invalid);
+  const statusRows = [...grouped.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([status, count]) => row(status, esc(number(count)), status === "Некорректные статусы/интенты" ? "warn" : ""))
+    .join("");
   qs("#card-applications").innerHTML = `
     ${cardHeader("", "Заявки", "queue")}
     <div class="metric-row">
@@ -416,6 +539,7 @@ function renderNotification(snapshot) {
 }
 
 function render(snapshot) {
+  currentSnapshot = snapshot;
   qs("#empty-state").classList.add("hidden");
   renderTop(snapshot);
   renderSummary(snapshot);
@@ -435,6 +559,7 @@ function render(snapshot) {
   renderUrgent(snapshot);
   renderErrors(snapshot);
   renderNotification(snapshot);
+  if (activeTab === "pilot") renderPilot(snapshot);
 }
 
 function applicationColumns() {
@@ -676,6 +801,12 @@ qsa(".rail-item[data-tab]").forEach((button) => {
   button.addEventListener("click", () => {
     window.location.hash = button.dataset.tab;
     switchTab(button.dataset.tab);
+  });
+});
+qsa("[data-pilot-period]").forEach((button) => {
+  button.addEventListener("click", () => {
+    activePilotPeriod = button.dataset.pilotPeriod || "7d";
+    if (currentSnapshot) renderPilot(currentSnapshot);
   });
 });
 qs("#refresh-button").addEventListener("click", collect);
