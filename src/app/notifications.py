@@ -1259,6 +1259,7 @@ class StatusNotificationService:
                             stable_updates=notification.stable_tracking_updates,
                         )
                     ],
+                    application_events=self._application_events(notification),
                     dashboard_projections=(
                         []
                         if should_notify_user
@@ -1306,6 +1307,11 @@ class StatusNotificationService:
                     )
                     for item in non_notified_updates
                 ],
+                application_events=[
+                    event
+                    for item in non_notified_updates
+                    for event in self._application_events(item)
+                ],
                 dashboard_projections=self._tracking_dashboard_projections(
                     non_notified_updates,
                     scan_batches,
@@ -1336,6 +1342,11 @@ class StatusNotificationService:
                         stable_updates=item.stable_tracking_updates,
                     )
                     for item in notifications
+                ],
+                application_events=[
+                    event
+                    for item in notifications
+                    for event in self._application_events(item)
                 ],
                 dashboard_projections=self._tracking_dashboard_projections(
                     notifications,
@@ -2048,6 +2059,68 @@ class StatusNotificationService:
             ),
             "change_type": current.change_type or tracked.change_type,
         }
+
+    @staticmethod
+    def _application_events(notification: StatusNotification) -> list[dict[str, Any]]:
+        tracked = notification.tracked
+        current = notification.current
+        metadata = {
+            "spreadsheet_id": current.spreadsheet_id or tracked.spreadsheet_id,
+            "sheet_id": (
+                current.sheet_id
+                if current.sheet_id is not None
+                else tracked.sheet_id
+            ),
+            "sheet_name": current.sheet_name or tracked.sheet_name,
+            "row_number": current.row_number,
+            "direction": current.direction or tracked.direction,
+            "answer_type": current.answer_type or tracked.answer_type,
+            "change_type": current.change_type or tracked.change_type,
+            "batch_id": current.batch_id or tracked.batch_id,
+        }
+        base = {
+            "application_id": tracked.application_id,
+            "telegram_user_id": tracked.telegram_user_id,
+            "metadata": metadata,
+        }
+        events: list[dict[str, Any]] = []
+        if notification.status_changed:
+            events.append(
+                {
+                    **base,
+                    "event_type": "status_changed",
+                    "old_value": tracked.last_known_status,
+                    "new_value": current.status,
+                }
+            )
+        if notification.editor_changed:
+            events.append(
+                {
+                    **base,
+                    "event_type": "editor_changed",
+                    "old_value": tracked.last_seen_editor,
+                    "new_value": current.editor,
+                }
+            )
+        if notification.editor_comment_ready:
+            events.append(
+                {
+                    **base,
+                    "event_type": "editor_comment_added",
+                    "old_value": tracked.last_seen_editor_comment,
+                    "new_value": current.editor_comment,
+                }
+            )
+        if notification.final_answer_changed:
+            events.append(
+                {
+                    **base,
+                    "event_type": "final_answer_added",
+                    "old_value": tracked.last_seen_final_answer,
+                    "new_value": current.final_answer,
+                }
+            )
+        return events
 
     @staticmethod
     def _notification_snapshot(notification: StatusNotification) -> dict[str, Any]:

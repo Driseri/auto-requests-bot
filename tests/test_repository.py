@@ -54,6 +54,340 @@ async def test_sqlite_state_persists_between_repository_instances(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_application_events_schema_and_indexes_are_created(tmp_path):
+    db_path = str(tmp_path / "events_schema.db")
+    repository = DraftRepository(db_path)
+    await repository.init()
+
+    async with aiosqlite.connect(db_path) as db:
+        table_rows = await (
+            await db.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'application_events'
+                """
+            )
+        ).fetchall()
+        index_rows = await (
+            await db.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'index' AND tbl_name = 'application_events'
+                """
+            )
+        ).fetchall()
+
+    assert table_rows == [("application_events",)]
+    assert {
+        "idx_application_events_application",
+        "idx_application_events_type_time",
+        "idx_application_events_user_time",
+    } <= {row[0] for row in index_rows}
+
+
+@pytest.mark.asyncio
+async def test_record_application_event_stores_fields_without_application_id(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_record.db"))
+    await repository.init()
+
+    await repository.record_application_event(
+        event_type="draft_started",
+        telegram_user_id=100,
+        event_at="2026-07-06T10:00:00+00:00",
+        old_value="old",
+        new_value="new",
+        metadata={"ключ": "значение", "count": 2},
+    )
+
+    events = await repository.list_application_events(event_type="draft_started")
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.application_id is None
+    assert event.telegram_user_id == 100
+    assert event.event_type == "draft_started"
+    assert event.event_at == "2026-07-06T10:00:00+00:00"
+    assert event.old_value == "old"
+    assert event.new_value == "new"
+    assert event.metadata_json is not None
+    assert "\\u" not in event.metadata_json
+    assert json.loads(event.metadata_json) == {"ключ": "значение", "count": 2}
+    assert event.created_at
+
+
+@pytest.mark.asyncio
+async def test_list_application_events_filters_limits_and_sorts(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_list.db"))
+    await repository.init()
+
+    await repository.record_application_event(
+        application_id="APP-1",
+        telegram_user_id=100,
+        event_type="status_changed",
+        event_at="2026-07-06T10:00:00+00:00",
+        new_value="first",
+    )
+    await repository.record_application_event(
+        application_id="APP-2",
+        telegram_user_id=101,
+        event_type="status_changed",
+        event_at="2026-07-06T11:00:00+00:00",
+        new_value="other-application",
+    )
+    await repository.record_application_event(
+        application_id="APP-1",
+        telegram_user_id=100,
+        event_type="final_answer_added",
+        event_at="2026-07-06T12:00:00+00:00",
+        new_value="other-type",
+    )
+    await repository.record_application_event(
+        application_id="APP-1",
+        telegram_user_id=100,
+        event_type="status_changed",
+        event_at="2026-07-06T13:00:00+00:00",
+        new_value="latest",
+    )
+    await repository.record_application_event(
+        application_id="APP-1",
+        telegram_user_id=100,
+        event_type="status_changed",
+        event_at="2026-07-06T13:00:00+00:00",
+        new_value="latest-by-id",
+    )
+
+    by_application = await repository.list_application_events(application_id="APP-1")
+    by_type = await repository.list_application_events(event_type="final_answer_added")
+    limited = await repository.list_application_events(
+        application_id="APP-1",
+        event_type="status_changed",
+        limit=2,
+    )
+
+    assert {event.application_id for event in by_application} == {"APP-1"}
+    assert [event.event_type for event in by_type] == ["final_answer_added"]
+    assert [event.new_value for event in limited] == ["latest-by-id", "latest"]
+
+
+@pytest.mark.asyncio
+async def test_complete_submission_records_application_submitted_event(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_submission.db"))
+    await repository.init()
+    draft = await repository.get_or_create(100)
+
+    await repository.complete_submission(
+        100,
+        application_id=draft.application_id or "APP-SUBMITTED",
+        spreadsheet_id="spreadsheet",
+        sheet_id=0,
+        sheet_name="01.07",
+        row_number=5,
+        last_known_status=ApplicationStatus.NEW.value,
+        direction="FL",
+        answer_type="regular",
+        application_type="single",
+        change_type="ADD",
+        is_urgent=False,
+        submitted_at="2026-07-06T12:00:00+00:00",
+    )
+
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="application_submitted",
+    )
+
+    assert len(events) == 1
+    assert events[0].telegram_user_id == 100
+    assert events[0].event_at == "2026-07-06T12:00:00+00:00"
+    metadata = json.loads(events[0].metadata_json or "{}")
+    assert metadata["sheet_id"] == 0
+    assert metadata["row_number"] == 5
+    assert metadata["direction"] == "FL"
+
+
+@pytest.mark.asyncio
+async def test_index_submitted_application_records_application_indexed_event(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_indexed.db"))
+    await repository.init()
+
+    await repository.index_submitted_application(
+        application_id="APP-INDEXED",
+        telegram_user_id=100,
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="01.07",
+        last_known_status=ApplicationStatus.NEW.value,
+        direction="FL",
+        answer_type="regular",
+        application_type="single",
+        change_type="EDIT",
+        is_urgent=True,
+        last_seen_row_number=9,
+        submitted_at="2026-07-06T12:30:00+00:00",
+    )
+
+    events = await repository.list_application_events(
+        application_id="APP-INDEXED",
+        event_type="application_indexed",
+    )
+
+    assert len(events) == 1
+    assert events[0].event_at == "2026-07-06T12:30:00+00:00"
+    metadata = json.loads(events[0].metadata_json or "{}")
+    assert metadata["row_number"] == 9
+    assert metadata["change_type"] == "EDIT"
+    assert metadata["is_urgent"] is True
+
+
+@pytest.mark.asyncio
+async def test_not_found_and_deletion_paths_record_application_events(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_problems.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="APP-PROBLEM",
+        telegram_user_id=100,
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="01.07",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=10,
+    )
+
+    await repository.mark_submitted_application_not_found(
+        "APP-PROBLEM",
+        threshold=2,
+        recheck_seconds=3600,
+    )
+    await repository.record_application_deletion_error(
+        "APP-PROBLEM",
+        "section lock is busy",
+    )
+    await repository.complete_application_deletion(
+        application_id="APP-PROBLEM",
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        deleted_row_number=10,
+    )
+
+    events = await repository.list_application_events(application_id="APP-PROBLEM")
+    event_by_type = {event.event_type: event for event in events}
+
+    assert event_by_type["application_not_found"].new_value == "1"
+    not_found_metadata = json.loads(
+        event_by_type["application_not_found"].metadata_json or "{}"
+    )
+    assert not_found_metadata["threshold"] == 2
+    assert not_found_metadata["polling_state"] == "ACTIVE"
+    assert event_by_type["application_deletion_error"].new_value == "section lock is busy"
+    deletion_metadata = json.loads(
+        event_by_type["application_deleted"].metadata_json or "{}"
+    )
+    assert deletion_metadata["deleted_row_number"] == 10
+    assert await repository.get_submitted_application("APP-PROBLEM") is None
+
+
+@pytest.mark.asyncio
+async def test_notification_event_records_application_events_atomically(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_notification.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="APP-NOTIFY",
+        telegram_user_id=100,
+        sheet_name="01.07",
+        last_known_status=ApplicationStatus.NEW.value,
+    )
+    update = {
+        "application_id": "APP-NOTIFY",
+        "spreadsheet_id": "spreadsheet",
+        "sheet_id": 123,
+        "sheet_name": "01.07",
+        "last_known_status": ApplicationStatus.ACCEPTED.value,
+        "last_seen_row_number": 11,
+    }
+    event = {
+        "event_type": "status_changed",
+        "application_id": "APP-NOTIFY",
+        "telegram_user_id": 100,
+        "old_value": ApplicationStatus.NEW.value,
+        "new_value": ApplicationStatus.ACCEPTED.value,
+    }
+
+    inserted = await repository.enqueue_notification_event(
+        telegram_user_id=100,
+        event_type="application-status",
+        dedupe_key="application-status:APP-NOTIFY",
+        snapshot_json="{}",
+        chunks=["status"],
+        application_updates=[update],
+        application_events=[event],
+    )
+    duplicated = await repository.enqueue_notification_event(
+        telegram_user_id=100,
+        event_type="application-status",
+        dedupe_key="application-status:APP-NOTIFY",
+        snapshot_json="{}",
+        chunks=["status"],
+        application_updates=[update],
+        application_events=[event],
+    )
+
+    events = await repository.list_application_events(application_id="APP-NOTIFY")
+    tracked = await repository.get_submitted_application("APP-NOTIFY")
+
+    assert inserted is True
+    assert duplicated is False
+    assert len(events) == 1
+    assert events[0].event_type == "status_changed"
+    assert tracked is not None
+    assert tracked.last_known_status == ApplicationStatus.ACCEPTED.value
+
+
+@pytest.mark.asyncio
+async def test_update_application_tracking_batch_records_application_events(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_tracking_batch.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="APP-BATCH-EVENT",
+        telegram_user_id=100,
+        sheet_name="01.07",
+        last_known_status=ApplicationStatus.NEW.value,
+    )
+
+    await repository.update_application_tracking_batch(
+        [
+            {
+                "application_id": "APP-BATCH-EVENT",
+                "spreadsheet_id": "spreadsheet",
+                "sheet_id": 123,
+                "sheet_name": "01.07",
+                "last_known_status": ApplicationStatus.ACCEPTED.value,
+                "last_seen_row_number": 11,
+            }
+        ],
+        application_events=[
+            {
+                "event_type": "status_changed",
+                "application_id": "APP-BATCH-EVENT",
+                "telegram_user_id": 100,
+                "old_value": ApplicationStatus.NEW.value,
+                "new_value": ApplicationStatus.ACCEPTED.value,
+            }
+        ],
+    )
+
+    events = await repository.list_application_events(
+        application_id="APP-BATCH-EVENT",
+        event_type="status_changed",
+    )
+
+    assert len(events) == 1
+    assert events[0].old_value == ApplicationStatus.NEW.value
+    assert events[0].new_value == ApplicationStatus.ACCEPTED.value
+
+
+@pytest.mark.asyncio
 async def test_bulk_reservation_migration_and_row_shift(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk_reservations.db"))
     await repository.init()

@@ -1297,6 +1297,178 @@ async def test_notification_service_updates_non_important_status_without_message
 
 
 @pytest.mark.asyncio
+async def test_notification_service_records_status_changed_event(tmp_path):
+    repository = DraftRepository(str(tmp_path / "status_event.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=0,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=5,
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "A1B2C3D4": SheetApplicationStatus(
+                    application_id="A1B2C3D4",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name=WEEK_SHEET,
+                    sheet_id=0,
+                    row_number=5,
+                    status=ApplicationStatus.IN_PROGRESS.value,
+                    editor_comment="",
+                    final_answer="",
+                )
+            }
+        ),
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+    events = await repository.list_application_events(
+        application_id="A1B2C3D4",
+        event_type="status_changed",
+    )
+
+    assert len(events) == 1
+    assert events[0].old_value == ApplicationStatus.NEW.value
+    assert events[0].new_value == ApplicationStatus.IN_PROGRESS.value
+    metadata = json.loads(events[0].metadata_json or "{}")
+    assert metadata["sheet_id"] == 0
+    assert metadata["row_number"] == 5
+
+
+@pytest.mark.asyncio
+async def test_notification_service_records_stable_editor_comment_event(tmp_path):
+    repository = DraftRepository(str(tmp_path / "comment_event.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+        last_seen_row_number=5,
+    )
+    status = SheetApplicationStatus(
+        application_id="A1B2C3D4",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name=WEEK_SHEET,
+        sheet_id=100,
+        row_number=5,
+        status=ApplicationStatus.NEEDS_CLARIFICATION.value,
+        editor_comment="Уточните деталь",
+        final_answer="",
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({"A1B2C3D4": status}),
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+    await service.run_once()
+    await service.run_once()
+    events = await repository.list_application_events(
+        application_id="A1B2C3D4",
+        event_type="editor_comment_added",
+    )
+
+    assert len(events) == 1
+    assert events[0].old_value is None
+    assert events[0].new_value == "Уточните деталь"
+
+
+@pytest.mark.asyncio
+async def test_notification_service_records_final_answer_event(tmp_path):
+    repository = DraftRepository(str(tmp_path / "final_answer_event.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
+        last_seen_row_number=5,
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "A1B2C3D4": SheetApplicationStatus(
+                    application_id="A1B2C3D4",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name=WEEK_SHEET,
+                    sheet_id=100,
+                    row_number=5,
+                    status=ApplicationStatus.FINAL_ANSWER_READY.value,
+                    editor_comment="",
+                    final_answer="Готовый ответ",
+                )
+            }
+        ),
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+    events = await repository.list_application_events(application_id="A1B2C3D4")
+    event_types = {event.event_type for event in events}
+    final_answer = [
+        event for event in events if event.event_type == "final_answer_added"
+    ][0]
+
+    assert "status_changed" in event_types
+    assert "final_answer_added" in event_types
+    assert final_answer.old_value is None
+    assert final_answer.new_value == "Готовый ответ"
+
+
+@pytest.mark.asyncio
+async def test_notification_service_does_not_record_events_without_changes(tmp_path):
+    repository = DraftRepository(str(tmp_path / "no_change_event.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=5,
+        last_seen_editor="редактор 1",
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "A1B2C3D4": SheetApplicationStatus(
+                    application_id="A1B2C3D4",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name=WEEK_SHEET,
+                    sheet_id=100,
+                    row_number=5,
+                    status=ApplicationStatus.NEW.value,
+                    editor="редактор 1",
+                    editor_comment="",
+                    final_answer="",
+                )
+            }
+        ),
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+
+    assert await repository.list_application_events(application_id="A1B2C3D4") == []
+
+
+@pytest.mark.asyncio
 async def test_notification_service_defers_repeatedly_missing_tracking(tmp_path):
     repository = DraftRepository(str(tmp_path / "missing_tracking.db"))
     await repository.init()

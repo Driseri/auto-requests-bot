@@ -410,6 +410,19 @@ class SubmittedApplication:
     updated_at: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ApplicationEvent:
+    id: int
+    application_id: str | None
+    telegram_user_id: int | None
+    event_type: str
+    event_at: str
+    old_value: str | None
+    new_value: str | None
+    metadata_json: str | None
+    created_at: str
+
+
 @dataclass(slots=True)
 class BulkBatch:
     batch_id: str

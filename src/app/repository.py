@@ -9,6 +9,7 @@ from typing import Any, AsyncIterator
 import aiosqlite
 
 from app.models import (
+    ApplicationEvent,
     BulkCreationRequest,
     BulkCreationState,
     BulkBatch,
@@ -336,6 +337,21 @@ class DraftRepository:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS application_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id TEXT,
+                    telegram_user_id INTEGER,
+                    event_type TEXT NOT NULL,
+                    event_at TEXT NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             await self._ensure_bulk_batches_column(db, "spreadsheet_id", "TEXT")
             await self._ensure_bulk_batches_column(db, "direction", "TEXT")
             await self._ensure_bulk_batches_column(db, "batch_status", "TEXT")
@@ -453,6 +469,24 @@ class DraftRepository:
                 """
                 CREATE INDEX IF NOT EXISTS idx_dashboard_outbox_delivery
                 ON dashboard_outbox(state, next_attempt_at, updated_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_application_events_application
+                ON application_events(application_id, event_type, event_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_application_events_type_time
+                ON application_events(event_type, event_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_application_events_user_time
+                ON application_events(telegram_user_id, event_at)
                 """
             )
             await self._migrate_llm_completeness_check(db)
@@ -747,6 +781,25 @@ class DraftRepository:
                     chunks=notification_event["chunks"],
                     now=now,
                 )
+            await self._record_application_event_in_connection(
+                db,
+                event_type="application_submitted",
+                application_id=application_id,
+                telegram_user_id=telegram_user_id,
+                event_at=submitted_at or now,
+                metadata={
+                    "spreadsheet_id": spreadsheet_id,
+                    "sheet_id": sheet_id,
+                    "sheet_name": sheet_name,
+                    "row_number": row_number,
+                    "direction": direction,
+                    "answer_type": answer_type,
+                    "application_type": application_type,
+                    "change_type": change_type,
+                    "is_urgent": is_urgent,
+                },
+                created_at=now,
+            )
             await db.commit()
         draft = await self.get_by_user_id(telegram_user_id)
         if draft is None:
@@ -832,6 +885,101 @@ class DraftRepository:
             },
         )
         return await self.get_user_settings(telegram_user_id)
+
+    async def record_application_event(
+        self,
+        *,
+        event_type: str,
+        application_id: str | None = None,
+        telegram_user_id: int | None = None,
+        event_at: str | None = None,
+        old_value: str | None = None,
+        new_value: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        async with self._connection() as db:
+            await self._record_application_event_in_connection(
+                db,
+                event_type=event_type,
+                application_id=application_id,
+                telegram_user_id=telegram_user_id,
+                event_at=event_at,
+                old_value=old_value,
+                new_value=new_value,
+                metadata=metadata,
+            )
+            await db.commit()
+
+    async def list_application_events(
+        self,
+        *,
+        application_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> list[ApplicationEvent]:
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if application_id is not None:
+            where_clauses.append("application_id = ?")
+            params.append(application_id)
+        if event_type is not None:
+            where_clauses.append("event_type = ?")
+            params.append(event_type)
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+        params.append(max(0, limit))
+
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""
+                SELECT *
+                FROM application_events
+                {where_sql}
+                ORDER BY event_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = await cursor.fetchall()
+        return [self._application_event_from_row(row) for row in rows]
+
+    @staticmethod
+    async def _record_application_event_in_connection(
+        db: aiosqlite.Connection,
+        *,
+        event_type: str,
+        application_id: str | None = None,
+        telegram_user_id: int | None = None,
+        event_at: str | None = None,
+        old_value: str | None = None,
+        new_value: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        now = created_at or utc_now_iso()
+        metadata_json = (
+            None if metadata is None else json.dumps(metadata, ensure_ascii=False)
+        )
+        await db.execute(
+            """
+            INSERT INTO application_events (
+                application_id, telegram_user_id, event_type, event_at,
+                old_value, new_value, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                application_id,
+                telegram_user_id,
+                event_type,
+                event_at or now,
+                old_value,
+                new_value,
+                metadata_json,
+                now,
+            ),
+        )
 
     async def save_submitted_application(
         self,
@@ -935,6 +1083,24 @@ class DraftRepository:
                     snapshot=dashboard_projection,
                     now=now,
                 )
+            await self._record_application_event_in_connection(
+                db,
+                event_type="application_indexed",
+                application_id=application_id,
+                telegram_user_id=telegram_user_id,
+                event_at=submitted_at or now,
+                metadata={
+                    "spreadsheet_id": spreadsheet_id,
+                    "sheet_id": sheet_id,
+                    "sheet_name": sheet_name,
+                    "row_number": last_seen_row_number,
+                    "direction": direction,
+                    "answer_type": answer_type,
+                    "change_type": change_type,
+                    "is_urgent": is_urgent,
+                },
+                created_at=now,
+            )
             await db.commit()
         submitted = await self.get_submitted_application(application_id)
         if submitted is None:
@@ -1135,7 +1301,7 @@ class DraftRepository:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
                 """
-                SELECT not_found_count
+                SELECT telegram_user_id, not_found_count
                 FROM submitted_applications
                 WHERE application_id = ?
                 """,
@@ -1174,6 +1340,25 @@ class DraftRepository:
                     now.isoformat(),
                     application_id,
                 ),
+            )
+            polling_state = (
+                StatusPollingState.NOT_FOUND.value
+                if count >= threshold
+                else StatusPollingState.ACTIVE.value
+            )
+            await self._record_application_event_in_connection(
+                db,
+                event_type="application_not_found",
+                application_id=application_id,
+                telegram_user_id=row["telegram_user_id"],
+                new_value=str(count),
+                metadata={
+                    "threshold": threshold,
+                    "recheck_seconds": recheck_seconds,
+                    "next_status_check_at": next_check_at,
+                    "polling_state": polling_state,
+                },
+                created_at=now.isoformat(),
             )
             await db.commit()
 
@@ -1824,6 +2009,7 @@ class DraftRepository:
         application_updates: list[dict[str, Any]] | None = None,
         batch_updates: list[dict[str, Any]] | None = None,
         dashboard_projections: list[dict[str, Any]] | None = None,
+        application_events: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Atomically persist an observed event and advance its tracking state."""
         now = utc_now_iso()
@@ -1844,6 +2030,12 @@ class DraftRepository:
 
             for update in application_updates or []:
                 await self._update_submitted_application_in_connection(db, update, now)
+            for event in application_events or []:
+                await self._record_application_event_in_connection(
+                    db,
+                    **event,
+                    created_at=now,
+                )
             for update in batch_updates or []:
                 await db.execute(
                     """
@@ -1921,12 +2113,19 @@ class DraftRepository:
         updates: list[dict[str, Any]],
         *,
         dashboard_projections: list[dict[str, Any]] | None = None,
+        application_events: list[dict[str, Any]] | None = None,
     ) -> None:
         now = utc_now_iso()
         async with self._connection() as db:
             await db.execute("BEGIN IMMEDIATE")
             for update in updates:
                 await self._update_submitted_application_in_connection(db, update, now)
+            for event in application_events or []:
+                await self._record_application_event_in_connection(
+                    db,
+                    **event,
+                    created_at=now,
+                )
             for projection in dashboard_projections or []:
                 await self._upsert_dashboard_projection_in_connection(
                     db,
@@ -2853,6 +3052,13 @@ class DraftRepository:
     ) -> None:
         now = utc_now_iso()
         async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT telegram_user_id FROM submitted_applications WHERE application_id = ?",
+                (application_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
             await db.execute(
                 """
                 UPDATE submitted_applications
@@ -2861,6 +3067,14 @@ class DraftRepository:
                 WHERE application_id = ?
                 """,
                 (error[:1000], now, application_id),
+            )
+            await self._record_application_event_in_connection(
+                db,
+                event_type="application_deletion_error",
+                application_id=application_id,
+                telegram_user_id=row["telegram_user_id"] if row is not None else None,
+                new_value=error[:1000],
+                created_at=now,
             )
             await db.commit()
 
@@ -2874,7 +3088,14 @@ class DraftRepository:
     ) -> dict[str, int]:
         now = utc_now_iso()
         async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT telegram_user_id FROM submitted_applications WHERE application_id = ?",
+                (application_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
             notification_deleted = await self._delete_notification_refs_in_connection(
                 db,
                 application_id,
@@ -2942,6 +3163,18 @@ class DraftRepository:
             )
             reservations_shifted = cursor.rowcount
             await cursor.close()
+            await self._record_application_event_in_connection(
+                db,
+                event_type="application_deleted",
+                application_id=application_id,
+                telegram_user_id=row["telegram_user_id"] if row is not None else None,
+                metadata={
+                    "spreadsheet_id": spreadsheet_id,
+                    "sheet_id": sheet_id,
+                    "deleted_row_number": deleted_row_number,
+                },
+                created_at=now,
+            )
             await db.commit()
         return {
             "submitted_deleted": submitted_deleted,
@@ -3124,6 +3357,20 @@ class DraftRepository:
             deletion_error=row["deletion_error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _application_event_from_row(row: aiosqlite.Row) -> ApplicationEvent:
+        return ApplicationEvent(
+            id=row["id"],
+            application_id=row["application_id"],
+            telegram_user_id=row["telegram_user_id"],
+            event_type=row["event_type"],
+            event_at=row["event_at"],
+            old_value=row["old_value"],
+            new_value=row["new_value"],
+            metadata_json=row["metadata_json"],
+            created_at=row["created_at"],
         )
 
     @staticmethod
