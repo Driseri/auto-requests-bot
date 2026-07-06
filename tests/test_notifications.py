@@ -2103,6 +2103,15 @@ async def test_urgent_scriptwriter_response_notifies_editor_chat(tmp_path):
     assert tracked is not None
     assert tracked.last_seen_scriptwriter_response == "Сценарист уточнил детали <важно>"
 
+    events = await repository.list_application_events(
+        application_id="URGRESP1",
+        event_type="scriptwriter_response_added",
+    )
+    assert len(events) == 1
+    assert events[0].telegram_user_id == 100
+    assert events[0].old_value is None
+    assert events[0].new_value == tracked.last_seen_scriptwriter_response
+
 
 @pytest.mark.asyncio
 async def test_urgent_scriptwriter_response_is_not_duplicated(tmp_path):
@@ -2152,7 +2161,12 @@ async def test_urgent_scriptwriter_response_is_not_duplicated(tmp_path):
 
     assert len(notifier.messages) == 1
     outbox = await repository.list_notification_outbox()
+    events = await repository.list_application_events(
+        application_id="URGRESP2",
+        event_type="scriptwriter_response_added",
+    )
     assert len(outbox) == 1
+    assert len(events) == 1
 
 
 @pytest.mark.asyncio
@@ -2204,6 +2218,14 @@ async def test_changed_urgent_scriptwriter_response_notifies_again(tmp_path):
     assert len(notifier.messages) == 2
     assert "Первый ответ" in notifier.messages[0]["text"]
     assert "Исправленный ответ" in notifier.messages[1]["text"]
+
+    events = await repository.list_application_events(
+        application_id="URGRESP3",
+        event_type="scriptwriter_response_added",
+    )
+    assert len(events) == 2
+    assert events[0].new_value == current.scriptwriter_response
+    assert events[1].new_value == "Первый ответ"
 
 
 @pytest.mark.asyncio

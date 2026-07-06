@@ -523,6 +523,18 @@ class DraftRepository:
                     now,
                 ),
             )
+            await self._record_application_event_in_connection(
+                db,
+                event_type="draft_started",
+                application_id=draft.application_id,
+                telegram_user_id=telegram_user_id,
+                event_at=now,
+                metadata={
+                    "current_step": Step.DIRECTION.value,
+                    "application_type": draft.application_type,
+                },
+                created_at=now,
+            )
             await db.commit()
         return draft
 

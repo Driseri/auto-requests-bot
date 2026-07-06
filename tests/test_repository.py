@@ -172,6 +172,37 @@ async def test_list_application_events_filters_limits_and_sorts(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_get_or_create_records_draft_started_once_per_new_draft(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_draft_started.db"))
+    await repository.init()
+
+    first = await repository.get_or_create(100)
+    repeated = await repository.get_or_create(100)
+    await repository.delete(100)
+    second = await repository.get_or_create(100)
+
+    events = await repository.list_application_events(
+        event_type="draft_started",
+    )
+
+    assert repeated.application_id == first.application_id
+    assert second.application_id != first.application_id
+    assert [event.application_id for event in events] == [
+        second.application_id,
+        first.application_id,
+    ]
+    assert [event.event_at for event in events] == [
+        second.created_at,
+        first.created_at,
+    ]
+    metadata = json.loads(events[0].metadata_json or "{}")
+    assert metadata == {
+        "current_step": Step.DIRECTION.value,
+        "application_type": second.application_type,
+    }
+
+
+@pytest.mark.asyncio
 async def test_complete_submission_records_application_submitted_event(tmp_path):
     repository = DraftRepository(str(tmp_path / "events_submission.db"))
     await repository.init()

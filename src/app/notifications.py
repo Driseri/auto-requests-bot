@@ -2120,6 +2120,17 @@ class StatusNotificationService:
                     "new_value": current.final_answer,
                 }
             )
+        if "last_seen_scriptwriter_response" in notification.stable_tracking_updates:
+            events.append(
+                {
+                    **base,
+                    "event_type": "scriptwriter_response_added",
+                    "old_value": tracked.last_seen_scriptwriter_response,
+                    "new_value": notification.stable_tracking_updates[
+                        "last_seen_scriptwriter_response"
+                    ],
+                }
+            )
         return events
 
     @staticmethod
