@@ -656,7 +656,7 @@ class GoogleSheetsBulkReservationService:
                         "startIndex": insert_index,
                         "endIndex": insert_index + inserted_rows,
                     },
-                    "inheritFromBefore": True,
+                    "inheritFromBefore": insert_plan.get("inherit_from_before", True),
                 }
             },
             {
@@ -2555,6 +2555,7 @@ def _daily_bulk_reservation_insert_plan(
         "prefix_requests": [],
         "group_request": group_request,
         "protected_rows": protected_rows,
+        "inherit_from_before": bool(today_rows),
     }
 
 
@@ -2645,6 +2646,7 @@ def _urgent_daily_bulk_reservation_insert_plan(
         "prefix_requests": [],
         "group_request": group_request,
         "protected_rows": protected_rows,
+        "inherit_from_before": today_row is not None,
     }
 
 

@@ -1023,6 +1023,59 @@ def test_previous_daily_group_excludes_date_separator_row():
     }
 
 
+def test_new_daily_separator_insert_does_not_inherit_previous_row_group():
+    from app.submission import _daily_insert_plan
+
+    plan = _daily_insert_plan(
+        [
+            SHEET_HEADERS,
+            ["02.07.26"],
+            ["old application"],
+        ],
+        label="07.07.26",
+        sheet_id=42,
+        section_start_row=2,
+        section_end_row=4,
+        column_count=len(SHEET_HEADERS),
+        row_data={"values": [{"userEnteredValue": {"stringValue": "new application"}}]},
+    )
+
+    insert = plan["requests"][0]["insertDimension"]
+    assert insert["inheritFromBefore"] is False
+    assert plan["group_request"] == {
+        "addDimensionGroup": {
+            "range": {
+                "sheetId": 42,
+                "dimension": "ROWS",
+                "startIndex": 2,
+                "endIndex": 3,
+            }
+        }
+    }
+
+
+def test_existing_daily_separator_insert_keeps_inheriting_same_day_formatting():
+    from app.submission import _daily_insert_plan
+
+    plan = _daily_insert_plan(
+        [
+            SHEET_HEADERS,
+            ["07.07.26"],
+            ["same day application"],
+        ],
+        label="07.07.26",
+        sheet_id=42,
+        section_start_row=2,
+        section_end_row=4,
+        column_count=len(SHEET_HEADERS),
+        row_data={"values": [{"userEnteredValue": {"stringValue": "new application"}}]},
+    )
+
+    insert = plan["requests"][0]["insertDimension"]
+    assert insert["inheritFromBefore"] is True
+    assert plan["group_request"] is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "headers",

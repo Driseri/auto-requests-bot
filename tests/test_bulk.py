@@ -20,6 +20,8 @@ from app.bulk import (
     GoogleSheetsBulkBatchService,
     GoogleSheetsBulkReservationService,
     _bulk_schema_layout,
+    _daily_bulk_reservation_insert_plan,
+    _urgent_daily_bulk_reservation_insert_plan,
 )
 from app.google_api import GoogleApiRetryConfig
 from app.models import (
@@ -57,6 +59,52 @@ def test_old_bulk_sheet_headers_remain_supported():
     assert "Причина изменений" in LEGACY_BULK_STAGING_HEADERS
     assert _bulk_schema_layout(CURRENT_BULK_STAGING_HEADERS)["schema"] == "current"
     assert _bulk_schema_layout(LEGACY_BULK_STAGING_HEADERS)["schema"] == "legacy"
+
+
+def test_new_daily_bulk_reservation_does_not_inherit_previous_row_group():
+    plan = _daily_bulk_reservation_insert_plan(
+        [
+            WORKSHEET_HEADERS,
+            ["02.07.26"],
+            ["old application"],
+        ],
+        sheet_id=42,
+        label="07.07.26",
+        section_start_row=2,
+        section_end_row=4,
+        column_count=len(WORKSHEET_HEADERS),
+        count=2,
+    )
+
+    assert plan["inherit_from_before"] is False
+    assert plan["group_request"] == {
+        "addDimensionGroup": {
+            "range": {
+                "sheetId": 42,
+                "dimension": "ROWS",
+                "startIndex": 2,
+                "endIndex": 3,
+            }
+        }
+    }
+
+
+def test_existing_daily_bulk_reservation_keeps_inheriting_same_day_formatting():
+    plan = _urgent_daily_bulk_reservation_insert_plan(
+        [
+            WORKSHEET_HEADERS,
+            ["07.07.26"],
+            ["same day application"],
+        ],
+        sheet_id=42,
+        label="07.07.26",
+        change_type=ChangeType.ADD,
+        column_count=len(WORKSHEET_HEADERS),
+        count=2,
+    )
+
+    assert plan["inherit_from_before"] is True
+    assert plan["group_request"] is None
 
 
 FL_SPREADSHEET = "fl-spreadsheet"

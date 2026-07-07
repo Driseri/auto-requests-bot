@@ -1046,7 +1046,7 @@ class GoogleSheetsSubmissionService:
                         "startIndex": insert_row - 1,
                         "endIndex": insert_row,
                     },
-                    "inheritFromBefore": True,
+                    "inheritFromBefore": False,
                 }
             },
             {
@@ -3110,6 +3110,7 @@ def _daily_insert_plan(
             sheet_id=sheet_id,
         )
 
+    inherit_from_before = bool(today_rows)
     insert_index = insert_row - 1
     shift_from_row = insert_row if insert_row <= len(rows) else None
     requests.extend(
@@ -3122,7 +3123,7 @@ def _daily_insert_plan(
                         "startIndex": insert_index,
                         "endIndex": insert_index + inserted_rows,
                     },
-                    "inheritFromBefore": True,
+                    "inheritFromBefore": inherit_from_before,
                 }
             },
             {
@@ -3235,6 +3236,7 @@ def _urgent_daily_insert_plan(
         update_rows = [row_data]
         protected_rows = []
 
+    inherit_from_before = today_row is not None
     insert_index = insert_row - 1
     column_count = max(len(item.get("values", [])) for item in update_rows)
     requests.extend(
@@ -3247,7 +3249,7 @@ def _urgent_daily_insert_plan(
                         "startIndex": insert_index,
                         "endIndex": insert_index + inserted_rows,
                     },
-                    "inheritFromBefore": True,
+                    "inheritFromBefore": inherit_from_before,
                 }
             },
             {
