@@ -1465,7 +1465,8 @@ async def test_notification_service_does_not_record_events_without_changes(tmp_p
 
     await service.run_once()
 
-    assert await repository.list_application_events(application_id="A1B2C3D4") == []
+    events = await repository.list_application_events(application_id="A1B2C3D4")
+    assert [event.event_type for event in events] == ["application_indexed"]
 
 
 @pytest.mark.asyncio

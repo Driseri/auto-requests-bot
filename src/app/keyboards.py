@@ -5,6 +5,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.models import (
     AnswerType,
     ChangeType,
+    ChipAfterTextAction,
     Direction,
     FieldName,
     KeyboardKind,
@@ -58,6 +59,10 @@ class CallbackData:
     @staticmethod
     def change_type(value: str) -> str:
         return f"app:change_type:{value}"
+
+    @staticmethod
+    def chip_after_text_action(value: str) -> str:
+        return f"app:chip_after_action:{value}"
 
     @staticmethod
     def bulk_ready(batch_id: str) -> str:
@@ -169,6 +174,22 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                     [InlineKeyboardButton(text="Отменить", callback_data=CallbackData.CANCEL)],
                 ]
             )
+        case KeyboardKind.CHIP_AFTER_TEXT_ACTION:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=action.label,
+                            callback_data=CallbackData.chip_after_text_action(action.value),
+                        )
+                    ]
+                    for action in ChipAfterTextAction
+                ]
+                + [
+                    [InlineKeyboardButton(text="Назад", callback_data=CallbackData.BACK)],
+                    [InlineKeyboardButton(text="Отменить", callback_data=CallbackData.CANCEL)],
+                ]
+            )
         case KeyboardKind.STEP:
             return InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -267,6 +288,22 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                         InlineKeyboardButton(
                             text="Текст чипса",
                             callback_data=CallbackData.edit_field(FieldName.CHIP_TEXT),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Действие с текстом после чипса",
+                            callback_data=CallbackData.edit_field(
+                                FieldName.CHIP_AFTER_TEXT_ACTION
+                            ),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Суть изменений текста после чипса",
+                            callback_data=CallbackData.edit_field(
+                                FieldName.CHANGE_DESCRIPTION
+                            ),
                         )
                     ],
                     [

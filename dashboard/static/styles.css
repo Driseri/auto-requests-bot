@@ -373,7 +373,7 @@ a:hover { color: var(--brand-dark); text-decoration: underline; }
 .segment.is-active { color: #fff; background: var(--brand); }
 
 .pilot-kpi-grid {
-  grid-template-columns: repeat(6, minmax(150px, 1fr));
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
   margin-bottom: 24px;
 }
 
@@ -416,6 +416,42 @@ a:hover { color: var(--brand-dark); text-decoration: underline; }
   min-height: 4px;
   border-radius: 4px 4px 0 0;
   background: var(--brand);
+}
+
+.pilot-split-card {
+  display: grid;
+  gap: 0;
+}
+
+.pilot-split-row {
+  display: grid;
+  grid-template-columns: 150px repeat(2, minmax(190px, 1fr));
+  gap: 14px;
+  align-items: center;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.pilot-split-row:last-child { border-bottom: 0; }
+
+.pilot-split-row > strong {
+  font-size: 16px;
+}
+
+.pilot-split-row > div {
+  display: grid;
+  gap: 4px;
+}
+
+.pilot-split-row span,
+.pilot-split-row small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pilot-split-row b {
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
 }
 
 .pilot-events-card {
@@ -643,6 +679,7 @@ footer { display: flex; justify-content: space-between; gap: 20px; padding: 10px
   .systems-grid, .business-grid, .processes-grid, .lower-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .pilot-kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .pilot-charts-grid { grid-template-columns: 1fr; }
+  .pilot-split-row { grid-template-columns: 120px repeat(2, minmax(0, 1fr)); }
   .pilot-events-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .report-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .report-detail-grid { grid-template-columns: 1fr; }
@@ -670,6 +707,7 @@ footer { display: flex; justify-content: space-between; gap: 20px; padding: 10px
   .segment { flex: 1 1 0; padding-inline: 6px; }
   .report-meta { display: grid; }
   .pilot-kpi-grid { grid-template-columns: 1fr; }
+  .pilot-split-row { grid-template-columns: 1fr; gap: 10px; }
   .pilot-events-summary,
   .pilot-events-grid { grid-template-columns: 1fr; }
   .funnel-row { grid-template-columns: 1fr 58px; }

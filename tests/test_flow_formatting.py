@@ -6,7 +6,14 @@ import pytest
 
 from app.flow import ApplicationFlow
 from app.formatting import TextFormattingSpan
-from app.models import AnswerType, ChangeType, Direction, FieldName, LlmResult
+from app.models import (
+    AnswerType,
+    ChangeType,
+    ChipAfterTextAction,
+    Direction,
+    FieldName,
+    LlmResult,
+)
 from app.repository import DraftRepository
 from app.submission import InMemorySubmissionService
 
@@ -159,6 +166,7 @@ async def test_chips_saves_formatting_for_each_text_independently(tmp_path):
         "chip",
         [TextFormattingSpan(start=0, end=4, strikethrough=True)],
     )
+    await flow.select_chip_after_text_action(user_id, ChipAfterTextAction.UNCHANGED)
     await flow.handle_text(
         user_id,
         "after",

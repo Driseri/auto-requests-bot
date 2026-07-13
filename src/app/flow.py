@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -30,12 +32,14 @@ from app.models import (
     BulkReservationState,
     BulkTargetKind,
     ChangeType,
+    ChipAfterTextAction,
     Direction,
     Draft,
     FieldName,
     KeyboardKind,
     LlmCheckStatus,
     LlmContext,
+    LinkedSubmissionResult,
     Priority,
     Step,
     SubmissionState,
@@ -60,6 +64,7 @@ FIELD_LABELS = {
     FieldName.SOURCE_TEXT: "Исходный текст",
     FieldName.CHIP_TEXT_BEFORE: "Текст до чипса",
     FieldName.CHIP_TEXT: "Текст чипса",
+    FieldName.CHIP_AFTER_TEXT_ACTION: "Действие с текстом после чипса",
     FieldName.CHIP_TEXT_AFTER: "Текст после чипса",
     FieldName.URGENCY: "Срочная",
     FieldName.PRIORITY: "Приоритет",
@@ -87,6 +92,11 @@ STEP_PROMPTS = {
     Step.SOURCE_TEXT: "Пришлите предлагаемый текст.",
     Step.CHIP_TEXT_BEFORE: "Введите текст до чипса.",
     Step.CHIP_TEXT: "Введите текст чипса.",
+    Step.CHIP_AFTER_TEXT_ACTION: "Что происходит с текстом ответа после чипса?",
+    Step.CHIP_RESPONSE_CHANGE_DESCRIPTION: (
+        "Кратко опишите суть изменения текста ответа после чипса. "
+        "Связь с CHIPS-заявкой бот добавит автоматически."
+    ),
     Step.CHIP_TEXT_AFTER: "Введите текст после чипса.",
     Step.URGENCY: "Заявка срочная?",
     Step.PRIORITY: "Выберите приоритет заявки.",
@@ -102,6 +112,11 @@ STEP_PROMPTS = {
     Step.EDIT_SOURCE_TEXT: "Введите новый предлагаемый текст.",
     Step.EDIT_CHIP_TEXT_BEFORE: "Введите новый текст до чипса.",
     Step.EDIT_CHIP_TEXT: "Введите новый текст чипса.",
+    Step.EDIT_CHIP_AFTER_TEXT_ACTION: "Что происходит с текстом ответа после чипса?",
+    Step.EDIT_CHIP_RESPONSE_CHANGE_DESCRIPTION: (
+        "Введите новую суть изменений текста ответа после чипса. "
+        "Связь с CHIPS-заявкой бот добавит автоматически."
+    ),
     Step.EDIT_CHIP_TEXT_AFTER: "Введите новый текст после чипса.",
     Step.EDIT_URGENCY: "Выберите новый признак срочности.",
     Step.EDIT_PRIORITY: "Выберите новый приоритет заявки.",
@@ -447,7 +462,7 @@ class ApplicationFlow:
             return await self._legacy_open_bulk_menu(telegram_user_id)
         return BotResponse(
             text=(
-                "Массовая заявка создаёт обычные строки сразу в нужном рабочем листе.\n\n"
+                "Массовая заявка создает обычные строки сразу в нужном рабочем листе.\n\n"
                 "Выберите направление, место, тип и количество строк. После заполнения бот "
                 "зарегистрирует заполненные строки как обычные заявки."
             ),
@@ -957,7 +972,10 @@ class ApplicationFlow:
                     value,
                     formatting_spans,
                 )
-                draft = await self.repository.set_step(telegram_user_id, Step.CHIP_TEXT_AFTER)
+                draft = await self.repository.set_step(
+                    telegram_user_id,
+                    Step.CHIP_AFTER_TEXT_ACTION,
+                )
                 return await self._prompt_response_for_user(telegram_user_id, draft)
             case Step.CHIP_TEXT_AFTER:
                 await self._save_formatted_text(
@@ -968,6 +986,10 @@ class ApplicationFlow:
                 )
                 draft = await self.repository.set_step(telegram_user_id, Step.REVIEW)
                 return self._review_response(draft)
+            case Step.CHIP_RESPONSE_CHANGE_DESCRIPTION:
+                await self._save_chip_response_change_description(telegram_user_id, value)
+                draft = await self.repository.set_step(telegram_user_id, Step.CHIP_TEXT_AFTER)
+                return await self._prompt_response_for_user(telegram_user_id, draft)
             case Step.CHANGE_DESCRIPTION:
                 return await self._process_change_description(telegram_user_id, value)
             case Step.CHANGE_DESCRIPTION_CLARIFICATION:
@@ -1026,6 +1048,9 @@ class ApplicationFlow:
                         prefix="Суть изменений обновлена через GigaChat.",
                     )
                 return response
+            case Step.EDIT_CHIP_RESPONSE_CHANGE_DESCRIPTION:
+                await self._save_chip_response_change_description(telegram_user_id, value)
+                return await self._return_to_review(telegram_user_id)
             case Step.EDIT_SOURCE_TEXT:
                 await self._save_source_text(telegram_user_id, value, formatting_spans)
                 return await self._return_to_review(telegram_user_id)
@@ -1191,6 +1216,70 @@ class ApplicationFlow:
             return self._review_response(draft, prefix="Тип изменения обновлен.")
         return await self._prompt_response_for_user(telegram_user_id, draft)
 
+    async def select_chip_after_text_action(
+        self,
+        telegram_user_id: int,
+        action: ChipAfterTextAction,
+    ) -> BotResponse:
+        draft = await self._get_active_or_start(telegram_user_id)
+        if draft.current_step not in {
+            Step.CHIP_AFTER_TEXT_ACTION,
+            Step.EDIT_CHIP_AFTER_TEXT_ACTION,
+        }:
+            return await self._prompt_response_for_user(
+                telegram_user_id,
+                draft,
+                prefix="Сейчас выбор действия с текстом после чипса не ожидается.",
+            )
+        if not _is_chips(draft):
+            return self._review_response(
+                draft,
+                prefix="Этот выбор доступен только для CHIPS-заявки.",
+            )
+        edit_mode = draft.current_step == Step.EDIT_CHIP_AFTER_TEXT_ACTION
+        await self.repository.save_answer(
+            telegram_user_id,
+            FieldName.CHIP_AFTER_TEXT_ACTION.value,
+            action.value,
+        )
+        if action == ChipAfterTextAction.UNCHANGED:
+            await self.repository.save_llm_result(
+                telegram_user_id,
+                formatted_change_description=None,
+                raw_change_description=None,
+                llm_check_status=LlmCheckStatus.SKIPPED.value,
+                llm_score=None,
+                clarification_count=0,
+            )
+        next_step = (
+            Step.REVIEW
+            if edit_mode and action == ChipAfterTextAction.UNCHANGED
+            else Step.EDIT_CHIP_RESPONSE_CHANGE_DESCRIPTION
+            if edit_mode
+            else Step.CHIP_RESPONSE_CHANGE_DESCRIPTION
+            if action != ChipAfterTextAction.UNCHANGED
+            else Step.CHIP_TEXT_AFTER
+        )
+        draft = await self.repository.set_step(telegram_user_id, next_step)
+        if next_step == Step.REVIEW:
+            return self._review_response(draft, prefix="Действие после чипса обновлено.")
+        return await self._prompt_response_for_user(telegram_user_id, draft)
+
+    async def _save_chip_response_change_description(
+        self,
+        telegram_user_id: int,
+        value: str,
+    ) -> None:
+        """Сохранить суть автоматически создаваемой ADD/EDIT без LLM-проверки."""
+        await self.repository.save_llm_result(
+            telegram_user_id,
+            formatted_change_description=value,
+            raw_change_description=value,
+            llm_check_status=LlmCheckStatus.SKIPPED.value,
+            llm_score=None,
+            clarification_count=0,
+        )
+
     async def _reset_change_type_specific_fields(
         self,
         telegram_user_id: int,
@@ -1222,6 +1311,11 @@ class ApplicationFlow:
                     f"{field.value}_formatting_json",
                     "",
                 )
+            await self.repository.save_answer(
+                telegram_user_id,
+                FieldName.CHIP_AFTER_TEXT_ACTION.value,
+                "",
+            )
             return
 
         for field in (
@@ -1235,6 +1329,11 @@ class ApplicationFlow:
                 f"{field.value}_formatting_json",
                 "",
             )
+        await self.repository.save_answer(
+            telegram_user_id,
+            FieldName.CHIP_AFTER_TEXT_ACTION.value,
+            "",
+        )
         await self.repository.save_llm_result(
             telegram_user_id,
             formatted_change_description=None,
@@ -1284,13 +1383,20 @@ class ApplicationFlow:
     async def back(self, telegram_user_id: int) -> BotResponse:
         draft = await self._get_active_or_start(telegram_user_id)
         if _is_chips(draft):
-            previous_step = {
+            previous_step = (
+                Step.CHIP_RESPONSE_CHANGE_DESCRIPTION
+                if draft.current_step == Step.CHIP_TEXT_AFTER
+                and _chip_after_text_action(draft)
+                in {ChipAfterTextAction.ADD, ChipAfterTextAction.EDIT}
+                else {
                 Step.SCRIPTWRITER: Step.CHANGE_TYPE,
                 Step.INTENT: Step.SCRIPTWRITER,
                 Step.REASON: Step.INTENT,
                 Step.CHIP_TEXT_BEFORE: Step.REASON,
                 Step.CHIP_TEXT: Step.CHIP_TEXT_BEFORE,
-                Step.CHIP_TEXT_AFTER: Step.CHIP_TEXT,
+                Step.CHIP_AFTER_TEXT_ACTION: Step.CHIP_TEXT,
+                Step.CHIP_TEXT_AFTER: Step.CHIP_AFTER_TEXT_ACTION,
+                Step.CHIP_RESPONSE_CHANGE_DESCRIPTION: Step.CHIP_AFTER_TEXT_ACTION,
                 Step.REVIEW: Step.CHIP_TEXT_AFTER,
                 Step.EDIT_DIRECTION: Step.REVIEW,
                 Step.EDIT_ANSWER_TYPE: Step.REVIEW,
@@ -1300,8 +1406,11 @@ class ApplicationFlow:
                 Step.EDIT_REASON: Step.REVIEW,
                 Step.EDIT_CHIP_TEXT_BEFORE: Step.REVIEW,
                 Step.EDIT_CHIP_TEXT: Step.REVIEW,
+                Step.EDIT_CHIP_AFTER_TEXT_ACTION: Step.REVIEW,
+                Step.EDIT_CHIP_RESPONSE_CHANGE_DESCRIPTION: Step.REVIEW,
                 Step.EDIT_CHIP_TEXT_AFTER: Step.REVIEW,
-            }.get(draft.current_step)
+                }.get(draft.current_step)
+            )
         elif (
             draft.current_step == Step.INTENT
             and _answer_type_requires_change_type(draft.answer_type)
@@ -1377,9 +1486,10 @@ class ApplicationFlow:
         chip_fields = {
             FieldName.CHIP_TEXT_BEFORE,
             FieldName.CHIP_TEXT,
+            FieldName.CHIP_AFTER_TEXT_ACTION,
             FieldName.CHIP_TEXT_AFTER,
         }
-        if (_is_chips(draft) and field in {FieldName.CHANGE_DESCRIPTION, FieldName.SOURCE_TEXT}) or (
+        if (_is_chips(draft) and field == FieldName.SOURCE_TEXT) or (
             not _is_chips(draft) and field in chip_fields
         ):
             return self._review_response(draft, prefix="Эта кнопка не относится к выбранному типу изменения.")
@@ -1388,6 +1498,16 @@ class ApplicationFlow:
                 draft,
                 prefix="Срочность для этого направления определяется полем «Тип ответа». Чтобы изменить срочность, отредактируйте тип ответа.",
             )
+        if (
+            _is_chips(draft)
+            and field == FieldName.CHANGE_DESCRIPTION
+            and _chip_after_text_action(draft)
+            not in {ChipAfterTextAction.ADD, ChipAfterTextAction.EDIT}
+        ):
+            return self._review_response(
+                draft,
+                prefix="Суть изменений текста после чипса нужна только для ADD или EDIT.",
+            )
         step_by_field = {
             FieldName.DIRECTION: Step.EDIT_DIRECTION,
             FieldName.ANSWER_TYPE: Step.EDIT_ANSWER_TYPE,
@@ -1395,10 +1515,15 @@ class ApplicationFlow:
             FieldName.INTENT: Step.EDIT_INTENT,
             FieldName.SCRIPTWRITER: Step.EDIT_SCRIPTWRITER,
             FieldName.REASON: Step.EDIT_REASON,
-            FieldName.CHANGE_DESCRIPTION: Step.EDIT_CHANGE_DESCRIPTION,
+            FieldName.CHANGE_DESCRIPTION: (
+                Step.EDIT_CHIP_RESPONSE_CHANGE_DESCRIPTION
+                if _is_chips(draft)
+                else Step.EDIT_CHANGE_DESCRIPTION
+            ),
             FieldName.SOURCE_TEXT: Step.EDIT_SOURCE_TEXT,
             FieldName.CHIP_TEXT_BEFORE: Step.EDIT_CHIP_TEXT_BEFORE,
             FieldName.CHIP_TEXT: Step.EDIT_CHIP_TEXT,
+            FieldName.CHIP_AFTER_TEXT_ACTION: Step.EDIT_CHIP_AFTER_TEXT_ACTION,
             FieldName.CHIP_TEXT_AFTER: Step.EDIT_CHIP_TEXT_AFTER,
             FieldName.URGENCY: Step.EDIT_URGENCY,
             FieldName.PRIORITY: Step.EDIT_PRIORITY,
@@ -1463,6 +1588,90 @@ class ApplicationFlow:
                 spreadsheet_id=spreadsheet_id,
                 sheet_name=sheet_name,
             )
+            action = _chip_after_text_action(draft)
+            if _is_chips(draft) and action in {
+                ChipAfterTextAction.ADD,
+                ChipAfterTextAction.EDIT,
+            }:
+                response_draft = _linked_response_draft(draft, action)
+
+                async def complete_pair(linked: LinkedSubmissionResult) -> None:
+                    nonlocal draft
+                    chips_result = linked.chips_result
+                    response_result = linked.response_result
+                    if chips_result is None or response_result is None:
+                        raise RuntimeError("Linked submission returned incomplete results")
+                    applications = [
+                        _tracking_item(draft, chips_result),
+                        _tracking_item(response_draft, response_result),
+                    ]
+                    projections = []
+                    if self.dashboard_enabled:
+                        projections = [
+                            {
+                                "entity_id": item.application_id or "",
+                                "snapshot": dashboard_projection(
+                                    dashboard_row(
+                                        item,
+                                        ApplicationStatus.NEW.value,
+                                        False,
+                                        result_item.row_link or "",
+                                        submitted_at=result_item.submitted_at,
+                                    )
+                                ),
+                            }
+                            for item, result_item in (
+                                (draft, chips_result),
+                                (response_draft, response_result),
+                            )
+                        ]
+                    draft = await self.repository.complete_linked_submission(
+                        telegram_user_id,
+                        applications=applications,
+                        row_shifts=linked.row_shifts,
+                        dashboard_projections=projections,
+                        notification_event=self._urgent_editor_linked_notification_event(
+                            draft,
+                            chips_link=chips_result.row_link,
+                            response_id=response_draft.application_id or "",
+                            response_link=response_result.row_link,
+                        ),
+                    )
+
+                submit_pair = getattr(
+                    self.submission_service,
+                    "submit_chips_with_response",
+                    None,
+                )
+                if not callable(submit_pair):
+                    await self.repository.fail_submission(telegram_user_id)
+                    return BotResponse(
+                        text="Сервис отправки не поддерживает парные CHIPS-заявки.",
+                        keyboard=KeyboardKind.REVIEW,
+                        draft=draft,
+                    )
+                linked_result = await submit_pair(
+                    draft,
+                    response_draft,
+                    on_success=complete_pair,
+                )
+                if not linked_result.success:
+                    await self.repository.fail_submission(telegram_user_id)
+                    return BotResponse(
+                        text=linked_result.message,
+                        keyboard=KeyboardKind.REVIEW,
+                        draft=draft,
+                    )
+                return BotResponse(
+                    text=(
+                        f"{linked_result.message}\n\n"
+                        f"CHIPS ID: {application_id}\n"
+                        f"{action.value} ID: {response_draft.application_id}\n\n"
+                        "Чтобы создать новую заявку, отправьте /new."
+                    ),
+                    keyboard=KeyboardKind.CREATE_MODE,
+                    draft=draft,
+                )
             result = await self.submission_service.submit(draft)
             if not result.success:
                 await self.repository.fail_submission(telegram_user_id)
@@ -1544,6 +1753,42 @@ class ApplicationFlow:
                 sort_keys=True,
             ),
             "chunks": [_render_urgent_editor_notification(snapshot)],
+        }
+
+    def _urgent_editor_linked_notification_event(
+        self,
+        draft: Draft,
+        *,
+        chips_link: str | None,
+        response_id: str,
+        response_link: str | None,
+    ) -> dict[str, object] | None:
+        if (
+            not self.urgent_editor_notifications_enabled
+            or self.editor_urgent_chat_id is None
+            or not draft.is_urgent
+            or not chips_link
+            or not response_link
+            or not draft.application_id
+        ):
+            return None
+        snapshot = {
+            "application_id": draft.application_id,
+            "response_application_id": response_id,
+            "direction": draft.direction or "",
+            "scriptwriter": draft.scriptwriter or "",
+            "intent": draft.intent or "",
+            "chips_link": chips_link,
+            "response_link": response_link,
+        }
+        return {
+            "telegram_user_id": self.editor_urgent_chat_id,
+            "event_type": URGENT_EDITOR_NOTIFICATION_EVENT_TYPE,
+            "dedupe_key": (
+                f"{URGENT_EDITOR_NOTIFICATION_EVENT_TYPE}:linked:{draft.application_id}"
+            ),
+            "snapshot_json": json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+            "chunks": [_render_urgent_editor_linked_notification(snapshot)],
         }
 
     async def _process_change_description(
@@ -1864,6 +2109,20 @@ class ApplicationFlow:
 
     def _prompt_response(self, draft: Draft, *, prefix: str | None = None) -> BotResponse:
         text = STEP_PROMPTS[draft.current_step]
+        if draft.current_step == Step.CHIP_TEXT_AFTER:
+            action = _chip_after_text_action(draft)
+            text = {
+                ChipAfterTextAction.ADD: (
+                    "Пришлите новый текст ответа, который будет показан после нажатия на чипс."
+                ),
+                ChipAfterTextAction.EDIT: (
+                    "Пришлите предлагаемую версию текста ответа после чипса."
+                ),
+                ChipAfterTextAction.UNCHANGED: (
+                    "Пришлите текущий текст ответа после чипса. "
+                    "Он будет указан только как контекст."
+                ),
+            }.get(action, text)
         if prefix:
             text = f"{prefix}\n\n{text}"
         return BotResponse(
@@ -1891,6 +2150,8 @@ class ApplicationFlow:
             return KeyboardKind.ANSWER_TYPE
         if step in {Step.CHANGE_TYPE, Step.EDIT_CHANGE_TYPE}:
             return KeyboardKind.CHANGE_TYPE
+        if step in {Step.CHIP_AFTER_TEXT_ACTION, Step.EDIT_CHIP_AFTER_TEXT_ACTION}:
+            return KeyboardKind.CHIP_AFTER_TEXT_ACTION
         if step in {Step.URGENCY, Step.EDIT_URGENCY}:
             return KeyboardKind.URGENCY
         if step in {Step.PRIORITY, Step.EDIT_PRIORITY}:
@@ -1904,6 +2165,13 @@ class ApplicationFlow:
     @staticmethod
     def _render_review(draft: Draft) -> str:
         if _is_chips(draft):
+            response_change_description = (
+                "📝 <b>Суть изменений текста после чипса:</b> "
+                f"{_html_value(draft.formatted_change_description or draft.raw_change_description)}\n"
+                if _chip_after_text_action(draft)
+                in {ChipAfterTextAction.ADD, ChipAfterTextAction.EDIT}
+                else ""
+            )
             return (
                 "Проверьте заявку перед отправкой.\n\n"
                 f"🧭 <b>Направление:</b> {_html_value(direction_display_label(draft.direction))}\n"
@@ -1916,6 +2184,9 @@ class ApplicationFlow:
                 f"{_render_formatted_draft_value(draft.chip_text_before, draft.chip_text_before_formatting_json)}\n"
                 "🔘 <b>Текст чипса:</b> "
                 f"{_render_formatted_draft_value(draft.chip_text, draft.chip_text_formatting_json)}\n"
+                "🔗 <b>Действие с текстом после чипса:</b> "
+                f"{_html_value(_chip_after_text_action_review(draft))}\n"
+                f"{response_change_description}"
                 "➡️ <b>Текст после чипса:</b> "
                 f"{_render_formatted_draft_value(draft.chip_text_after, draft.chip_text_after_formatting_json)}\n"
                 f"⚡ <b>Срочная:</b> {_html_value('Да' if draft.is_urgent else 'Нет')}"
@@ -1963,6 +2234,14 @@ class ApplicationFlow:
                 missing.append(FIELD_LABELS[FieldName.CHIP_TEXT_BEFORE])
             if not draft.chip_text:
                 missing.append(FIELD_LABELS[FieldName.CHIP_TEXT])
+            if _chip_after_text_action(draft) is None:
+                missing.append(FIELD_LABELS[FieldName.CHIP_AFTER_TEXT_ACTION])
+            if (
+                _chip_after_text_action(draft)
+                in {ChipAfterTextAction.ADD, ChipAfterTextAction.EDIT}
+                and not (draft.formatted_change_description or draft.raw_change_description)
+            ):
+                missing.append("Суть изменений текста после чипса")
             if not draft.chip_text_after:
                 missing.append(FIELD_LABELS[FieldName.CHIP_TEXT_AFTER])
         else:
@@ -1990,6 +2269,98 @@ def _is_chips(draft: Draft) -> bool:
     return ChangeType.normalize(draft.change_type) == ChangeType.CHIPS
 
 
+def _chip_after_text_action(draft: Draft) -> ChipAfterTextAction | None:
+    try:
+        return ChipAfterTextAction(draft.chip_after_text_action or "")
+    except ValueError:
+        return None
+
+
+def _chip_after_text_action_label(draft: Draft) -> str:
+    action = _chip_after_text_action(draft)
+    if action is None:
+        return "Не выбрано"
+    return action.label
+
+
+def _chip_after_text_action_review(draft: Draft) -> str:
+    action = _chip_after_text_action(draft)
+    return {
+        ChipAfterTextAction.ADD: "Будут созданы CHIPS + ADD",
+        ChipAfterTextAction.EDIT: "Будут созданы CHIPS + EDIT",
+        ChipAfterTextAction.UNCHANGED: "Будет создана только CHIPS-заявка",
+    }.get(action, "Не выбрано")
+
+
+def _linked_response_application_id(chips_application_id: str) -> str:
+    return hashlib.sha256(
+        f"chip-response:{chips_application_id}".encode("utf-8")
+    ).hexdigest()[:8].upper()
+
+
+def _linked_response_draft(
+    chips: Draft,
+    action: ChipAfterTextAction,
+) -> Draft:
+    if action not in {ChipAfterTextAction.ADD, ChipAfterTextAction.EDIT}:
+        raise ValueError("Only ADD and EDIT create a second application")
+    chips_id = chips.application_id or ""
+    generated_description = (
+        "Добавление нового текста ответа после чипса."
+        if action == ChipAfterTextAction.ADD
+        else "Изменение текста ответа после чипса."
+    )
+    generated_description = f"{generated_description} Связано с CHIPS-заявкой {chips_id}."
+    user_description = (
+        chips.formatted_change_description or chips.raw_change_description or ""
+    ).strip()
+    description = (
+        f"{user_description}\n\n{generated_description}"
+        if user_description
+        else generated_description
+    )
+    return replace(
+        chips,
+        application_id=_linked_response_application_id(chips_id),
+        change_type=action.value,
+        source_text=chips.chip_text_after,
+        source_text_formatting_json=chips.chip_text_after_formatting_json,
+        raw_change_description=description,
+        formatted_change_description=description,
+        llm_check_status=LlmCheckStatus.SKIPPED.value,
+        llm_score=None,
+        chip_text_before=None,
+        chip_text_before_formatting_json=None,
+        chip_text=None,
+        chip_text_formatting_json=None,
+        chip_after_text_action=None,
+        chip_text_after=None,
+        chip_text_after_formatting_json=None,
+    )
+
+
+def _tracking_item(draft: Draft, result) -> dict[str, object]:
+    return {
+        "application_id": draft.application_id or "",
+        "telegram_user_id": draft.telegram_user_id,
+        "spreadsheet_id": result.spreadsheet_id,
+        "sheet_id": result.sheet_id,
+        "sheet_name": result.sheet_name or "",
+        "last_known_status": ApplicationStatus.NEW.value,
+        "direction": draft.direction,
+        "answer_type": draft.answer_type,
+        "application_type": draft.application_type,
+        "change_type": draft.change_type,
+        "is_urgent": draft.is_urgent,
+        "batch_id": None,
+        "last_seen_row_number": result.row_number,
+        "last_seen_editor": None,
+        "last_seen_editor_comment": None,
+        "last_seen_final_answer": None,
+        "submitted_at": result.submitted_at,
+    }
+
+
 def _first_missing_step(draft: Draft) -> Step | None:
     common = (
         (draft.scriptwriter, Step.SCRIPTWRITER),
@@ -2003,10 +2374,18 @@ def _first_missing_step(draft: Draft) -> Step | None:
         for value, step in (
             (draft.chip_text_before, Step.CHIP_TEXT_BEFORE),
             (draft.chip_text, Step.CHIP_TEXT),
-            (draft.chip_text_after, Step.CHIP_TEXT_AFTER),
+            (draft.chip_after_text_action, Step.CHIP_AFTER_TEXT_ACTION),
         ):
             if not value:
                 return step
+        if (
+            _chip_after_text_action(draft)
+            in {ChipAfterTextAction.ADD, ChipAfterTextAction.EDIT}
+            and not (draft.formatted_change_description or draft.raw_change_description)
+        ):
+            return Step.CHIP_RESPONSE_CHANGE_DESCRIPTION
+        if not draft.chip_text_after:
+            return Step.CHIP_TEXT_AFTER
         return None
     if not draft.formatted_change_description and not draft.raw_change_description:
         return Step.CHANGE_DESCRIPTION
@@ -2028,6 +2407,28 @@ def _render_urgent_editor_notification(snapshot: dict[str, str]) -> str:
             (
                 f'<a href="{escape(snapshot.get("row_link", ""), quote=True)}">'
                 "Открыть заявку</a>"
+            ),
+        ]
+    )
+
+
+def _render_urgent_editor_linked_notification(snapshot: dict[str, str]) -> str:
+    return "\n".join(
+        [
+            "🚨 <b>Новые срочные заявки CHIPS + текст ответа</b>",
+            "",
+            f"<b>Направление:</b> {_html_value(snapshot.get('direction'))}",
+            f"<b>Сценарист:</b> {_html_value(snapshot.get('scriptwriter'))}",
+            f"<b>Интент:</b> {_html_value(snapshot.get('intent'))}",
+            "",
+            (
+                f'<a href="{escape(snapshot.get("chips_link", ""), quote=True)}">'
+                f'Открыть CHIPS {escape(snapshot.get("application_id", ""))}</a>'
+            ),
+            (
+                f'<a href="{escape(snapshot.get("response_link", ""), quote=True)}">'
+                "Открыть заявку на текст ответа "
+                f'{escape(snapshot.get("response_application_id", ""))}</a>'
             ),
         ]
     )

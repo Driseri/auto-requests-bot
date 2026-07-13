@@ -17,6 +17,7 @@ from app.models import (
     BotResponse,
     BulkTargetKind,
     ChangeType,
+    ChipAfterTextAction,
     Direction,
     FieldName,
     KeyboardKind,
@@ -591,6 +592,17 @@ def create_router(flow: ApplicationFlow) -> Router:
             await flow.select_change_type(
                 _callback_user_id(callback),
                 ChangeType(change_type_value),
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("app:chip_after_action:"))
+    async def callback_chip_after_text_action(callback: CallbackQuery) -> None:
+        action_value = (callback.data or "").split(":", maxsplit=2)[2]
+        await ui.answer_callback(
+            callback,
+            await flow.select_chip_after_text_action(
+                _callback_user_id(callback),
+                ChipAfterTextAction(action_value),
             ),
         )
 

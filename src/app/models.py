@@ -18,6 +18,8 @@ class Step(StrEnum):
     SOURCE_TEXT = "source_text"
     CHIP_TEXT_BEFORE = "chip_text_before"
     CHIP_TEXT = "chip_text"
+    CHIP_AFTER_TEXT_ACTION = "chip_after_text_action"
+    CHIP_RESPONSE_CHANGE_DESCRIPTION = "chip_response_change_description"
     CHIP_TEXT_AFTER = "chip_text_after"
     URGENCY = "urgency"
     PRIORITY = "priority"
@@ -33,6 +35,8 @@ class Step(StrEnum):
     EDIT_SOURCE_TEXT = "edit_source_text"
     EDIT_CHIP_TEXT_BEFORE = "edit_chip_text_before"
     EDIT_CHIP_TEXT = "edit_chip_text"
+    EDIT_CHIP_AFTER_TEXT_ACTION = "edit_chip_after_text_action"
+    EDIT_CHIP_RESPONSE_CHANGE_DESCRIPTION = "edit_chip_response_change_description"
     EDIT_CHIP_TEXT_AFTER = "edit_chip_text_after"
     EDIT_URGENCY = "edit_urgency"
     EDIT_PRIORITY = "edit_priority"
@@ -94,6 +98,20 @@ class ChangeType(StrEnum):
             return cls(normalized)
         except ValueError:
             return None
+
+
+class ChipAfterTextAction(StrEnum):
+    ADD = "ADD"
+    EDIT = "EDIT"
+    UNCHANGED = "UNCHANGED"
+
+    @property
+    def label(self) -> str:
+        return {
+            self.ADD: "Добавляется новый текст",
+            self.EDIT: "Изменяется текст",
+            self.UNCHANGED: "Остается без изменений",
+        }[self]
 
 
 class ApplicationType(StrEnum):
@@ -184,6 +202,7 @@ class KeyboardKind(StrEnum):
     DIRECTION_WITH_DEFAULT = "direction_with_default"
     ANSWER_TYPE = "answer_type"
     CHANGE_TYPE = "change_type"
+    CHIP_AFTER_TEXT_ACTION = "chip_after_text_action"
     STEP = "step"
     INTENT_STEP_WITH_DEFAULT = "intent_step_with_default"
     SCRIPTWRITER_STEP_WITH_DEFAULT = "scriptwriter_step_with_default"
@@ -250,6 +269,7 @@ class FieldName(StrEnum):
     SOURCE_TEXT = "source_text"
     CHIP_TEXT_BEFORE = "chip_text_before"
     CHIP_TEXT = "chip_text"
+    CHIP_AFTER_TEXT_ACTION = "chip_after_text_action"
     CHIP_TEXT_AFTER = "chip_text_after"
     URGENCY = "is_urgent"
     PRIORITY = "priority"
@@ -269,6 +289,7 @@ TEXT_FIELDS = {
     "chip_text_before_formatting_json",
     FieldName.CHIP_TEXT.value,
     "chip_text_formatting_json",
+    FieldName.CHIP_AFTER_TEXT_ACTION.value,
     FieldName.CHIP_TEXT_AFTER.value,
     "chip_text_after_formatting_json",
     "application_type",
@@ -311,6 +332,7 @@ class Draft:
     chip_text_before_formatting_json: str | None = None
     chip_text: str | None = None
     chip_text_formatting_json: str | None = None
+    chip_after_text_action: str | None = None
     chip_text_after: str | None = None
     chip_text_after_formatting_json: str | None = None
     priority: str | None = None
@@ -373,6 +395,15 @@ class SubmissionResult:
     row_number: int | None = None
     row_link: str | None = None
     submitted_at: str | None = None
+
+
+@dataclass(slots=True)
+class LinkedSubmissionResult:
+    success: bool
+    message: str
+    chips_result: SubmissionResult | None = None
+    response_result: SubmissionResult | None = None
+    row_shifts: tuple[tuple[str, int, int, int], ...] = ()
 
 
 @dataclass(slots=True)

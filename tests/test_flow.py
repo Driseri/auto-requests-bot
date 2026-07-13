@@ -12,6 +12,7 @@ from app.models import (
     BulkReservationState,
     BulkTargetKind,
     ChangeType,
+    ChipAfterTextAction,
     Direction,
     FieldName,
     KeyboardKind,
@@ -309,6 +310,11 @@ async def test_chips_collects_dedicated_fields_without_gigachat(tmp_path):
     response = await flow.handle_text(user_id, "before")
     assert response.draft.current_step == Step.CHIP_TEXT
     response = await flow.handle_text(user_id, "chip")
+    assert response.draft.current_step == Step.CHIP_AFTER_TEXT_ACTION
+    response = await flow.select_chip_after_text_action(
+        user_id,
+        ChipAfterTextAction.UNCHANGED,
+    )
     assert response.draft.current_step == Step.CHIP_TEXT_AFTER
     response = await flow.handle_text(user_id, "after")
 
@@ -323,6 +329,80 @@ async def test_chips_collects_dedicated_fields_without_gigachat(tmp_path):
         "after",
     )
     assert llm_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "expected_change_type"),
+    [
+        (ChipAfterTextAction.ADD, ChangeType.ADD.value),
+        (ChipAfterTextAction.EDIT, ChangeType.EDIT.value),
+    ],
+)
+async def test_chips_action_creates_two_independent_tracked_applications(
+    tmp_path,
+    action,
+    expected_change_type,
+):
+    flow, repository, submission_service, llm_client = await make_flow(tmp_path)
+    user_id = 1103
+    await flow.start_single(user_id)
+    await flow.select_direction(user_id, Direction.FL)
+    await flow.select_answer_type(user_id, AnswerType.ROLLOUT)
+    await flow.select_change_type(user_id, ChangeType.CHIPS)
+    for value in ("Writer", "intent.chips", "reason", "before", "chip"):
+        await flow.handle_text(user_id, value)
+    action_response = await flow.select_chip_after_text_action(user_id, action)
+    assert action_response.draft is not None
+    assert action_response.draft.current_step == Step.CHIP_RESPONSE_CHANGE_DESCRIPTION
+    after_description = await flow.handle_text(
+        user_id,
+        "Нужно обновить текст после чипса",
+    )
+    assert after_description.draft is not None
+    assert after_description.draft.current_step == Step.CHIP_TEXT_AFTER
+    await flow.handle_text(user_id, "response after chip")
+
+    result = await flow.submit(user_id)
+    draft = await repository.get_by_user_id(user_id)
+    tracked = await repository.list_submitted_applications()
+
+    assert draft is not None
+    assert draft.submission_state == "SENT"
+    assert result.keyboard == KeyboardKind.CREATE_MODE
+    assert len(submission_service.submitted) == 2
+    assert {item.change_type for item in tracked} == {
+        ChangeType.CHIPS.value,
+        expected_change_type,
+    }
+    response = next(item for item in submission_service.submitted if item.change_type != "CHIPS")
+    assert response.source_text == "response after chip"
+    assert "Нужно обновить текст после чипса" in (
+        response.formatted_change_description or ""
+    )
+    assert response.llm_check_status == LlmCheckStatus.SKIPPED.value
+    assert draft.application_id in (response.formatted_change_description or "")
+    assert llm_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_chips_unchanged_creates_only_chips_application(tmp_path):
+    flow, repository, submission_service, _ = await make_flow(tmp_path)
+    user_id = 1104
+    await flow.start_single(user_id)
+    await flow.select_direction(user_id, Direction.FL)
+    await flow.select_answer_type(user_id, AnswerType.ROLLOUT)
+    await flow.select_change_type(user_id, ChangeType.CHIPS)
+    for value in ("Writer", "intent.chips", "reason", "before", "chip"):
+        await flow.handle_text(user_id, value)
+    await flow.select_chip_after_text_action(user_id, ChipAfterTextAction.UNCHANGED)
+    await flow.handle_text(user_id, "context")
+
+    await flow.submit(user_id)
+
+    assert len(submission_service.submitted) == 1
+    assert submission_service.submitted[0].change_type == ChangeType.CHIPS.value
+    assert len(await repository.list_submitted_applications()) == 1
 
 
 @pytest.mark.asyncio
@@ -406,6 +486,7 @@ async def test_urgent_chips_skips_gigachat_and_uses_chips_fields(tmp_path):
     await flow.handle_text(user_id, "Reason")
     await flow.handle_text(user_id, "Before")
     await flow.handle_text(user_id, "Chip")
+    await flow.select_chip_after_text_action(user_id, ChipAfterTextAction.UNCHANGED)
     response = await flow.handle_text(user_id, "After")
 
     draft = await repository.get_by_user_id(user_id)
@@ -461,6 +542,18 @@ async def test_old_urgent_draft_without_change_type_resumes_at_selection(tmp_pat
     assert response.keyboard == KeyboardKind.CHANGE_TYPE
     assert response.draft is not None
     assert response.draft.current_step == Step.CHANGE_TYPE
+
+
+@pytest.mark.asyncio
+async def test_regular_draft_keeps_generic_change_description_label(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    await flow.start_single(109)
+    draft = await repository.get_by_user_id(109)
+
+    assert draft is not None
+    missing = flow._missing_required_fields(draft)
+    assert "Суть изменений" in missing
+    assert "Суть изменений текста после чипса" not in missing
 
 
 @pytest.mark.asyncio

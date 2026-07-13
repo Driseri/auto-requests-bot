@@ -73,6 +73,7 @@ class DraftRepository:
                     chip_text_before_formatting_json TEXT,
                     chip_text TEXT,
                     chip_text_formatting_json TEXT,
+                    chip_after_text_action TEXT,
                     chip_text_after TEXT,
                     chip_text_after_formatting_json TEXT,
                     priority TEXT,
@@ -95,6 +96,7 @@ class DraftRepository:
             await self._ensure_column(db, "chip_text_before_formatting_json", "TEXT")
             await self._ensure_column(db, "chip_text", "TEXT")
             await self._ensure_column(db, "chip_text_formatting_json", "TEXT")
+            await self._ensure_column(db, "chip_after_text_action", "TEXT")
             await self._ensure_column(db, "chip_text_after", "TEXT")
             await self._ensure_column(db, "chip_text_after_formatting_json", "TEXT")
             await self._ensure_column(db, "application_id", "TEXT")
@@ -818,6 +820,96 @@ class DraftRepository:
             raise LookupError(f"Draft not found for user {telegram_user_id}")
         return draft
 
+    async def complete_linked_submission(
+        self,
+        telegram_user_id: int,
+        *,
+        applications: list[dict[str, Any]],
+        row_shifts: tuple[tuple[str, int, int, int], ...] = (),
+        dashboard_projections: list[dict[str, Any]] | None = None,
+        notification_event: dict[str, Any] | None = None,
+    ) -> Draft:
+        """Атомарно завершить исходный draft и сохранить две независимые заявки."""
+        if len(applications) != 2:
+            raise ValueError("Linked CHIPS submission must contain exactly two applications")
+        now = utc_now_iso()
+        async with self._connection() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for spreadsheet_id, sheet_id, from_row, delta in row_shifts:
+                await self._shift_rows_after_insert_in_connection(
+                    db,
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_id=sheet_id,
+                    from_row=from_row,
+                    delta=delta,
+                    now=now,
+                )
+            for item in applications:
+                await self._save_submitted_application_in_connection(db, item, now)
+                await self._record_application_event_in_connection(
+                    db,
+                    event_type="application_submitted",
+                    application_id=item["application_id"],
+                    telegram_user_id=telegram_user_id,
+                    event_at=item.get("submitted_at") or now,
+                    metadata={
+                        "spreadsheet_id": item.get("spreadsheet_id"),
+                        "sheet_id": item.get("sheet_id"),
+                        "sheet_name": item.get("sheet_name"),
+                        "row_number": item.get("last_seen_row_number"),
+                        "direction": item.get("direction"),
+                        "answer_type": item.get("answer_type"),
+                        "application_type": item.get("application_type"),
+                        "change_type": item.get("change_type"),
+                        "is_urgent": item.get("is_urgent"),
+                    },
+                    created_at=now,
+                )
+            primary = applications[0]
+            await db.execute(
+                """
+                UPDATE drafts
+                SET submission_state = ?, submission_started_at = NULL,
+                    submission_spreadsheet_id = ?, submission_sheet_name = ?,
+                    submission_sheet_id = ?, submission_row_number = ?,
+                    current_step = ?, updated_at = ?
+                WHERE telegram_user_id = ?
+                """,
+                (
+                    SubmissionState.SENT.value,
+                    primary.get("spreadsheet_id"),
+                    primary.get("sheet_name"),
+                    primary.get("sheet_id"),
+                    primary.get("last_seen_row_number"),
+                    Step.COMPLETED.value,
+                    now,
+                    telegram_user_id,
+                ),
+            )
+            for projection in dashboard_projections or []:
+                await self._upsert_dashboard_projection_in_connection(
+                    db,
+                    entity_type="APPLICATION",
+                    entity_id=projection["entity_id"],
+                    snapshot=projection["snapshot"],
+                    now=now,
+                )
+            if notification_event is not None:
+                await self._insert_notification_event_in_connection(
+                    db,
+                    telegram_user_id=notification_event["telegram_user_id"],
+                    event_type=notification_event["event_type"],
+                    dedupe_key=notification_event["dedupe_key"],
+                    snapshot_json=notification_event["snapshot_json"],
+                    chunks=notification_event["chunks"],
+                    now=now,
+                )
+            await db.commit()
+        draft = await self.get_by_user_id(telegram_user_id)
+        if draft is None:
+            raise LookupError(f"Draft not found for user {telegram_user_id}")
+        return draft
+
     async def get_user_settings(self, telegram_user_id: int) -> UserSettings:
         async with self._connection() as db:
             db.row_factory = aiosqlite.Row
@@ -1035,7 +1127,17 @@ class DraftRepository:
             "submitted_at": submitted_at,
         }
         async with self._connection() as db:
+            previous_location = await self._submitted_location_in_connection(
+                db,
+                application_id,
+            )
             await self._save_submitted_application_in_connection(db, item, now)
+            await self._maybe_record_application_indexed_event_in_connection(
+                db,
+                item=item,
+                previous_location=previous_location,
+                now=now,
+            )
             await db.commit()
         submitted = await self.get_submitted_application(application_id)
         if submitted is None:
@@ -1086,6 +1188,10 @@ class DraftRepository:
         }
         async with self._connection() as db:
             await db.execute("BEGIN IMMEDIATE")
+            previous_location = await self._submitted_location_in_connection(
+                db,
+                application_id,
+            )
             await self._save_submitted_application_in_connection(db, item, now)
             if dashboard_projection is not None:
                 await self._upsert_dashboard_projection_in_connection(
@@ -1095,29 +1201,83 @@ class DraftRepository:
                     snapshot=dashboard_projection,
                     now=now,
                 )
-            await self._record_application_event_in_connection(
+            await self._maybe_record_application_indexed_event_in_connection(
                 db,
-                event_type="application_indexed",
-                application_id=application_id,
-                telegram_user_id=telegram_user_id,
-                event_at=submitted_at or now,
-                metadata={
-                    "spreadsheet_id": spreadsheet_id,
-                    "sheet_id": sheet_id,
-                    "sheet_name": sheet_name,
-                    "row_number": last_seen_row_number,
-                    "direction": direction,
-                    "answer_type": answer_type,
-                    "change_type": change_type,
-                    "is_urgent": is_urgent,
-                },
-                created_at=now,
+                item=item,
+                previous_location=previous_location,
+                now=now,
             )
             await db.commit()
         submitted = await self.get_submitted_application(application_id)
         if submitted is None:
             raise LookupError(f"Submitted application not found: {application_id}")
         return submitted
+
+    @staticmethod
+    async def _submitted_location_in_connection(
+        db: aiosqlite.Connection,
+        application_id: str,
+    ) -> tuple[str | None, int | None, str | None, int | None] | None:
+        cursor = await db.execute(
+            """
+            SELECT spreadsheet_id, sheet_id, sheet_name, last_seen_row_number
+            FROM submitted_applications
+            WHERE application_id = ?
+            """,
+            (application_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        return row[0], row[1], row[2], row[3]
+
+    @staticmethod
+    def _application_location(
+        item: dict[str, Any],
+    ) -> tuple[str | None, int | None, str | None, int | None] | None:
+        spreadsheet_id = item.get("spreadsheet_id")
+        sheet_id = item.get("sheet_id")
+        sheet_name = item.get("sheet_name")
+        row_number = item.get("last_seen_row_number")
+        if not spreadsheet_id or sheet_id is None or not sheet_name or row_number is None:
+            return None
+        return str(spreadsheet_id), int(sheet_id), str(sheet_name), int(row_number)
+
+    @classmethod
+    async def _maybe_record_application_indexed_event_in_connection(
+        cls,
+        db: aiosqlite.Connection,
+        *,
+        item: dict[str, Any],
+        previous_location: tuple[str | None, int | None, str | None, int | None] | None,
+        now: str,
+    ) -> None:
+        location = cls._application_location(item)
+        if location is None or location == previous_location:
+            return
+        spreadsheet_id, sheet_id, sheet_name, row_number = location
+        old_value = None if previous_location is None else json.dumps(previous_location, ensure_ascii=False)
+        await cls._record_application_event_in_connection(
+            db,
+            event_type="application_indexed",
+            application_id=item["application_id"],
+            telegram_user_id=item["telegram_user_id"],
+            event_at=now,
+            old_value=old_value,
+            new_value=json.dumps(location, ensure_ascii=False),
+            metadata={
+                "spreadsheet_id": spreadsheet_id,
+                "sheet_id": sheet_id,
+                "sheet_name": sheet_name,
+                "row_number": row_number,
+                "direction": item.get("direction"),
+                "answer_type": item.get("answer_type"),
+                "change_type": item.get("change_type"),
+                "is_urgent": item.get("is_urgent"),
+            },
+            created_at=now,
+        )
 
     @staticmethod
     async def _save_submitted_application_in_connection(
@@ -2959,7 +3119,27 @@ class DraftRepository:
         now = utc_now_iso()
         async with self._connection() as db:
             await db.execute("BEGIN IMMEDIATE")
-            await db.execute(
+            await self._shift_rows_after_insert_in_connection(
+                db,
+                spreadsheet_id=spreadsheet_id,
+                sheet_id=sheet_id,
+                from_row=from_row,
+                delta=delta,
+                now=now,
+            )
+            await db.commit()
+
+    @staticmethod
+    async def _shift_rows_after_insert_in_connection(
+        db: aiosqlite.Connection,
+        *,
+        spreadsheet_id: str,
+        sheet_id: int,
+        from_row: int,
+        delta: int,
+        now: str,
+    ) -> None:
+        await db.execute(
                 """
                 UPDATE submitted_applications
                 SET last_seen_row_number = last_seen_row_number + ?,
@@ -2970,7 +3150,7 @@ class DraftRepository:
                 """,
                 (delta, now, spreadsheet_id, sheet_id, from_row),
             )
-            await db.execute(
+        await db.execute(
                 """
                 UPDATE bulk_reservations
                 SET start_row = CASE
@@ -3001,7 +3181,6 @@ class DraftRepository:
                     BulkReservationState.FAILED.value,
                 ),
             )
-            await db.commit()
 
     async def mark_application_deletion_seen(
         self,
@@ -3303,6 +3482,7 @@ class DraftRepository:
             chip_text_before_formatting_json=row["chip_text_before_formatting_json"],
             chip_text=row["chip_text"],
             chip_text_formatting_json=row["chip_text_formatting_json"],
+            chip_after_text_action=row["chip_after_text_action"],
             chip_text_after=row["chip_text_after"],
             chip_text_after_formatting_json=row["chip_text_after_formatting_json"],
             priority=row["priority"],

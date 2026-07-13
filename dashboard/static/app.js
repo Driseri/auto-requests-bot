@@ -333,12 +333,14 @@ function durationMetric(stats) {
   const median = stats?.median_seconds;
   const average = stats?.average_seconds;
   const sample = stats?.sample_size || 0;
-  if (median === null || median === undefined) return { main: "нет данных", detail: "нет событий", css: "muted" };
-  return { main: age(median), detail: `среднее ${age(average)}, n=${sample}`, css: "" };
+  if (median === null || median === undefined) return { main: "нет данных", detail: "нет точных событий", css: "muted" };
+  return { main: age(median), detail: `среднее ${age(average)}, n=${sample} · точные события`, css: "" };
 }
 
 function renderPilotKpiCard(target, title, valueText, detailText, css = "") {
-  qs(target).innerHTML = `
+  const element = qs(target);
+  if (!element) return;
+  element.innerHTML = `
     <span>${esc(title)}</span>
     <strong class="${css}">${esc(valueText)}</strong>
     <small>${esc(detailText || "")}</small>
@@ -384,6 +386,37 @@ function renderPilotFunnel(period) {
     </div>
   `).join("");
   qs("#pilot-funnel").innerHTML = html || '<div class="muted">Нет данных для воронки</div>';
+}
+
+function renderPilotUrgencySplit(period) {
+  const target = qs("#pilot-urgency-split");
+  if (!target) return;
+  const kpi = period?.kpi || {};
+  const editor = kpi.first_editor_action_seconds_by_urgency || {};
+  const cycle = kpi.full_cycle_seconds_by_urgency || {};
+  const rows = [
+    ["Срочные", editor.urgent, cycle.urgent],
+    ["Обычные", editor.regular, cycle.regular],
+  ].map(([label, editorStats, cycleStats]) => {
+    const editorMetric = durationMetric(editorStats || {});
+    const cycleMetric = durationMetric(cycleStats || {});
+    return `
+      <div class="pilot-split-row">
+        <strong>${esc(label)}</strong>
+        <div>
+          <span>До действия редактора</span>
+          <b class="${editorMetric.css}">${esc(editorMetric.main)}</b>
+          <small>${esc(editorMetric.detail)}</small>
+        </div>
+        <div>
+          <span>Полный цикл</span>
+          <b class="${cycleMetric.css}">${esc(cycleMetric.main)}</b>
+          <small>${esc(cycleMetric.detail)}</small>
+        </div>
+      </div>
+    `;
+  }).join("");
+  target.innerHTML = rows;
 }
 
 function renderPilotProblems(period) {
@@ -451,6 +484,7 @@ function renderPilot(snapshot) {
   const periodKey = activePilotPeriod || pilot.default_period || "7d";
   const period = pilot.periods?.[periodKey] || { kpi: {}, daily: [], funnel: [], problem_rows: [] };
   const kpi = period.kpi || {};
+  const stickiness = pilot.stickiness || {};
   const quality = pilot.data_quality || {};
   qsa("[data-pilot-period]").forEach((button) => button.classList.toggle("is-active", button.dataset.pilotPeriod === periodKey));
 
@@ -469,6 +503,9 @@ function renderPilot(snapshot) {
   renderPilotKpiCard("#pilot-kpi-editor", "До действия редактора", editor.main, editor.detail, editor.css);
   renderPilotKpiCard("#pilot-kpi-cycle", "Полный цикл", cycle.main, cycle.detail, cycle.css);
   renderPilotKpiCard("#pilot-kpi-quality", "Пояснения / ошибки", `${number(kpi.clarification_share_percent)}%`, `not_found ${number(kpi.not_found_or_tracking_errors)}, уведомления ${number(kpi.notification_errors)}`, kpi.not_found_or_tracking_errors ? "warn" : "");
+  renderPilotKpiCard("#pilot-kpi-stickiness-wau", "Липкость DAU / WAU", `${number(stickiness.dau_wau_percent)}%`, `DAU ${number(stickiness.dau)}, WAU ${number(stickiness.wau)}`, stickiness.dau_wau_percent ? "good" : "muted");
+  renderPilotKpiCard("#pilot-kpi-stickiness-mau", "Липкость DAU / MAU", `${number(stickiness.dau_mau_percent)}%`, `DAU ${number(stickiness.dau)}, MAU ${number(stickiness.mau)}`, stickiness.dau_mau_percent ? "good" : "muted");
+  renderPilotKpiCard("#pilot-kpi-stickiness-wau-mau", "Липкость WAU / MAU", `${number(stickiness.wau_mau_percent)}%`, `WAU ${number(stickiness.wau)}, MAU ${number(stickiness.mau)}`, stickiness.wau_mau_percent ? "good" : "muted");
 
   renderPilotChart("#pilot-chart-applications", "Заявки по дням", period.daily || [], "applications", number);
   renderPilotChart("#pilot-chart-users", "Активные пользователи", period.daily || [], "active_users", number);
@@ -476,6 +513,7 @@ function renderPilot(snapshot) {
   renderPilotChart("#pilot-chart-editor", "Медиана до редактора", period.daily || [], "first_editor_action_median_seconds", age);
   renderPilotChart("#pilot-chart-cycle", "Медиана полного цикла", period.daily || [], "full_cycle_median_seconds", age);
   renderPilotChart("#pilot-chart-issues", "not_found и ошибки", period.daily || [], "not_found_or_errors", number);
+  renderPilotUrgencySplit(period);
   renderPilotEvents(pilot);
   renderPilotFunnel(period);
   renderPilotProblems(period);

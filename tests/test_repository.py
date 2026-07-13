@@ -265,11 +265,101 @@ async def test_index_submitted_application_records_application_indexed_event(tmp
     )
 
     assert len(events) == 1
-    assert events[0].event_at == "2026-07-06T12:30:00+00:00"
+    assert events[0].event_at != "2026-07-06T12:30:00+00:00"
     metadata = json.loads(events[0].metadata_json or "{}")
     assert metadata["row_number"] == 9
     assert metadata["change_type"] == "EDIT"
     assert metadata["is_urgent"] is True
+
+
+@pytest.mark.asyncio
+async def test_save_submitted_application_records_indexed_event_on_new_location(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_indexed_save.db"))
+    await repository.init()
+
+    await repository.save_submitted_application(
+        application_id="APP-SAVE-INDEXED",
+        telegram_user_id=100,
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="01.07",
+        last_known_status=ApplicationStatus.NEW.value,
+        direction="FL",
+        answer_type="regular",
+        application_type="single",
+        change_type="EDIT",
+        is_urgent=False,
+        last_seen_row_number=9,
+        submitted_at="2026-07-06T12:30:00+00:00",
+    )
+
+    events = await repository.list_application_events(
+        application_id="APP-SAVE-INDEXED",
+        event_type="application_indexed",
+    )
+
+    assert len(events) == 1
+    metadata = json.loads(events[0].metadata_json or "{}")
+    assert metadata["row_number"] == 9
+    assert metadata["direction"] == "FL"
+
+
+@pytest.mark.asyncio
+async def test_save_submitted_application_deduplicates_indexed_location(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_indexed_dedupe.db"))
+    await repository.init()
+
+    for _ in range(2):
+        await repository.save_submitted_application(
+            application_id="APP-SAVE-INDEXED",
+            telegram_user_id=100,
+            spreadsheet_id="spreadsheet",
+            sheet_id=123,
+            sheet_name="01.07",
+            last_known_status=ApplicationStatus.NEW.value,
+            last_seen_row_number=9,
+        )
+
+    events = await repository.list_application_events(
+        application_id="APP-SAVE-INDEXED",
+        event_type="application_indexed",
+    )
+
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_submitted_application_records_indexed_event_on_location_change(tmp_path):
+    repository = DraftRepository(str(tmp_path / "events_indexed_change.db"))
+    await repository.init()
+
+    await repository.save_submitted_application(
+        application_id="APP-SAVE-INDEXED",
+        telegram_user_id=100,
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="01.07",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=9,
+    )
+    await repository.save_submitted_application(
+        application_id="APP-SAVE-INDEXED",
+        telegram_user_id=100,
+        spreadsheet_id="spreadsheet",
+        sheet_id=123,
+        sheet_name="01.07",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=10,
+    )
+
+    events = await repository.list_application_events(
+        application_id="APP-SAVE-INDEXED",
+        event_type="application_indexed",
+    )
+
+    assert len(events) == 2
+    latest_metadata = json.loads(events[0].metadata_json or "{}")
+    assert latest_metadata["row_number"] == 10
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#ffffff" />
     <title>Мониторинг | Alfa Auto Requests Bot</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='8' fill='%23e30613'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='Arial' font-size='42' font-weight='800' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260708-pilot-metrics-2" />
   </head>
   <body>
     <div class="app-shell">
@@ -144,6 +144,14 @@
               <article class="card pilot-kpi" id="pilot-kpi-editor"></article>
               <article class="card pilot-kpi" id="pilot-kpi-cycle"></article>
               <article class="card pilot-kpi" id="pilot-kpi-quality"></article>
+              <article class="card pilot-kpi" id="pilot-kpi-stickiness-wau"></article>
+              <article class="card pilot-kpi" id="pilot-kpi-stickiness-mau"></article>
+              <article class="card pilot-kpi" id="pilot-kpi-stickiness-wau-mau"></article>
+            </section>
+
+            <section class="dashboard-section">
+              <div class="section-heading"><h2>Срочные / обычные</h2><span>Временные метрики без пересечения бизнес-групп</span></div>
+              <article class="card pilot-split-card" id="pilot-urgency-split"></article>
             </section>
 
             <section class="dashboard-section">
@@ -282,6 +290,6 @@
         </footer>
       </div>
     </div>
-    <script src="/static/app.js" defer></script>
+    <script src="/static/app.js?v=20260708-pilot-metrics-2" defer></script>
   </body>
 </html>

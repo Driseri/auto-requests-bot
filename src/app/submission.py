@@ -1,13 +1,14 @@
 ﻿from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from app.formatting import build_text_format_runs, deserialize_formatting_spans
@@ -25,6 +26,7 @@ from app.models import (
     DashboardOutboxItem,
     Direction,
     Draft,
+    LinkedSubmissionResult,
     SubmittedApplication,
     SubmissionResult,
 )
@@ -240,6 +242,15 @@ class SubmissionServiceProtocol(Protocol):
     async def submit(self, application: Draft) -> SubmissionResult:
         ...
 
+    async def submit_chips_with_response(
+        self,
+        chips: Draft,
+        response: Draft,
+        *,
+        on_success: Callable[[LinkedSubmissionResult], Awaitable[None]],
+    ) -> LinkedSubmissionResult:
+        ...
+
 
 class InMemorySubmissionService:
     def __init__(self) -> None:
@@ -283,6 +294,25 @@ class InMemorySubmissionService:
             row_number=len(self.submitted) + 1,
             row_link="https://docs.google.com/spreadsheets/d/test-spreadsheet/edit#gid=100&range=A2:V2",
         )
+
+    async def submit_chips_with_response(
+        self,
+        chips: Draft,
+        response: Draft,
+        *,
+        on_success: Callable[[LinkedSubmissionResult], Awaitable[None]],
+    ) -> LinkedSubmissionResult:
+        response_result = await self.submit(response)
+        chips_result = await self.submit(chips)
+        result = LinkedSubmissionResult(
+            success=response_result.success and chips_result.success,
+            message="Созданы CHIPS и отдельная заявка на текст после чипса.",
+            chips_result=chips_result,
+            response_result=response_result,
+        )
+        if result.success:
+            await on_success(result)
+        return result
 
 
 class SheetConfigurationError(RuntimeError):
@@ -467,6 +497,268 @@ class GoogleSheetsSubmissionService:
                 ),
             )
         return result
+
+    async def submit_chips_with_response(
+        self,
+        chips: Draft,
+        response: Draft,
+        *,
+        on_success: Callable[[LinkedSubmissionResult], Awaitable[None]],
+    ) -> LinkedSubmissionResult:
+        """Записать CHIPS и ADD/EDIT как независимые строки одной операцией."""
+        submitted_at = self.clock()
+        spreadsheet_id, sheet_name = self._resolve_target(chips, submitted_at=submitted_at)
+        response_target = self._resolve_target(response, submitted_at=submitted_at)
+        if response_target != (spreadsheet_id, sheet_name):
+            return LinkedSubmissionResult(False, "Не удалось определить общий лист для заявок.")
+        if chips.answer_type not in {AnswerType.ROLLOUT.value, AnswerType.URGENT.value}:
+            return LinkedSubmissionResult(False, "Парная CHIPS-заявка для этого типа ответа не поддерживается.")
+
+        lock_keys = sorted(
+            {
+                sheet_section_lock_key(
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_name=sheet_name,
+                    section_kind=sheet_section_kind(
+                        answer_type=item.answer_type,
+                        change_type=ChangeType.normalize(item.change_type),
+                    ),
+                )
+                for item in (chips, response)
+            }
+        )
+        owner = f"linked:{chips.application_id}"
+        acquired: list[str] = []
+        try:
+            async with AsyncExitStack() as stack:
+                for lock_key in lock_keys:
+                    await stack.enter_async_context(
+                        self._section_locks.setdefault(lock_key, asyncio.Lock())
+                    )
+                for lock_key in lock_keys:
+                    if self.repository is not None:
+                        if not await self.repository.acquire_bulk_section_lock(
+                            lock_key=lock_key,
+                            owner=owner,
+                            ttl_seconds=SECTION_LOCK_TTL_SECONDS,
+                        ):
+                            return LinkedSubmissionResult(
+                                False,
+                                "Сейчас другой пользователь вносит строки в этот раздел. "
+                                "Повторите отправку через несколько секунд.",
+                            )
+                        acquired.append(lock_key)
+                if chips.application_id == response.application_id:
+                    return LinkedSubmissionResult(
+                        False,
+                        "Не удалось безопасно сформировать ID второй заявки. "
+                        "Повторите отправку через несколько секунд.",
+                    )
+                if self.repository is not None:
+                    for application_id in (chips.application_id, response.application_id):
+                        if application_id and await self.repository.get_submitted_application(application_id):
+                            return LinkedSubmissionResult(
+                                False,
+                                "Один из ID связанных заявок уже используется в другой заявке. "
+                                "Автоматическая запись остановлена во избежание перезаписи данных.",
+                            )
+                result = await execute_with_retry_async(
+                    lambda: self._submit_chips_with_response_sync(
+                        chips,
+                        response,
+                        submitted_at,
+                        spreadsheet_id=spreadsheet_id,
+                        sheet_name=sheet_name,
+                    ),
+                    config=self.google_api_retry,
+                    operation_id=f"submit-linked-chips:{chips.application_id}",
+                    reset_client=self._reset_sheets_api,
+                )
+                if result.success:
+                    await on_success(result)
+                return result
+        except Exception as exc:
+            if is_google_rate_limit_error(exc):
+                return LinkedSubmissionResult(
+                    False,
+                    "Google API временно перегружен и не принял заявки.\n\n"
+                    "Повторите отправку через 2-3 минуты. Черновик сохранён.",
+                )
+            return LinkedSubmissionResult(
+                False,
+                "Не удалось безопасно отправить связанные заявки в Google-таблицу. "
+                f"Причина: {exc}",
+            )
+        finally:
+            if self.repository is not None:
+                for lock_key in reversed(acquired):
+                    await self.repository.release_bulk_section_lock(
+                        lock_key=lock_key,
+                        owner=owner,
+                    )
+
+    def _submit_chips_with_response_sync(
+        self,
+        chips: Draft,
+        response: Draft,
+        submitted_at: datetime,
+        *,
+        spreadsheet_id: str,
+        sheet_name: str,
+    ) -> LinkedSubmissionResult:
+        api = self._get_sheets_api()
+        sheet_mode = "rollout" if chips.answer_type == AnswerType.ROLLOUT.value else "urgent"
+        response_type = ChangeType.normalize(response.change_type)
+        chips_type = ChangeType.CHIPS
+        sheet_id, response_layout, response_marker = self._ensure_sheet_ready(
+            api, spreadsheet_id, sheet_name,
+            sheet_mode=sheet_mode, change_type=response_type,
+        )
+        _, chips_layout, chips_marker = self._ensure_sheet_ready(
+            api, spreadsheet_id, sheet_name,
+            sheet_mode=sheet_mode, change_type=chips_type,
+        )
+        rows = self._read_rows(api, spreadsheet_id, sheet_name)
+        chips_row = _find_application_row_in_rows(rows, chips.application_id)
+        response_row = _find_application_row_in_rows(rows, response.application_id)
+        if (chips_row is None) != (response_row is None):
+            raise SheetConfigurationError(
+                "Найдена только одна строка из пары CHIPS + ADD/EDIT. "
+                "Автоматическая дозапись заблокирована во избежание дубля."
+            )
+        if chips_row is not None and response_row is not None:
+            if not _application_row_belongs_to_draft(rows, chips_row, chips):
+                raise SheetConfigurationError(
+                    "ID CHIPS-заявки уже занят строкой с другими техническими данными."
+                )
+            if not _application_row_belongs_to_draft(rows, response_row, response):
+                raise SheetConfigurationError(
+                    "Вычисленный ID второй заявки уже принадлежит посторонней строке."
+                )
+
+        response_schema = response_layout.split(":", 1)[1]
+        chips_schema = chips_layout.split(":", 1)[1]
+        submitted_at_iso = utc_iso(submitted_at)
+        if chips_row is not None and response_row is not None:
+            result = LinkedSubmissionResult(
+                True,
+                "Обе заявки уже были отправлены в таблицу.",
+                chips_result=_existing_submission_result(
+                    spreadsheet_id, sheet_id, sheet_name, chips_row, chips_schema
+                ),
+                response_result=_existing_submission_result(
+                    spreadsheet_id, sheet_id, sheet_name, response_row, response_schema
+                ),
+            )
+            result.chips_result.submitted_at = submitted_at_iso
+            result.response_result.submitted_at = submitted_at_iso
+            return result
+
+        response_data = _draft_to_row_data(
+            response,
+            submitted_at=submitted_at,
+            timezone_name=self.timezone_name,
+            application_editors=self.application_editors,
+            schema=response_schema,
+        )
+        chips_data = _draft_to_row_data(
+            chips,
+            submitted_at=submitted_at,
+            timezone_name=self.timezone_name,
+            application_editors=self.application_editors,
+            schema=chips_schema,
+        )
+        label = daily_separator_label(submitted_at, self.timezone_name)
+        if sheet_mode == "urgent":
+            response_plan = _urgent_daily_insert_plan(
+                rows, label=label, sheet_id=sheet_id,
+                change_type=response_type or ChangeType.ADD, row_data=response_data,
+            )
+        else:
+            response_plan = _section_insert_plan(
+                rows, sheet_id=sheet_id,
+                change_type=response_type or ChangeType.ADD,
+                row_data=response_data, target_marker=response_marker,
+            )
+        virtual_rows = _simulate_insert_plan(rows, response_plan)
+        if sheet_mode == "urgent":
+            chips_plan = _urgent_daily_insert_plan(
+                virtual_rows, label=label, sheet_id=sheet_id,
+                change_type=chips_type, row_data=chips_data,
+            )
+        else:
+            chips_plan = _section_insert_plan(
+                virtual_rows, sheet_id=sheet_id, change_type=chips_type,
+                row_data=chips_data, target_marker=chips_marker,
+            )
+
+        response_row = int(response_plan["row_number"])
+        chips_row = int(chips_plan["row_number"])
+        chips_link = spreadsheet_row_link(
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            row_number=chips_row,
+            end_column=_worksheet_schema_layout(chips_schema)["end_column"],
+        )
+        response_link = spreadsheet_row_link(
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            row_number=response_row,
+            end_column=_worksheet_schema_layout(response_schema)["end_column"],
+        )
+        _decorate_linked_text_cell(
+            response_data,
+            _worksheet_schema_layout(response_schema)["source_text"],
+            note=f"Связанная CHIPS-заявка {chips.application_id}: {chips_link}",
+        )
+        _decorate_linked_text_cell(
+            chips_data,
+            5,
+            note=(
+                f"Связанная {response.change_type}-заявка "
+                f"{response.application_id}: {response_link}"
+            ),
+        )
+        requests = [*response_plan["requests"], *chips_plan["requests"]]
+        requests.extend(
+            _application_metadata_request(sheet_id, row, application_id)
+            for row, application_id in (
+                (response_row, response.application_id or ""),
+                (chips_row, chips.application_id or ""),
+            )
+        )
+        api.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+        for plan in (response_plan, chips_plan):
+            self._apply_daily_group_best_effort(
+                api,
+                spreadsheet_id=spreadsheet_id,
+                group_request=plan.get("group_request"),
+            )
+        shifts = tuple(
+            (spreadsheet_id, sheet_id, int(plan["shift_from_row"]), int(plan["shift_delta"]))
+            for plan in (response_plan, chips_plan)
+            if plan.get("shift_from_row") is not None
+        )
+        return LinkedSubmissionResult(
+            True,
+            "Созданы CHIPS и отдельная заявка на текст после чипса.",
+            chips_result=SubmissionResult(
+                True, "CHIPS-заявка отправлена.", spreadsheet_id, sheet_id,
+                sheet_name, chips_row,
+                chips_link,
+                submitted_at_iso,
+            ),
+            response_result=SubmissionResult(
+                True, "Заявка на текст после чипса отправлена.", spreadsheet_id, sheet_id,
+                sheet_name, response_row,
+                response_link,
+                submitted_at_iso,
+            ),
+            row_shifts=shifts,
+        )
 
     def _reset_sheets_api(self) -> None:
         if self._external_sheets_api:
@@ -1343,90 +1635,23 @@ class GoogleSheetsSubmissionService:
         *,
         target_marker: str | None = None,
     ) -> _InsertedRow:
-        if change_type is None:
-            raise SheetConfigurationError(
-                "Для раскатки не выбран тип изменения ADD, EDIT или CHIPS."
-            )
         rows = self._read_rows(api, spreadsheet_id, sheet_name)
-        if not rows:
-            rows = [
-                item
-                for marker in ROLLOUT_SECTION_MARKERS
-                for item in (
-                    [marker],
-                    CHIPS_WORKSHEET_HEADERS
-                    if marker == ChangeType.CHIPS.value
-                    else WORKSHEET_HEADERS,
-                )
-            ]
-        marker_rows = {
-            _cell(row, 0).strip(): index + 1
-            for index, row in enumerate(rows)
-            if _cell(row, 0).strip() in ALL_ROLLOUT_SECTION_MARKERS
-        }
-        if not set(ROLLOUT_SECTION_MARKERS) <= set(marker_rows):
-            raise SheetConfigurationError(
-                "В недельной вкладке повреждена структура секций ADD, EDIT и CHIPS."
-            )
-
-        selected_marker = target_marker or change_type.value
-        selected_row = marker_rows.get(selected_marker)
-        if selected_row is None:
-            raise SheetConfigurationError(f"Секция {selected_marker} не найдена.")
-        following_rows = sorted(row for row in marker_rows.values() if row > selected_row)
-        if following_rows:
-            row_number = following_rows[0]
-            shift_from_row = row_number
-            insert_index = row_number - 1
-            requests = [
-                {
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": insert_index,
-                            "endIndex": insert_index + 1,
-                        },
-                        "inheritFromBefore": True,
-                    }
-                },
-                {
-                    "updateCells": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": insert_index,
-                            "endRowIndex": insert_index + 1,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": len(row_data["values"]),
-                        },
-                        "rows": [row_data],
-                        "fields": (
-                            "userEnteredValue,dataValidation,"
-                            "userEnteredFormat,textFormatRuns"
-                        ),
-                    }
-                },
-            ]
-        else:
-            row_number = len(rows) + 1
-            shift_from_row = None
-            requests = [
-                {
-                    "appendCells": {
-                        "sheetId": sheet_id,
-                        "rows": [row_data],
-                        "fields": (
-                            "userEnteredValue,dataValidation,"
-                            "userEnteredFormat,textFormatRuns"
-                        ),
-                    }
-                }
-            ]
+        plan = _section_insert_plan(
+            rows,
+            sheet_id=sheet_id,
+            change_type=change_type,
+            row_data=row_data,
+            target_marker=target_marker,
+        )
         api.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
-            body={"requests": requests},
+            body={"requests": plan["requests"]},
         ).execute()
-        return _InsertedRow(row_number=row_number, shift_from_row=shift_from_row)
+        return _InsertedRow(
+            row_number=plan["row_number"],
+            shift_from_row=plan["shift_from_row"],
+            shift_delta=plan["shift_delta"],
+        )
 
     def _insert_urgent_row(
         self,
@@ -3154,6 +3379,96 @@ def _daily_insert_plan(
     }
 
 
+def _section_insert_plan(
+    rows: list[list[Any]],
+    *,
+    sheet_id: int,
+    change_type: ChangeType | None,
+    row_data: dict[str, Any],
+    target_marker: str | None = None,
+) -> dict[str, Any]:
+    if change_type is None:
+        raise SheetConfigurationError("Для раскатки не выбран тип изменения ADD, EDIT или CHIPS.")
+    if not rows:
+        rows = [
+            item
+            for marker in ROLLOUT_SECTION_MARKERS
+            for item in (
+                [marker],
+                CHIPS_WORKSHEET_HEADERS if marker == ChangeType.CHIPS.value else WORKSHEET_HEADERS,
+            )
+        ]
+    marker_rows = {
+        _cell(row, 0).strip(): index + 1
+        for index, row in enumerate(rows)
+        if _cell(row, 0).strip() in ALL_ROLLOUT_SECTION_MARKERS
+    }
+    if not set(ROLLOUT_SECTION_MARKERS) <= set(marker_rows):
+        raise SheetConfigurationError(
+            "В недельной вкладке повреждена структура секций ADD, EDIT и CHIPS."
+        )
+    selected_marker = target_marker or change_type.value
+    selected_row = marker_rows.get(selected_marker)
+    if selected_row is None:
+        raise SheetConfigurationError(f"Секция {selected_marker} не найдена.")
+    following = sorted(row for row in marker_rows.values() if row > selected_row)
+    insert_row = following[0] if following else len(rows) + 1
+    insert_index = insert_row - 1
+    shift_from_row = insert_row if insert_row <= len(rows) else None
+    if insert_row <= len(rows):
+        requests = [
+            {
+                "insertDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": insert_index,
+                        "endIndex": insert_index + 1,
+                    },
+                    "inheritFromBefore": True,
+                }
+            },
+            {
+                "updateCells": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": insert_index,
+                        "endRowIndex": insert_index + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(row_data["values"]),
+                    },
+                    "rows": [row_data],
+                    "fields": (
+                        "userEnteredValue,dataValidation,userEnteredFormat,"
+                        "textFormatRuns,note"
+                    ),
+                }
+            },
+        ]
+    else:
+        requests = [
+            {
+                "appendCells": {
+                    "sheetId": sheet_id,
+                    "rows": [row_data],
+                    "fields": (
+                        "userEnteredValue,dataValidation,userEnteredFormat,"
+                        "textFormatRuns,note"
+                    ),
+                }
+            }
+        ]
+    return {
+        "row_number": insert_row,
+        "insert_row": insert_row,
+        "shift_from_row": shift_from_row,
+        "shift_delta": 1,
+        "update_rows": [row_data],
+        "requests": requests,
+        "group_request": None,
+    }
+
+
 def _urgent_daily_insert_plan(
     rows: list[list[Any]],
     *,
@@ -3262,22 +3577,185 @@ def _urgent_daily_insert_plan(
                         "endColumnIndex": column_count,
                     },
                     "rows": update_rows,
-                    "fields": (
-                        "userEnteredValue,dataValidation,"
-                        "userEnteredFormat,textFormatRuns"
-                    ),
+                        "fields": (
+                            "userEnteredValue,dataValidation,"
+                            "userEnteredFormat,textFormatRuns,note"
+                        ),
                 }
             },
         ]
     )
     return {
         "row_number": row_number,
+        "insert_row": insert_row,
         "shift_from_row": insert_row if insert_row <= len(rows) else None,
         "shift_delta": inserted_rows,
+        "update_rows": update_rows,
         "requests": requests,
         "group_request": group_request,
         "protected_rows": protected_rows,
     }
+
+
+def _simulate_insert_plan(
+    rows: list[list[Any]],
+    plan: dict[str, Any],
+) -> list[list[Any]]:
+    simulated = [list(row) for row in rows]
+    values = [_row_data_to_values(row) for row in plan["update_rows"]]
+    simulated[int(plan["insert_row"]) - 1 : int(plan["insert_row"]) - 1] = values
+    return simulated
+
+
+def _row_data_to_values(row_data: dict[str, Any]) -> list[Any]:
+    result: list[Any] = []
+    for cell in row_data.get("values", []):
+        value = cell.get("userEnteredValue", {})
+        result.append(
+            value.get("stringValue", value.get("numberValue", value.get("boolValue", "")))
+        )
+    return result
+
+
+def _decorate_linked_text_cell(
+    row_data: dict[str, Any],
+    column_index: int | tuple[int, ...],
+    *,
+    note: str,
+) -> None:
+    if isinstance(column_index, tuple):
+        raise ValueError("Linked response text must use one source-text column")
+    cell = row_data["values"][column_index]
+    cell["note"] = note
+    cell.setdefault("userEnteredFormat", {})["backgroundColor"] = {
+        "red": 234 / 255,
+        "green": 220 / 255,
+        "blue": 248 / 255,
+    }
+
+
+def _application_metadata_request(
+    sheet_id: int,
+    row_number: int,
+    application_id: str,
+) -> dict[str, Any]:
+    return {
+        "createDeveloperMetadata": {
+            "developerMetadata": {
+                "metadataKey": "application_id",
+                "metadataValue": application_id,
+                "visibility": "DOCUMENT",
+                "location": {
+                    "dimensionRange": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_number - 1,
+                        "endIndex": row_number,
+                    }
+                },
+            }
+        }
+    }
+
+
+def _find_application_row_in_rows(
+    rows: list[list[Any]],
+    application_id: str | None,
+) -> int | None:
+    if not application_id:
+        return None
+    id_column_index: int | None = None
+    known_headers = (
+        CHIPS_WORKSHEET_HEADERS,
+        PREVIOUS_CHIPS_WORKSHEET_HEADERS,
+        WORKSHEET_HEADERS,
+        PREVIOUS_WORKSHEET_HEADERS,
+        CURRENT_WORKSHEET_HEADERS,
+        LEGACY_WORKSHEET_HEADERS,
+    )
+    for row_number, row in enumerate(rows, start=1):
+        if is_daily_separator_row(row):
+            id_column_index = WORKSHEET_HEADERS.index("ID заявки")
+            continue
+        normalized = [str(value).strip() for value in row]
+        matched = next(
+            (headers for headers in known_headers if normalized[: len(headers)] == headers),
+            None,
+        )
+        if matched is not None:
+            id_column_index = matched.index("ID заявки")
+            continue
+        if (
+            id_column_index is not None
+            and len(normalized) > id_column_index
+            and normalized[id_column_index] == application_id
+        ):
+            return row_number
+    return None
+
+
+def _application_row_belongs_to_draft(
+    rows: list[list[Any]],
+    row_number: int,
+    draft: Draft,
+) -> bool:
+    headers: list[str] | None = None
+    known_headers = (
+        CHIPS_WORKSHEET_HEADERS,
+        PREVIOUS_CHIPS_WORKSHEET_HEADERS,
+        WORKSHEET_HEADERS,
+        PREVIOUS_WORKSHEET_HEADERS,
+        CURRENT_WORKSHEET_HEADERS,
+        LEGACY_WORKSHEET_HEADERS,
+    )
+    for candidate in rows[:row_number]:
+        if is_daily_separator_row(candidate):
+            # A daily block always starts with the regular ADD/EDIT layout.
+            headers = WORKSHEET_HEADERS
+            continue
+        normalized = [str(value).strip() for value in candidate]
+        matched = next(
+            (item for item in known_headers if normalized[: len(item)] == item),
+            None,
+        )
+        if matched is not None:
+            headers = matched
+    if headers is None or row_number < 1 or row_number > len(rows):
+        return False
+    row = rows[row_number - 1]
+
+    def value(name: str) -> str:
+        index = headers.index(name)
+        return _cell(row, index).strip()
+
+    return (
+        value("ID заявки") == (draft.application_id or "")
+        and value("Telegram ID") == str(draft.telegram_user_id)
+        and value("Тип изменения") == (draft.change_type or "")
+    )
+
+
+def _existing_submission_result(
+    spreadsheet_id: str,
+    sheet_id: int,
+    sheet_name: str,
+    row_number: int,
+    schema: str,
+) -> SubmissionResult:
+    return SubmissionResult(
+        success=True,
+        message="Заявка уже отправлена в таблицу.",
+        spreadsheet_id=spreadsheet_id,
+        sheet_id=sheet_id,
+        sheet_name=sheet_name,
+        row_number=row_number,
+        row_link=spreadsheet_row_link(
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            row_number=row_number,
+            end_column=_worksheet_schema_layout(schema)["end_column"],
+        ),
+    )
 
 
 def _chips_marker_row_in_day(

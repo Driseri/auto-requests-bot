@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -381,10 +382,19 @@ def test_pilot_metrics_are_normalized_from_snapshot(tmp_path: Path) -> None:
     assert period["kpi"]["creation_time_seconds"]["median_seconds"] == 600
     assert period["kpi"]["first_editor_action_seconds"]["median_seconds"] == 1800
     assert period["kpi"]["full_cycle_seconds"]["median_seconds"] == 3600
+    assert period["kpi"]["first_editor_action_seconds_by_urgency"]["regular"]["median_seconds"] == 1800
+    assert period["kpi"]["first_editor_action_seconds_by_urgency"]["urgent"]["median_seconds"] is None
+    assert period["kpi"]["full_cycle_seconds_by_urgency"]["regular"]["median_seconds"] == 3600
+    assert period["kpi"]["full_cycle_seconds_by_urgency"]["urgent"]["median_seconds"] is None
     assert period["kpi"]["not_found_or_tracking_errors"] == 1
+    assert snapshot["pilot"]["stickiness"]["wau"] == 2
+    assert snapshot["pilot"]["stickiness"]["mau"] == 2
     assert period["problem_rows"]
     funnel = {item["key"]: item for item in period["funnel"]}
-    assert funnel["user_response"]["count"] == 1
+    assert funnel["submitted"]["count"] == 1
+    assert funnel["sheets_visible"]["count"] == 1
+    assert funnel["final_answer"]["count"] == 1
+    assert funnel["user_response"]["count"] == 0
     assert funnel["submitted"]["average_transition_seconds"] == 600
     assert funnel["sheets_visible"]["average_transition_seconds"] == 300
     assert funnel["status_changed"]["average_transition_seconds"] == 1500
@@ -393,6 +403,123 @@ def test_pilot_metrics_are_normalized_from_snapshot(tmp_path: Path) -> None:
         {"status": "Некорректные статусы/интенты", "count": 3},
         {"status": "Новая", "count": 2},
     ]
+
+
+def test_pilot_stickiness_counts_unique_submission_users(tmp_path: Path) -> None:
+    payload = sample_pilot_payload()
+    now = datetime.now(timezone.utc)
+    today = now.isoformat()
+    yesterday = (now - timedelta(days=1)).isoformat()
+    old = (now - timedelta(days=20)).isoformat()
+    apps = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]["applications"]
+    apps[:] = [
+        {**apps[0], "application_id": "APP-TODAY-1", "telegram_user_id": 100, "submitted_at": today, "created_at": today},
+        {**apps[0], "application_id": "APP-TODAY-2", "telegram_user_id": 100, "submitted_at": today, "created_at": today},
+        {**apps[0], "application_id": "APP-WEEK", "telegram_user_id": 200, "submitted_at": yesterday, "created_at": yesterday},
+        {**apps[0], "application_id": "APP-MONTH", "telegram_user_id": 300, "submitted_at": old, "created_at": old},
+    ]
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    app = create_app(config_path=tmp_path / "config.local.toml", collector=collector)
+    client = TestClient(app)
+
+    response = client.post("/api/collect")
+
+    stickiness = response.json()["snapshot"]["pilot"]["stickiness"]
+    assert stickiness["dau"] == 1
+    assert stickiness["wau"] == 2
+    assert stickiness["mau"] == 3
+    assert stickiness["dau_wau_percent"] == 50
+    assert stickiness["dau_mau_percent"] == 33
+    assert stickiness["wau_mau_percent"] == 67
+
+
+def test_pilot_funnel_counts_unique_applications_for_repeated_events(tmp_path: Path) -> None:
+    payload = sample_pilot_payload()
+    events = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]["events"]
+    events.extend(
+        [
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
+                "event_type": "final_answer_added",
+                "event_at": "2026-07-06T09:05:00+00:00",
+                "old_value": "",
+                "new_value": "present again",
+            },
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
+                "event_type": "editor_changed",
+                "event_at": "2026-07-06T08:40:00+00:00",
+                "old_value": "",
+                "new_value": "Редактор 2",
+            },
+        ]
+    )
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    app = create_app(config_path=tmp_path / "config.local.toml", collector=collector)
+    client = TestClient(app)
+
+    response = client.post("/api/collect")
+
+    funnel = {item["key"]: item["count"] for item in response.json()["snapshot"]["pilot"]["periods"]["7d"]["funnel"]}
+    assert funnel["final_answer"] == 1
+    assert funnel["status_changed"] == 1
+
+
+def test_pilot_metrics_do_not_use_current_state_fallbacks(tmp_path: Path) -> None:
+    payload = sample_pilot_payload()
+    raw = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]
+    raw["applications"] = [
+        {
+            **raw["applications"][0],
+            "application_id": "APP-FALLBACK",
+            "is_urgent": 1,
+            "last_seen_row_number": 44,
+            "last_known_status": "Итоговый ответ готов",
+            "last_seen_editor": "Редактор",
+            "has_editor_comment": 1,
+            "has_final_answer": 1,
+            "has_scriptwriter_response": 1,
+            "submitted_at": "2026-07-06T08:00:00+00:00",
+            "updated_at": "2026-07-06T12:00:00+00:00",
+        }
+    ]
+    raw["events"] = [
+        {
+            "application_id": "APP-FALLBACK",
+            "telegram_user_id": 100,
+            "event_type": "application_submitted",
+            "event_at": "2026-07-06T08:00:00+00:00",
+            "old_value": None,
+            "new_value": None,
+        }
+    ]
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    app = create_app(config_path=tmp_path / "config.local.toml", collector=collector)
+    client = TestClient(app)
+
+    response = client.post("/api/collect")
+
+    period = response.json()["snapshot"]["pilot"]["periods"]["7d"]
+    kpi = period["kpi"]
+    assert kpi["first_editor_action_seconds"]["sample_size"] == 0
+    assert kpi["full_cycle_seconds"]["sample_size"] == 0
+    assert kpi["first_editor_action_seconds_by_urgency"]["urgent"]["sample_size"] == 0
+    assert kpi["full_cycle_seconds_by_urgency"]["urgent"]["sample_size"] == 0
+    funnel = {item["key"]: item for item in period["funnel"]}
+    assert funnel["submitted"]["count"] == 1
+    assert funnel["sheets_visible"]["count"] == 0
+    assert funnel["editor_comment"]["count"] == 0
+    assert funnel["user_response"]["count"] == 0
+    assert funnel["final_answer"]["count"] == 0
+    assert funnel["status_changed"]["count"] == 0
 
 
 def test_pilot_metrics_handle_missing_events(tmp_path: Path) -> None:
@@ -409,6 +536,23 @@ def test_pilot_metrics_handle_missing_events(tmp_path: Path) -> None:
     pilot = response.json()["snapshot"]["pilot"]
     assert pilot["data_quality"]["status"] == "missing_events"
     assert pilot["periods"]["7d"]["kpi"]["creation_time_seconds"]["median_seconds"] is None
+
+
+def test_pilot_metrics_mark_partial_events(tmp_path: Path) -> None:
+    payload = sample_pilot_payload()
+    raw = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]
+    raw["events"] = [event for event in raw["events"] if event["event_type"] == "application_submitted"]
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    app = create_app(config_path=tmp_path / "config.local.toml", collector=collector)
+    client = TestClient(app)
+
+    response = client.post("/api/collect")
+
+    pilot = response.json()["snapshot"]["pilot"]
+    assert pilot["data_quality"]["status"] == "partial_events"
+    assert any("fallback" in note for note in pilot["data_quality"]["notes"])
 
 
 def test_pilot_metrics_match_actual_application_event_names(tmp_path: Path) -> None:

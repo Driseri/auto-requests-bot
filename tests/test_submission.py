@@ -51,6 +51,7 @@ from app.submission import (
     _dashboard_duplicate_row_numbers,
     _repair_dashboard_headers,
     _repair_sheet_bool,
+    _application_row_belongs_to_draft,
     _working_sheet_schema,
     draft_to_sheet_row,
     sheet_protection_requests,
@@ -1181,6 +1182,256 @@ async def test_sectioned_week_sheet_writes_to_selected_section(
         assert write_requests[0]["insertDimension"]["range"]["startIndex"] == expected_insert_index
         assert "updateCells" in write_requests[1]
         assert result.row_number == expected_insert_index + 1
+
+
+@pytest.mark.asyncio
+async def test_linked_chips_submission_uses_one_batch_with_notes_and_metadata():
+    rows = [
+        ["ADD"],
+        SHEET_HEADERS,
+        ["EDIT"],
+        SHEET_HEADERS,
+        ["CHIPS"],
+        CHIPS_WORKSHEET_HEADERS,
+    ]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): rows},
+    )
+    service = make_service(api)
+    chips = make_draft(
+        application_id="C1C2C3C4",
+        change_type=ChangeType.CHIPS.value,
+        chip_text_before="before",
+        chip_text="chip",
+        chip_text_after="after",
+    )
+    response = make_draft(
+        application_id="A1A2A3A4",
+        change_type=ChangeType.ADD.value,
+        source_text="after",
+    )
+    callbacks = []
+
+    async def on_success(result):
+        callbacks.append(result)
+
+    result = await service.submit_chips_with_response(
+        chips,
+        response,
+        on_success=on_success,
+    )
+
+    assert result.success is True
+    assert callbacks == [result]
+    assert len(api.batch_updates) == 1
+    requests = api.batch_updates[0]["body"]["requests"]
+    metadata = [item for item in requests if "createDeveloperMetadata" in item]
+    assert {item["createDeveloperMetadata"]["developerMetadata"]["metadataValue"] for item in metadata} == {
+        "C1C2C3C4",
+        "A1A2A3A4",
+    }
+    row_updates = [item["updateCells"] for item in requests if "updateCells" in item]
+    row_updates.extend(
+        item["appendCells"] for item in requests if "appendCells" in item
+    )
+    linked_cells = [
+        cell
+        for update in row_updates
+        for row in update["rows"]
+        for cell in row["values"]
+        if cell.get("note")
+    ]
+    assert len(linked_cells) == 2
+    notes = [cell["note"] for cell in linked_cells]
+    assert any("C1C2C3C4" in note for note in notes)
+    assert any("A1A2A3A4" in note for note in notes)
+    assert all("https://docs.google.com/spreadsheets/d/fl-spreadsheet/" in note for note in notes)
+    assert all(
+        cell["userEnteredFormat"]["backgroundColor"]
+        == {"red": 234 / 255, "green": 220 / 255, "blue": 248 / 255}
+        for cell in linked_cells
+    )
+
+
+@pytest.mark.asyncio
+async def test_linked_chips_submission_fails_closed_when_only_one_id_exists():
+    existing_chips = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    existing_chips[CHIPS_WORKSHEET_HEADERS.index("ID заявки")] = "C1C2C3C4"
+    rows = [
+        ["ADD"],
+        SHEET_HEADERS,
+        ["EDIT"],
+        SHEET_HEADERS,
+        ["CHIPS"],
+        CHIPS_WORKSHEET_HEADERS,
+        existing_chips,
+    ]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): rows},
+    )
+    service = make_service(api)
+    chips = make_draft(
+        application_id="C1C2C3C4",
+        change_type=ChangeType.CHIPS.value,
+        chip_text_before="before",
+        chip_text="chip",
+        chip_text_after="after",
+    )
+    response = make_draft(application_id="A1A2A3A4", change_type=ChangeType.ADD.value)
+
+    result = await service.submit_chips_with_response(
+        chips,
+        response,
+        on_success=lambda result: None,
+    )
+
+    assert result.success is False
+    assert "только одна строка" in result.message
+    assert api.batch_updates == []
+
+
+@pytest.mark.asyncio
+async def test_linked_chips_submission_rejects_id_tracked_on_another_sheet(tmp_path):
+    repository = DraftRepository(str(tmp_path / "linked_id_conflict.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1A2A3A4",
+        telegram_user_id=999,
+        spreadsheet_id="other-spreadsheet",
+        sheet_id=7,
+        sheet_name="Other sheet",
+        last_known_status=ApplicationStatus.NEW.value,
+        last_seen_row_number=10,
+    )
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): [["ADD"], SHEET_HEADERS, ["CHIPS"], CHIPS_WORKSHEET_HEADERS]},
+    )
+    service = make_service(api, repository=repository)
+    chips = make_draft(
+        application_id="C1C2C3C4",
+        change_type=ChangeType.CHIPS.value,
+        chip_text_before="before",
+        chip_text="chip",
+        chip_text_after="after",
+    )
+    response = make_draft(application_id="A1A2A3A4", change_type=ChangeType.ADD.value)
+
+    result = await service.submit_chips_with_response(
+        chips,
+        response,
+        on_success=lambda result: None,
+    )
+
+    assert result.success is False
+    assert "уже используется" in result.message
+    assert api.batch_updates == []
+
+
+@pytest.mark.asyncio
+async def test_linked_chips_submission_rejects_same_id_for_both_rows():
+    api = FakeSheetsApi()
+    service = make_service(api)
+    chips = make_draft(
+        application_id="C1C2C3C4",
+        change_type=ChangeType.CHIPS.value,
+        chip_text_before="before",
+        chip_text="chip",
+        chip_text_after="after",
+    )
+    response = make_draft(application_id="C1C2C3C4", change_type=ChangeType.ADD.value)
+
+    result = await service.submit_chips_with_response(
+        chips,
+        response,
+        on_success=lambda result: None,
+    )
+
+    assert result.success is False
+    assert "сформировать ID" in result.message
+    assert api.batch_updates == []
+
+
+def test_linked_retry_resets_layout_at_urgent_daily_separator():
+    previous_day_chips = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    previous_day_chips[CHIPS_WORKSHEET_HEADERS.index("ID заявки")] = "OLDCHIPS"
+    response_row = [""] * len(SHEET_HEADERS)
+    response_row[SHEET_HEADERS.index("ID заявки")] = "A1A2A3A4"
+    response_row[SHEET_HEADERS.index("Telegram ID")] = 123
+    response_row[SHEET_HEADERS.index("Тип изменения")] = ChangeType.ADD.value
+    response = make_draft(application_id="A1A2A3A4", change_type=ChangeType.ADD.value)
+    rows = [
+        SHEET_HEADERS,
+        ["12.07.26"],
+        ["CHIPS"],
+        CHIPS_WORKSHEET_HEADERS,
+        previous_day_chips,
+        ["13.07.26"],
+        response_row,
+    ]
+
+    assert _application_row_belongs_to_draft(rows, 7, response) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("response_telegram_id", "expected_success"), [(123, True), (999, False)])
+async def test_linked_chips_retry_validates_existing_rows(
+    response_telegram_id,
+    expected_success,
+):
+    response_row = [""] * len(SHEET_HEADERS)
+    response_row[SHEET_HEADERS.index("ID заявки")] = "A1A2A3A4"
+    response_row[SHEET_HEADERS.index("Telegram ID")] = response_telegram_id
+    response_row[SHEET_HEADERS.index("Тип изменения")] = ChangeType.ADD.value
+    chips_row = [""] * len(CHIPS_WORKSHEET_HEADERS)
+    chips_row[CHIPS_WORKSHEET_HEADERS.index("ID заявки")] = "C1C2C3C4"
+    chips_row[CHIPS_WORKSHEET_HEADERS.index("Telegram ID")] = 123
+    chips_row[CHIPS_WORKSHEET_HEADERS.index("Тип изменения")] = ChangeType.CHIPS.value
+    rows = [
+        ["ADD"],
+        SHEET_HEADERS,
+        response_row,
+        ["EDIT"],
+        SHEET_HEADERS,
+        ["CHIPS"],
+        CHIPS_WORKSHEET_HEADERS,
+        chips_row,
+    ]
+    api = FakeSheetsApi(
+        sheets={FL_SPREADSHEET: {"08.06 (1)": 42}},
+        headers={(FL_SPREADSHEET, "08.06 (1)"): ["ADD"]},
+        rows={(FL_SPREADSHEET, "08.06 (1)"): rows},
+    )
+    service = make_service(api)
+    chips = make_draft(
+        application_id="C1C2C3C4",
+        change_type=ChangeType.CHIPS.value,
+        chip_text_before="before",
+        chip_text="chip",
+        chip_text_after="after",
+    )
+    response = make_draft(application_id="A1A2A3A4", change_type=ChangeType.ADD.value)
+    callbacks = []
+
+    async def on_success(result):
+        callbacks.append(result)
+
+    result = await service.submit_chips_with_response(
+        chips,
+        response,
+        on_success=on_success,
+    )
+
+    assert result.success is expected_success
+    assert bool(callbacks) is expected_success
+    assert api.batch_updates == []
+    if not expected_success:
+        assert "посторонней строке" in result.message
 
 
 @pytest.mark.asyncio

@@ -337,10 +337,22 @@ class DashboardCollector:
             for days in PILOT_PERIOD_DAYS
         }
         has_events = bool(events)
+        has_partial_events = has_events and any(
+            period["kpi"]["total_applications"] > 0
+            and (
+                period["kpi"]["creation_time_seconds"]["sample_size"] == 0
+                or period["kpi"]["first_editor_action_seconds"]["sample_size"] == 0
+                or period["kpi"]["full_cycle_seconds"]["sample_size"] == 0
+            )
+            for period in periods.values()
+        )
+        if has_partial_events:
+            notes.append("Временные KPI считаются только по точным application_events; fallback по текущему состоянию строк не используется.")
         return {
             "default_period": "7d",
+            "stickiness": _pilot_stickiness(applications),
             "data_quality": {
-                "status": "ok" if has_events else "missing_events",
+                "status": "missing_events" if not has_events else ("partial_events" if has_partial_events else "ok"),
                 "events_available": has_events,
                 "events_count": len(events),
                 "event_count_by_type": event_count_by_type,
@@ -493,9 +505,11 @@ def _pilot_period(
         if app_id:
             events_by_app.setdefault(app_id, []).append(event)
 
-    creation_durations = _durations_between(events_by_app, {"draft_started"}, {"application_submitted", "application_indexed", "submitted", "sent_to_sheets"})
+    creation_durations = _durations_between(events_by_app, {"draft_started"}, {"application_submitted"})
     first_editor_durations = _first_editor_durations(period_apps, events_by_app)
     full_cycle_durations = _full_cycle_durations(period_apps, events_by_app)
+    urgent_apps = [app for app in period_apps if _is_urgent(app)]
+    regular_apps = [app for app in period_apps if not _is_urgent(app)]
     clarification_count = sum(1 for app in period_apps if _has_clarification(app, events_by_app.get(str(app.get("application_id") or ""), [])))
     not_found_count = sum(1 for app in period_apps if int(app.get("not_found_count", 0) or 0) > 0 or app.get("polling_state") != "ACTIVE")
 
@@ -507,6 +521,14 @@ def _pilot_period(
             "creation_time_seconds": _duration_stats(creation_durations),
             "first_editor_action_seconds": _duration_stats(first_editor_durations),
             "full_cycle_seconds": _duration_stats(full_cycle_durations),
+            "first_editor_action_seconds_by_urgency": {
+                "urgent": _duration_stats(_first_editor_durations(urgent_apps, events_by_app)),
+                "regular": _duration_stats(_first_editor_durations(regular_apps, events_by_app)),
+            },
+            "full_cycle_seconds_by_urgency": {
+                "urgent": _duration_stats(_full_cycle_durations(urgent_apps, events_by_app)),
+                "regular": _duration_stats(_full_cycle_durations(regular_apps, events_by_app)),
+            },
             "clarification_share_percent": _percent(clarification_count, len(period_apps)),
             "clarification_count": clarification_count,
             "not_found_or_tracking_errors": not_found_count,
@@ -547,7 +569,7 @@ def _pilot_daily(
                 "applications": len(day_apps),
                 "active_users": len({app.get("telegram_user_id") for app in day_apps if app.get("telegram_user_id") is not None}),
                 "creation_time_median_seconds": _duration_stats(
-                    _durations_between(day_events_by_app, {"draft_started"}, {"application_submitted", "application_indexed", "submitted", "sent_to_sheets"})
+                    _durations_between(day_events_by_app, {"draft_started"}, {"application_submitted"})
                 )["median_seconds"],
                 "first_editor_action_median_seconds": _duration_stats(_first_editor_durations(day_apps, day_events_by_app))["median_seconds"],
                 "full_cycle_median_seconds": _duration_stats(_full_cycle_durations(day_apps, day_events_by_app))["median_seconds"],
@@ -562,6 +584,37 @@ def _pilot_daily(
     return rows
 
 
+def _pilot_stickiness(applications: list[dict[str, Any]]) -> dict[str, int]:
+    now = datetime.now(timezone.utc)
+    msk = timezone(timedelta(hours=3))
+    today_msk = now.astimezone(msk).date()
+    dau_users: set[Any] = set()
+    wau_users: set[Any] = set()
+    mau_users: set[Any] = set()
+    for app in applications:
+        user_id = app.get("telegram_user_id")
+        if user_id is None:
+            continue
+        submitted_at = _row_time(app, "submitted_at", "created_at")
+        if submitted_at.astimezone(msk).date() == today_msk:
+            dau_users.add(user_id)
+        if submitted_at >= now - timedelta(days=7):
+            wau_users.add(user_id)
+        if submitted_at >= now - timedelta(days=30):
+            mau_users.add(user_id)
+    dau = len(dau_users)
+    wau = len(wau_users)
+    mau = len(mau_users)
+    return {
+        "dau": dau,
+        "wau": wau,
+        "mau": mau,
+        "dau_wau_percent": _percent(dau, wau),
+        "dau_mau_percent": _percent(dau, mau),
+        "wau_mau_percent": _percent(wau, mau),
+    }
+
+
 def _pilot_funnel(applications: list[dict[str, Any]], events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return stage counts and conversion from the previous stage."""
 
@@ -571,20 +624,21 @@ def _pilot_funnel(applications: list[dict[str, Any]], events: list[dict[str, Any
         app_id = str(event.get("application_id") or "")
         if app_id:
             events_by_app.setdefault(app_id, []).append(event)
-    app_total = len(applications)
-    status_changed_count = sum(1 for event in events if event.get("event_type") == "status_changed")
-    editor_comment_count = sum(1 for event in events if event.get("event_type") == "editor_comment_added")
-    final_answer_count = sum(1 for event in events if event.get("event_type") == "final_answer_added")
-    deletion_count = sum(1 for event in events if event.get("event_type") == "application_deleted")
+    indexed_ids = _application_ids_with_event(events, {"application_indexed"})
+    status_changed_ids = _application_ids_with_event(events, {"status_changed", "editor_changed"})
+    editor_comment_ids = _application_ids_with_event(events, {"editor_comment_added", "clarification_requested"})
+    user_response_ids = _application_ids_with_event(events, {"user_comment_added", "scriptwriter_response_added"})
+    final_answer_ids = _application_ids_with_event(events, {"final_answer_added", "status_final_answer_ready"})
+    deletion_ids = _application_ids_with_event(events, {"application_deleted"})
     stages = [
-        ("draft_started", "Черновик начат", sum(1 for event in events if event.get("event_type") == "draft_started"), {"draft_started"}),
-        ("submitted", "Заявка отправлена", app_total, {"application_submitted", "submitted", "sent_to_sheets"}),
-        ("sheets_visible", "Появилась в Sheets", sum(1 for app in applications if app.get("last_seen_row_number")), {"application_indexed"}),
-        ("status_changed", "Статус изменен", status_changed_count or sum(1 for app in applications if str(app.get("last_known_status") or "") not in {"", "Новая"}), {"status_changed", "editor_changed"}),
-        ("editor_comment", "Комментарий редактора", editor_comment_count or sum(1 for app in applications if app.get("has_editor_comment")), {"editor_comment_added", "clarification_requested"}),
-        ("user_response", "Ответ пользователя", sum(1 for app in applications if app.get("has_scriptwriter_response")) + sum(1 for event in events if event.get("event_type") in {"user_comment_added", "scriptwriter_response_added"}), {"user_comment_added", "scriptwriter_response_added"}),
-        ("final_answer", "Итоговый ответ", final_answer_count or sum(1 for app in applications if _has_final_answer(app)), {"final_answer_added", "status_final_answer_ready"}),
-        ("deletion", "Удаление", deletion_count + sum(1 for app in applications if app.get("deletion_seen_count") or app.get("last_known_status") == "Удаление"), {"application_deleted"}),
+        ("draft_started", "Черновик начат", len(_application_ids_with_event(events, {"draft_started"})), {"draft_started"}),
+        ("submitted", "Заявка отправлена", len(_application_ids_with_event(events, {"application_submitted"})), {"application_submitted"}),
+        ("sheets_visible", "Появилась в Sheets", len(indexed_ids), {"application_indexed"}),
+        ("status_changed", "Статус изменен", len(status_changed_ids), {"status_changed", "editor_changed"}),
+        ("editor_comment", "Комментарий редактора", len(editor_comment_ids), {"editor_comment_added", "clarification_requested"}),
+        ("user_response", "Ответ пользователя", len(user_response_ids), {"user_comment_added", "scriptwriter_response_added"}),
+        ("final_answer", "Итоговый ответ", len(final_answer_ids), {"final_answer_added", "status_final_answer_ready"}),
+        ("deletion", "Удаление", len(deletion_ids), {"application_deleted"}),
     ]
     result = []
     previous: int | None = None
@@ -611,6 +665,22 @@ def _pilot_funnel(applications: list[dict[str, Any]], events: list[dict[str, Any
         previous = count
         previous_event_types = current_event_types
     return result
+
+
+def _application_ids_with_event(events: list[dict[str, Any]], event_types: set[str]) -> set[str]:
+    return {
+        str(event.get("application_id"))
+        for event in events
+        if event.get("application_id") and event.get("event_type") in event_types
+    }
+
+
+def _application_ids_where(applications: list[dict[str, Any]], predicate: Any) -> set[str]:
+    return {
+        str(app.get("application_id"))
+        for app in applications
+        if app.get("application_id") and predicate(app)
+    }
 
 
 def _pilot_problem_rows(
@@ -688,12 +758,10 @@ def _pilot_problem_row(app: dict[str, Any], reasons: list[str], submitted_at: da
 def _first_editor_durations(applications: list[dict[str, Any]], events_by_app: dict[str, list[dict[str, Any]]]) -> list[int]:
     durations: list[int] = []
     for app in applications:
-        submitted_at = _row_time(app, "submitted_at", "created_at")
         events = events_by_app.get(str(app.get("application_id") or ""), [])
-        editor_at = _first_event_at(events, {"editor_changed", "status_changed", "editor_comment_added", "final_answer_added"})
-        if editor_at is None and _has_first_editor_action(app, events):
-            editor_at = _row_time(app, "updated_at")
-        if editor_at and editor_at >= submitted_at:
+        submitted_at = _first_event_at(events, {"application_submitted"})
+        editor_at = _first_event_at(events, {"editor_changed", "status_changed", "editor_comment_added", "final_answer_added", "status_final_answer_ready"})
+        if submitted_at and editor_at and editor_at >= submitted_at:
             durations.append(int((editor_at - submitted_at).total_seconds()))
     return durations
 
@@ -701,14 +769,10 @@ def _first_editor_durations(applications: list[dict[str, Any]], events_by_app: d
 def _full_cycle_durations(applications: list[dict[str, Any]], events_by_app: dict[str, list[dict[str, Any]]]) -> list[int]:
     durations: list[int] = []
     for app in applications:
-        if not _has_final_answer(app):
-            continue
-        submitted_at = _row_time(app, "submitted_at", "created_at")
         events = events_by_app.get(str(app.get("application_id") or ""), [])
+        submitted_at = _first_event_at(events, {"application_submitted"})
         final_at = _first_event_at(events, {"final_answer_added", "status_final_answer_ready"})
-        if final_at is None:
-            final_at = _row_time(app, "updated_at")
-        if final_at >= submitted_at:
+        if submitted_at and final_at and final_at >= submitted_at:
             durations.append(int((final_at - submitted_at).total_seconds()))
     return durations
 
@@ -759,6 +823,10 @@ def _has_final_answer(app: dict[str, Any]) -> bool:
 def _has_editor(app: dict[str, Any]) -> bool:
     editor = str(app.get("last_seen_editor") or "").strip()
     return bool(editor and editor != EDITOR_NOT_SELECTED)
+
+
+def _is_urgent(app: dict[str, Any]) -> bool:
+    return str(app.get("is_urgent") or "").lower() in {"1", "true", "yes"}
 
 
 def _has_first_editor_action(app: dict[str, Any], events: list[dict[str, Any]]) -> bool:
