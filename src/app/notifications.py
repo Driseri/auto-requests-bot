@@ -66,6 +66,7 @@ URGENT_EDITOR_BULK_RESERVATION_EVENT_TYPE = "urgent-editor-bulk-reservation-crea
 SCRIPTWRITER_RESPONSE_PREVIEW_LIMIT = 1800
 STABLE_NOTIFICATION_POLLS = 3
 SINGLE_IMPORTANT_STATUSES = {
+    ApplicationStatus.IN_PROGRESS.value,
     ApplicationStatus.FINAL_ANSWER_READY.value,
     ApplicationStatus.ACCEPTED.value,
     ApplicationStatus.REJECTED.value,

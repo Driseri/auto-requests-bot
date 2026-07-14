@@ -1256,7 +1256,7 @@ async def test_status_reader_skips_bulk_batch_status_when_sheet_range_is_missing
 
 
 @pytest.mark.asyncio
-async def test_notification_service_updates_non_important_status_without_message(tmp_path):
+async def test_notification_service_notifies_about_in_progress_status(tmp_path):
     repository = DraftRepository(str(tmp_path / "notifications.db"))
     await repository.init()
     await repository.save_submitted_application(
@@ -1290,7 +1290,8 @@ async def test_notification_service_updates_non_important_status_without_message
     await service.run_once()
     tracked = await repository.get_submitted_application("A1B2C3D4")
 
-    assert notifier.messages == []
+    assert len(notifier.messages) == 1
+    assert "В работе" in notifier.messages[0]["text"]
     assert tracked is not None
     assert tracked.last_known_status == ApplicationStatus.IN_PROGRESS.value
     assert tracked.last_seen_row_number == 5
@@ -1905,6 +1906,53 @@ async def test_chips_notifies_status_but_never_renders_final_answer(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_single_in_progress_status_notifies_scriptwriter(tmp_path):
+    repository = DraftRepository(str(tmp_path / "in_progress_notification.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="WORK0001",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.NEW.value,
+        direction=Direction.FL.value,
+        answer_type=AnswerType.ROLLOUT.value,
+        change_type=ChangeType.ADD.value,
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "WORK0001": SheetApplicationStatus(
+                    application_id="WORK0001",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name=WEEK_SHEET,
+                    sheet_id=100,
+                    row_number=7,
+                    direction=Direction.FL.value,
+                    answer_type=AnswerType.ROLLOUT.value,
+                    change_type=ChangeType.ADD.value,
+                    status=ApplicationStatus.IN_PROGRESS.value,
+                    editor_comment="",
+                    final_answer="",
+                )
+            }
+        ),
+        notifier=notifier,
+    )
+
+    await service.run_once()
+
+    assert len(notifier.messages) == 1
+    assert "статус Новая → В работе" in notifier.messages[0]["text"]
+    tracked = await repository.get_submitted_application("WORK0001")
+    assert tracked is not None
+    assert tracked.last_known_status == ApplicationStatus.IN_PROGRESS.value
+
+
+@pytest.mark.asyncio
 async def test_single_editor_comment_is_sent_after_three_stable_polls(tmp_path):
     repository = DraftRepository(str(tmp_path / "clarification_comment.db"))
     await repository.init()
@@ -1914,7 +1962,7 @@ async def test_single_editor_comment_is_sent_after_three_stable_polls(tmp_path):
         spreadsheet_id=FL_SPREADSHEET,
         sheet_id=100,
         sheet_name=WEEK_SHEET,
-        last_known_status=ApplicationStatus.NEW.value,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
     )
     notifier = FakeNotifier()
     service = StatusNotificationService(
@@ -1967,7 +2015,7 @@ async def test_single_editor_comment_change_resets_stable_counter(tmp_path):
         spreadsheet_id=FL_SPREADSHEET,
         sheet_id=100,
         sheet_name=WEEK_SHEET,
-        last_known_status=ApplicationStatus.NEW.value,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
     )
     current = SheetApplicationStatus(
         application_id="A1B2C3D4",
@@ -2011,7 +2059,7 @@ async def test_empty_editor_comment_clears_pending_without_notification(tmp_path
         spreadsheet_id=FL_SPREADSHEET,
         sheet_id=100,
         sheet_name=WEEK_SHEET,
-        last_known_status=ApplicationStatus.NEW.value,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
     )
     current = SheetApplicationStatus(
         application_id="A1B2C3D4",

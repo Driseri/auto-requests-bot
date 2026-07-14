@@ -236,8 +236,22 @@ async def test_change_description_prompt_explains_expected_detail(tmp_path):
 
     response = await flow.handle_text(12, "Клиентское сообщение")
 
-    assert "Кратко опишите, зачем вы меняете текст" in response.text
-    assert "Не пишите общих фраз" in response.text
+    assert "Опишите, что именно меняется в тексте" in response.text
+    assert "Не подменяйте суть кейсом" in response.text
+
+
+@pytest.mark.asyncio
+async def test_reason_prompt_distinguishes_context_from_change_description(tmp_path):
+    flow, _, _, _ = await make_flow(tmp_path)
+    await flow.start_single(13)
+    await flow.select_direction(13, Direction.FL)
+    await flow.select_answer_type(13, AnswerType.ROLLOUT)
+    await flow.select_change_type(13, ChangeType.ADD)
+    await flow.handle_text(13, "intent.change_limit")
+    response = await flow.handle_text(13, "Иван Иванов")
+
+    assert "Это контекст" in response.text
+    assert "это следующий шаг" in response.text
 
 
 @pytest.mark.asyncio
@@ -583,6 +597,7 @@ async def test_collects_application_and_submits_stub(tmp_path):
     tracked = await repository.get_submitted_application(draft.application_id or "")
 
     assert "Заявка отправлена в таблицу" in response.text
+    assert f"ID заявки: {draft.application_id}" in response.text
     assert len(submission_service.submitted) == 1
     assert len(llm_client.calls) == 1
     assert completed is not None
