@@ -879,13 +879,41 @@ async def test_bulk_upload_stub_does_not_create_draft(tmp_path):
     response = await flow.bulk_upload_stub(171)
     draft = await repository.get_by_user_id(171)
 
-    assert response.keyboard == KeyboardKind.BULK_MENU
-    assert "Массовая загрузка работает через отдельный лист Google Sheets" in response.text
+    assert response.keyboard == KeyboardKind.CREATE_MODE
+    assert "не настроены" in response.text
     assert "xlsx" not in response.text.lower()
     assert draft is None
 
 
 @pytest.mark.asyncio
+async def test_legacy_bulk_callback_is_disabled_without_database_writes(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+
+    response = await flow.confirm_bulk_batch_filled(171, "BATCH-ABC12345")
+
+    assert response.keyboard == KeyboardKind.BULK_MENU
+    assert "Старый формат" in response.text
+    assert await repository.get_latest_unregistered_bulk_batch(171) is None
+
+
+@pytest.mark.asyncio
+async def test_resume_clears_retired_bulk_pending_action(tmp_path):
+    flow, repository, _, _ = await make_flow(tmp_path)
+    await repository.save_user_setting(
+        171,
+        "pending_action",
+        "create_bulk_direction:legacy-request",
+    )
+
+    response = await flow.resume_from_notification(171)
+    settings = await repository.get_user_settings(171)
+
+    assert response.keyboard == KeyboardKind.CREATE_MODE
+    assert settings.pending_action is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip(reason="Legacy bulk batches are retired.")
 async def test_create_bulk_batch_returns_ready_button(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk_flow.db"))
     await repository.init()
@@ -907,6 +935,7 @@ async def test_create_bulk_batch_returns_ready_button(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="Legacy bulk batches are retired.")
 async def test_bulk_creation_callback_is_idempotent(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk_idempotent.db"))
     await repository.init()
@@ -929,6 +958,7 @@ async def test_bulk_creation_callback_is_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="Legacy bulk batches are retired.")
 async def test_notification_menu_restores_bulk_direction_selection(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk_notification_direction.db"))
     await repository.init()
@@ -948,6 +978,7 @@ async def test_notification_menu_restores_bulk_direction_selection(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="Legacy bulk batches are retired.")
 async def test_notification_menu_restores_unregistered_bulk_batch(tmp_path):
     repository = DraftRepository(str(tmp_path / "bulk_notification_created.db"))
     await repository.init()
@@ -1110,6 +1141,7 @@ async def test_notification_menu_restores_exact_single_application_step(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="Legacy bulk batches are retired.")
 async def test_notification_menu_prefers_bulk_over_single_application(tmp_path):
     flow, repository, _, _ = await make_flow(tmp_path)
     await flow.start_single(182)
@@ -1168,6 +1200,7 @@ async def test_notification_menu_ignores_registered_bulk_batch(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="Legacy bulk batches are retired.")
 async def test_confirm_bulk_batch_filled_calls_registrar(tmp_path):
     from app.bulk import BulkRegistrationResult
 
@@ -1195,6 +1228,7 @@ async def test_confirm_bulk_batch_filled_calls_registrar(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="Legacy bulk batches are retired.")
 async def test_confirm_bulk_batch_filled_keeps_ready_button_on_empty_rows(tmp_path):
     from app.bulk import BulkRegistrationResult
 
@@ -1220,6 +1254,7 @@ async def test_confirm_bulk_batch_filled_keeps_ready_button_on_empty_rows(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="Legacy bulk batches are retired.")
 async def test_confirm_bulk_batch_filled_hides_ready_button_while_registering(tmp_path):
     from app.bulk import BulkRegistrationResult
 

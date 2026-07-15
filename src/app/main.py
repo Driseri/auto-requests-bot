@@ -10,9 +10,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 
 from app.bot import create_router
 from app.bulk import (
-    BulkApplicationRegistrar,
     BulkReservationRegistrar,
-    GoogleSheetsBulkBatchService,
     GoogleSheetsBulkReservationService,
 )
 from app.config import load_settings
@@ -136,16 +134,6 @@ async def main() -> None:
         google_api_retry=settings.google_api_retry,
         timezone_name=settings.rollout_schedule.timezone_name,
     )
-    bulk_registrar = BulkApplicationRegistrar(
-        repository=repository,
-        spreadsheet_id=settings.google_fl_spreadsheet_id,
-        credentials_path=settings.google_credentials_path,
-        dashboard_sync=dashboard_sync,
-        application_editors=settings.application_editors,
-        registration_stale_seconds=settings.bulk_registration_stale_seconds,
-        google_api_retry=settings.google_api_retry,
-    )
-
     flow = ApplicationFlow(
         repository=repository,
         llm_client=LlmClient(
@@ -164,16 +152,6 @@ async def main() -> None:
         ),
         show_llm_response_json=settings.gigachat_show_response_json,
         submission_service=submission_service,
-        bulk_service=GoogleSheetsBulkBatchService(
-            direction_spreadsheets=direction_spreadsheets,
-            credentials_path=settings.google_credentials_path,
-            repository=repository,
-            application_editors=settings.application_editors,
-            reserved_rows=settings.bulk_reserved_rows,
-            google_api_retry=settings.google_api_retry,
-            timezone_name=settings.rollout_schedule.timezone_name,
-        ),
-        bulk_registrar=bulk_registrar,
         bulk_reservation_service=bulk_reservation_service,
         bulk_reservation_registrar=bulk_reservation_registrar,
         bulk_max_rows=settings.bulk_max_rows,
@@ -207,6 +185,7 @@ async def main() -> None:
                         google_api_retry=settings.google_api_retry,
                     ),
                     dashboard_sync=dashboard_sync,
+                    legacy_bulk_enabled=False,
                     dashboard_sync_interval_seconds=(
                         settings.dashboard_sync_interval_seconds
                     ),

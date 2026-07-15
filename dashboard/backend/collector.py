@@ -38,6 +38,14 @@ VALID_MONITORING_STATUSES = VALID_APPLICATION_STATUSES | VALID_BULK_APPLICATION_
 FINAL_ANSWER_READY_STATUS = "Итоговый ответ готов"
 EDITOR_NOT_SELECTED = "Редактор не выбран"
 PILOT_PERIOD_DAYS = (7, 14, 30)
+CHIPS_SUCCESS_STATUSES = {"Принята", "Принято"}
+CLOSED_WITHOUT_RESULT_STATUSES = {
+    "Принята",
+    "Принято",
+    "Отклонена",
+    "Отложена",
+    "Удаление",
+}
 
 
 class DashboardCollector:
@@ -363,31 +371,27 @@ class DashboardCollector:
 
     @staticmethod
     def _normalize_bulk(metrics: dict[str, Any]) -> dict[str, Any]:
-        """Prepare bulk workflow aggregates and stale hints."""
+        """Prepare new bulk-reservation workflow aggregates only."""
 
         summary = metrics.get("bulk_summary", {}) or {}
-        creation_counts = _counts(metrics.get("bulk_creation_by_state", []))
         return {
             **summary,
-            "by_registration_state": metrics.get("bulk_by_registration_state", []),
-            "creation_by_state": metrics.get("bulk_creation_by_state", []),
-            "unfinished_by_user": metrics.get("bulk_unfinished_by_user", []),
+            "by_state": metrics.get("bulk_reservations_by_state", []),
+            "active_by_user": metrics.get("bulk_active_by_user", []),
             "recent": metrics.get("bulk_recent", []),
-            "creation_problem_rows": metrics.get("bulk_creation_problem_rows", []),
-            "stale_creating": creation_counts.get("BULK_CREATING", 0),
-            "stale_registering": summary.get("registering", 0) or 0,
+            "problem_rows": metrics.get("bulk_problem_rows", []),
         }
 
     @staticmethod
     def _normalize_urgent(metrics: dict[str, Any]) -> dict[str, Any]:
-        """Prepare urgent request rows and high-level counts."""
+        """Prepare only open urgent requests using type-specific completion rules."""
 
-        rows = metrics.get("urgent_applications", [])
+        rows = [row for row in metrics.get("urgent_applications", []) if _is_open_application(row)]
         oldest_created_at, oldest_age_seconds = _oldest_age(rows, "created_at")
         return {
             "open": len(rows),
             "no_editor": sum(1 for row in rows if not _has_editor(row)),
-            "no_final_answer": sum(1 for row in rows if not _has_final_answer(row)),
+            "no_final_answer": len(rows),
             "oldest_created_at": oldest_created_at,
             "oldest_age_seconds": oldest_age_seconds,
             "rows": rows,
@@ -453,7 +457,7 @@ class DashboardCollector:
                 "without_editor": int(applications.get("without_editor", 0) or 0),
                 "urgent_without_editor": int(urgent.get("no_editor", 0) or 0),
                 "urgent_without_final_answer": int(urgent.get("no_final_answer", 0) or 0),
-                "active_bulk_batches": int(bulk.get("unfinished", 0) or 0),
+                "active_bulk_reservations": int(bulk.get("active", 0) or 0),
             },
             "directions": {
                 "total": total_by_direction,
@@ -500,6 +504,11 @@ def _pilot_period(
     period_events = [row for row in events if _row_time(row, "event_at") >= since]
     period_errors = [row for row in notification_errors if _row_time(row, "updated_at", "created_at") >= since]
     events_by_app: dict[str, list[dict[str, Any]]] = {}
+    all_events_by_app: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        app_id = str(event.get("application_id") or "")
+        if app_id:
+            all_events_by_app.setdefault(app_id, []).append(event)
     for event in period_events:
         app_id = str(event.get("application_id") or "")
         if app_id:
@@ -507,9 +516,22 @@ def _pilot_period(
 
     creation_durations = _durations_between(events_by_app, {"draft_started"}, {"application_submitted"})
     first_editor_durations = _first_editor_durations(period_apps, events_by_app)
-    full_cycle_durations = _full_cycle_durations(period_apps, events_by_app)
+    completed_ids = _application_ids_with_event(
+        period_events,
+        {"final_answer_added", "status_final_answer_ready"},
+    )
+    completed_apps = [
+        app for app in applications if str(app.get("application_id") or "") in completed_ids
+    ]
+    full_cycle_durations = _full_cycle_durations(
+        completed_apps,
+        all_events_by_app,
+        final_since=since,
+    )
     urgent_apps = [app for app in period_apps if _is_urgent(app)]
     regular_apps = [app for app in period_apps if not _is_urgent(app)]
+    completed_urgent_apps = [app for app in completed_apps if _is_urgent(app)]
+    completed_regular_apps = [app for app in completed_apps if not _is_urgent(app)]
     clarification_count = sum(1 for app in period_apps if _has_clarification(app, events_by_app.get(str(app.get("application_id") or ""), [])))
     not_found_count = sum(1 for app in period_apps if int(app.get("not_found_count", 0) or 0) > 0 or app.get("polling_state") != "ACTIVE")
 
@@ -526,8 +548,20 @@ def _pilot_period(
                 "regular": _duration_stats(_first_editor_durations(regular_apps, events_by_app)),
             },
             "full_cycle_seconds_by_urgency": {
-                "urgent": _duration_stats(_full_cycle_durations(urgent_apps, events_by_app)),
-                "regular": _duration_stats(_full_cycle_durations(regular_apps, events_by_app)),
+                "urgent": _duration_stats(
+                    _full_cycle_durations(
+                        completed_urgent_apps,
+                        all_events_by_app,
+                        final_since=since,
+                    )
+                ),
+                "regular": _duration_stats(
+                    _full_cycle_durations(
+                        completed_regular_apps,
+                        all_events_by_app,
+                        final_since=since,
+                    )
+                ),
             },
             "clarification_share_percent": _percent(clarification_count, len(period_apps)),
             "clarification_count": clarification_count,
@@ -536,7 +570,9 @@ def _pilot_period(
         },
         "daily": _pilot_daily(
             applications=period_apps,
+            all_applications=applications,
             events_by_app=events_by_app,
+            all_events_by_app=all_events_by_app,
             notification_errors=period_errors,
             since=since,
             days=days,
@@ -549,7 +585,9 @@ def _pilot_period(
 def _pilot_daily(
     *,
     applications: list[dict[str, Any]],
+    all_applications: list[dict[str, Any]],
     events_by_app: dict[str, list[dict[str, Any]]],
+    all_events_by_app: dict[str, list[dict[str, Any]]],
     notification_errors: list[dict[str, Any]],
     since: datetime,
     days: int,
@@ -563,6 +601,16 @@ def _pilot_daily(
         day_error_count = sum(1 for err in notification_errors if _row_time(err, "updated_at", "created_at").date() == day)
         app_ids = {str(app.get("application_id") or "") for app in day_apps}
         day_events_by_app = {app_id: events_by_app.get(app_id, []) for app_id in app_ids}
+        day_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+        day_end = day_start + timedelta(days=1)
+        completed_app_ids = {
+            app_id
+            for app_id, app_events in all_events_by_app.items()
+            if _first_event_at(app_events, {"final_answer_added", "status_final_answer_ready"}, since=day_start, before=day_end)
+        }
+        completed_apps = [
+            app for app in all_applications if str(app.get("application_id") or "") in completed_app_ids
+        ]
         rows.append(
             {
                 "date": day.isoformat(),
@@ -572,7 +620,14 @@ def _pilot_daily(
                     _durations_between(day_events_by_app, {"draft_started"}, {"application_submitted"})
                 )["median_seconds"],
                 "first_editor_action_median_seconds": _duration_stats(_first_editor_durations(day_apps, day_events_by_app))["median_seconds"],
-                "full_cycle_median_seconds": _duration_stats(_full_cycle_durations(day_apps, day_events_by_app))["median_seconds"],
+                "full_cycle_median_seconds": _duration_stats(
+                    _full_cycle_durations(
+                        completed_apps,
+                        all_events_by_app,
+                        final_since=day_start,
+                        final_before=day_end,
+                    )
+                )["median_seconds"],
                 "clarification_share_percent": _percent(
                     sum(1 for app in day_apps if _has_clarification(app, day_events_by_app.get(str(app.get("application_id") or ""), []))),
                     len(day_apps),
@@ -616,7 +671,12 @@ def _pilot_stickiness(applications: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _pilot_funnel(applications: list[dict[str, Any]], events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return stage counts and conversion from the previous stage."""
+    """Return exact event-based funnel stages and transitions.
+
+    The funnel deliberately contains only business events that the bot writes to
+    ``application_events``. Current row fields and indexing metadata are not
+    used as substitutes because they do not contain the time of the transition.
+    """
 
     event_types = {str(event.get("event_type") or "") for event in events}
     events_by_app: dict[str, list[dict[str, Any]]] = {}
@@ -624,19 +684,21 @@ def _pilot_funnel(applications: list[dict[str, Any]], events: list[dict[str, Any
         app_id = str(event.get("application_id") or "")
         if app_id:
             events_by_app.setdefault(app_id, []).append(event)
-    indexed_ids = _application_ids_with_event(events, {"application_indexed"})
-    status_changed_ids = _application_ids_with_event(events, {"status_changed", "editor_changed"})
+    editor_assigned_ids = _application_ids_with_event(events, {"editor_changed"})
+    status_changed_ids = _application_ids_with_event(events, {"status_changed"})
     editor_comment_ids = _application_ids_with_event(events, {"editor_comment_added", "clarification_requested"})
-    user_response_ids = _application_ids_with_event(events, {"user_comment_added", "scriptwriter_response_added"})
+    # The bot does not emit user_comment_added. scriptwriter_response_added is
+    # the separate, observable event for a response prepared by a scriptwriter.
+    scriptwriter_response_ids = _application_ids_with_event(events, {"scriptwriter_response_added"})
     final_answer_ids = _application_ids_with_event(events, {"final_answer_added", "status_final_answer_ready"})
     deletion_ids = _application_ids_with_event(events, {"application_deleted"})
     stages = [
         ("draft_started", "Черновик начат", len(_application_ids_with_event(events, {"draft_started"})), {"draft_started"}),
         ("submitted", "Заявка отправлена", len(_application_ids_with_event(events, {"application_submitted"})), {"application_submitted"}),
-        ("sheets_visible", "Появилась в Sheets", len(indexed_ids), {"application_indexed"}),
-        ("status_changed", "Статус изменен", len(status_changed_ids), {"status_changed", "editor_changed"}),
+        ("editor_assigned", "Редактор назначен", len(editor_assigned_ids), {"editor_changed"}),
+        ("status_changed", "Статус изменен", len(status_changed_ids), {"status_changed"}),
         ("editor_comment", "Комментарий редактора", len(editor_comment_ids), {"editor_comment_added", "clarification_requested"}),
-        ("user_response", "Ответ пользователя", len(user_response_ids), {"user_comment_added", "scriptwriter_response_added"}),
+        ("scriptwriter_response", "Ответ сценариста", len(scriptwriter_response_ids), {"scriptwriter_response_added"}),
         ("final_answer", "Итоговый ответ", len(final_answer_ids), {"final_answer_added", "status_final_answer_ready"}),
         ("deletion", "Удаление", len(deletion_ids), {"application_deleted"}),
     ]
@@ -645,7 +707,7 @@ def _pilot_funnel(applications: list[dict[str, Any]], events: list[dict[str, Any
     previous_event_types: set[str] | None = None
     for key, label, count, current_event_types in stages:
         conversion = None if previous in (None, 0) else round(count / previous * 100)
-        source = "events" if key == "draft_started" and "draft_started" in event_types else "applications"
+        source = "events" if current_event_types & event_types else "missing_events"
         average_transition, transition_sample = _average_transition(
             events_by_app,
             previous_event_types,
@@ -699,7 +761,7 @@ def _pilot_problem_rows(
         reasons: list[str] = []
         if not _has_first_editor_action(app, app_events) and now - submitted_at > timedelta(hours=24):
             reasons.append("нет первого действия редактора >24ч")
-        if not _has_final_answer(app) and now - submitted_at > timedelta(hours=72):
+        if _is_open_application(app) and now - submitted_at > timedelta(hours=72):
             reasons.append("нет итогового ответа >72ч")
         if int(app.get("not_found_count", 0) or 0) > 0 or app.get("polling_state") != "ACTIVE":
             reasons.append("tracking/not_found")
@@ -766,12 +828,25 @@ def _first_editor_durations(applications: list[dict[str, Any]], events_by_app: d
     return durations
 
 
-def _full_cycle_durations(applications: list[dict[str, Any]], events_by_app: dict[str, list[dict[str, Any]]]) -> list[int]:
+def _full_cycle_durations(
+    applications: list[dict[str, Any]],
+    events_by_app: dict[str, list[dict[str, Any]]],
+    *,
+    final_since: datetime | None = None,
+    final_before: datetime | None = None,
+) -> list[int]:
+    """Measure cycles completed in a period from exact submission and final events."""
+
     durations: list[int] = []
     for app in applications:
         events = events_by_app.get(str(app.get("application_id") or ""), [])
         submitted_at = _first_event_at(events, {"application_submitted"})
-        final_at = _first_event_at(events, {"final_answer_added", "status_final_answer_ready"})
+        final_at = _first_event_at(
+            events,
+            {"final_answer_added", "status_final_answer_ready"},
+            since=final_since,
+            before=final_before,
+        )
         if submitted_at and final_at and final_at >= submitted_at:
             durations.append(int((final_at - submitted_at).total_seconds()))
     return durations
@@ -810,14 +885,48 @@ def _duration_stats(values: list[int]) -> dict[str, Any]:
     }
 
 
-def _first_event_at(events: list[dict[str, Any]], event_types: set[str]) -> datetime | None:
+def _first_event_at(
+    events: list[dict[str, Any]],
+    event_types: set[str],
+    *,
+    since: datetime | None = None,
+    before: datetime | None = None,
+) -> datetime | None:
+    """Return the earliest exact event timestamp inside an optional half-open window."""
+
     moments = [_parse_datetime(event.get("event_at")) for event in events if event.get("event_type") in event_types]
     moments = [moment for moment in moments if moment is not None]
+    if since is not None:
+        moments = [moment for moment in moments if moment >= since]
+    if before is not None:
+        moments = [moment for moment in moments if moment < before]
     return min(moments) if moments else None
 
 
 def _has_final_answer(app: dict[str, Any]) -> bool:
-    return bool(app.get("has_final_answer") or app.get("last_known_status") == FINAL_ANSWER_READY_STATUS)
+    """Return whether an application is complete by its own business model."""
+
+    if _is_chips(app):
+        return str(app.get("last_known_status") or "").strip() in CHIPS_SUCCESS_STATUSES
+    return bool(
+        app.get("has_final_answer")
+        or app.get("last_known_status") == FINAL_ANSWER_READY_STATUS
+    )
+
+
+def _is_chips(app: dict[str, Any]) -> bool:
+    """Normalize the historical CHIP spelling without enabling legacy bulk metrics."""
+
+    return str(app.get("change_type") or "").strip().upper() in {"CHIPS", "CHIP"}
+
+
+def _is_open_application(app: dict[str, Any]) -> bool:
+    """Apply one type-specific open/closed rule to manager-facing calculations."""
+
+    status = str(app.get("last_known_status") or "").strip()
+    if status in CLOSED_WITHOUT_RESULT_STATUSES:
+        return False
+    return not _has_final_answer(app)
 
 
 def _has_editor(app: dict[str, Any]) -> bool:

@@ -257,7 +257,6 @@ _CONTAINER_SCRIPT = textwrap.dedent(
             f"SELECT {SAFE_APPLICATION_COLUMNS} FROM submitted_applications WHERE application_id IN ({placeholders(application_ids)})",
             application_ids,
         )
-        batch_ids = sorted({row.get("batch_id") for row in apps if row.get("batch_id")})
         notification_rows = []
         for app_id in application_ids:
             notification_rows.extend(fetch_all(
@@ -281,19 +280,6 @@ _CONTAINER_SCRIPT = textwrap.dedent(
             """,
             application_ids,
         )
-        bulk_rows = []
-        if batch_ids:
-            bulk_rows = fetch_all(
-                connection,
-                f"""
-                SELECT batch_id, telegram_user_id, direction, sheet_name, registration_state,
-                       registered_count, data_end_row, location_state, location_miss_count,
-                       created_at, updated_at
-                FROM bulk_batches
-                WHERE batch_id IN ({placeholders(batch_ids)})
-                """,
-                batch_ids,
-            )
         return {
             "application_ids": application_ids,
             "confirmation_phrase": "DELETE " + " ".join(application_ids),
@@ -301,15 +287,12 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 "submitted_applications": len(apps),
                 "dashboard_outbox": len(dashboard_rows),
                 "notification_outbox": len(notification_rows),
-                "affected_bulk_batches": len(bulk_rows),
             },
             "export": {
                 "submitted_applications": apps,
                 "dashboard_outbox": dashboard_rows,
                 "notification_outbox": notification_rows,
-                "affected_bulk_batches": bulk_rows,
             },
-            "batch_ids": batch_ids,
         }
 
 
@@ -319,7 +302,6 @@ _CONTAINER_SCRIPT = textwrap.dedent(
             raise RuntimeError("confirmation phrase mismatch")
 
         before = preview(connection, application_ids)
-        batch_ids = before["batch_ids"]
         connection.execute("BEGIN IMMEDIATE")
         try:
             deleted = {}
@@ -343,28 +325,6 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 "DELETE FROM submitted_applications WHERE application_id IN ({})",
                 application_ids,
             )
-            for batch_id in batch_ids:
-                connection.execute(
-                    """
-                    UPDATE bulk_batches
-                    SET registered_count = (
-                            SELECT COUNT(*)
-                            FROM submitted_applications
-                            WHERE submitted_applications.batch_id = bulk_batches.batch_id
-                        ),
-                        data_end_row = COALESCE(
-                            (
-                                SELECT MAX(last_seen_row_number)
-                                FROM submitted_applications
-                                WHERE submitted_applications.batch_id = bulk_batches.batch_id
-                            ),
-                            data_end_row
-                        ),
-                        updated_at = ?
-                    WHERE batch_id = ?
-                    """,
-                    (datetime.now(timezone.utc).isoformat(), batch_id),
-                )
             connection.commit()
         except Exception:
             connection.rollback()

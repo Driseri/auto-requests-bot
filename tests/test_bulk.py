@@ -1092,6 +1092,12 @@ async def test_bulk_reservation_registration_enqueues_dashboard_application_proj
     assert result.success is True
     outbox = await repository.list_dashboard_outbox()
     assert len(outbox) == 1
+    submitted_events = await repository.list_application_events(
+        application_id=outbox[0].entity_id,
+        event_type="application_submitted",
+    )
+    assert len(submitted_events) == 1
+    assert submitted_events[0].event_at == "2026-06-30T09:15:00+00:00"
     dashboard_row = json.loads(outbox[0].snapshot_json)["row"]
     assert dashboard_row[0] == outbox[0].entity_id
     assert dashboard_row[1] == ""

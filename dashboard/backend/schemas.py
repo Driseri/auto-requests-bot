@@ -74,7 +74,7 @@ class ApplicationReport(BaseModel):
     without_owner: list[dict[str, Any]] = Field(default_factory=list)
     needs_clarification: list[dict[str, Any]] = Field(default_factory=list)
     stale_without_movement: list[dict[str, Any]] = Field(default_factory=list)
-    problematic_bulk_batches: list[dict[str, Any]] = Field(default_factory=list)
+    problematic_bulk_reservations: list[dict[str, Any]] = Field(default_factory=list)
     unfinished_workflows: list[dict[str, Any]] = Field(default_factory=list)
 
 

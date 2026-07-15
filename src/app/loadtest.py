@@ -15,9 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from app.bulk import (
-    BulkApplicationRegistrar,
     BulkReservationRegistrar,
-    GoogleSheetsBulkBatchService,
     GoogleSheetsBulkReservationService,
 )
 from app.config import load_settings
@@ -434,6 +432,9 @@ async def run_loadtest(
     google_throttle_seconds: float = 0.2,
     bulk_mode: str = "reservations",
 ) -> dict[str, Any]:
+    if bulk_mode != "reservations":
+        raise ValueError("Legacy bulk load tests are disabled; use bulk_mode='reservations'.")
+
     settings = load_settings()
     repository = DraftRepository(settings.sqlite_path)
     await repository.init()
@@ -464,24 +465,6 @@ async def run_loadtest(
         dashboard_sync=dashboard_sync,
         google_api_retry=settings.google_api_retry,
     )
-    bulk_service = GoogleSheetsBulkBatchService(
-        direction_spreadsheets=direction_spreadsheets,
-        credentials_path=settings.google_credentials_path,
-        repository=repository,
-        application_editors=settings.application_editors,
-        reserved_rows=settings.bulk_reserved_rows,
-        google_api_retry=settings.google_api_retry,
-        timezone_name=settings.rollout_schedule.timezone_name,
-    )
-    bulk_registrar = BulkApplicationRegistrar(
-        repository=repository,
-        spreadsheet_id=settings.google_fl_spreadsheet_id,
-        credentials_path=settings.google_credentials_path,
-        dashboard_sync=dashboard_sync,
-        application_editors=settings.application_editors,
-        registration_stale_seconds=settings.bulk_registration_stale_seconds,
-        google_api_retry=settings.google_api_retry,
-    )
     bulk_reservation_service = GoogleSheetsBulkReservationService(
         submission_service=submission_service,
         repository=repository,
@@ -501,8 +484,6 @@ async def run_loadtest(
         repository=repository,
         llm_client=CompleteFakeLlm(),  # type: ignore[arg-type]
         submission_service=submission_service,
-        bulk_service=bulk_service,
-        bulk_registrar=bulk_registrar,
         bulk_reservation_service=bulk_reservation_service,
         bulk_reservation_registrar=bulk_reservation_registrar,
         bulk_reserved_rows=settings.bulk_reserved_rows,
@@ -519,6 +500,7 @@ async def run_loadtest(
             google_api_retry=settings.google_api_retry,
         ),
         dashboard_sync=dashboard_sync,
+        legacy_bulk_enabled=False,
         dashboard_sync_interval_seconds=settings.dashboard_sync_interval_seconds,
         status_not_found_threshold=settings.status_not_found_threshold,
         status_not_found_recheck_seconds=settings.status_not_found_recheck_seconds,
@@ -575,32 +557,18 @@ async def run_loadtest(
             "google_api_retry": settings.google_api_retry,
             "google_throttle_seconds": google_throttle_seconds,
         }
-        if bulk_mode == "reservations":
-            bulk_tasks.append(
-                _guarded_bulk_reservation(
-                    semaphore,
-                    flow,
-                    repository,
-                    state,
-                    metrics,
-                    run_id,
-                    reservation_index=index + 1,
-                    **common,
-                )
-            )
-        else:
-            bulk_tasks.append(
-                _guarded_bulk(
+        bulk_tasks.append(
+            _guarded_bulk_reservation(
                 semaphore,
                 flow,
                 repository,
                 state,
                 metrics,
                 run_id,
-                    batch_index=index + 1,
-                    **common,
-                )
+                reservation_index=index + 1,
+                **common,
             )
+        )
     if bulk_tasks:
         await asyncio.gather(*bulk_tasks)
     memory_checkpoints["after_bulk"] = memory_cleanup()
@@ -1135,7 +1103,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile", choices=sorted(PROFILES), default="baseline")
     parser.add_argument(
         "--bulk-mode",
-        choices=("reservations", "legacy"),
+        choices=("reservations",),
         default="reservations",
         help="Which bulk workflow to exercise. Default: reservations.",
     )

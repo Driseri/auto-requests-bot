@@ -200,6 +200,24 @@ _CONTAINER_SCRIPT = textwrap.dedent(
         return row is not None
 
 
+    # Completion depends on application type: CHIPS has no editor final answer.
+    CHIPS_SQL = "UPPER(TRIM(COALESCE(change_type, ''))) IN ('CHIPS', 'CHIP')"
+    CLOSED_STATUS_SQL = "COALESCE(last_known_status, '') IN ('Итоговый ответ готов', 'Принята', 'Принято', 'Отклонена', 'Отложена', 'Удаление')"
+    CHIPS_SUCCESS_SQL = "COALESCE(last_known_status, '') IN ('Принята', 'Принято')"
+    OPEN_APPLICATION_SQL = f"""
+        CASE
+          WHEN {CHIPS_SQL} THEN NOT (
+            {CHIPS_SUCCESS_SQL}
+            OR COALESCE(last_known_status, '') IN ('Отклонена', 'Отложена', 'Удаление')
+          )
+          ELSE NOT (
+            COALESCE(last_seen_final_answer, '') != ''
+            OR {CLOSED_STATUS_SQL}
+          )
+        END
+    """
+
+
     def main():
         # This code runs inside the bot container and only opens SQLite read-only.
         result = {
@@ -291,24 +309,26 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                        SUM(CASE WHEN not_found_count > 0 THEN 1 ELSE 0 END) AS not_found_count_positive,
                        SUM(CASE
                          WHEN COALESCE(last_seen_editor, '') IN ('', 'Редактор не выбран')
-                              AND COALESCE(last_seen_final_answer, '') = ''
-                              AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
+                              AND (""" + OPEN_APPLICATION_SQL + """)
                          THEN 1 ELSE 0
                        END) AS without_editor,
+                       0 AS with_final_answer_today,
                        SUM(CASE
-                         WHEN (COALESCE(last_seen_final_answer, '') != '' OR COALESCE(last_known_status, '') = 'Итоговый ответ готов')
-                              AND date(updated_at, '+3 hours') = date('now', '+3 hours')
+                         WHEN UPPER(TRIM(COALESCE(change_type, ''))) NOT IN ('CHIPS', 'CHIP')
+                              AND COALESCE(last_seen_final_answer, '') != ''
                          THEN 1 ELSE 0
-                       END) AS with_final_answer_today,
-                       SUM(CASE WHEN COALESCE(last_seen_final_answer, '') != '' THEN 1 ELSE 0 END) AS with_final_answer
+                       END) AS with_final_answer
                 FROM submitted_applications
             """)
             if table_exists(db, "application_events"):
                 final_answer_events = fetch_one(db, """
-                    SELECT COUNT(DISTINCT application_id) AS count
-                    FROM application_events
-                    WHERE event_type IN ('final_answer_added', 'status_final_answer_ready')
-                      AND date(event_at, '+3 hours') = date('now', '+3 hours')
+                    SELECT COUNT(DISTINCT event.application_id) AS count
+                    FROM application_events AS event
+                    JOIN submitted_applications AS application
+                      ON application.application_id = event.application_id
+                    WHERE event.event_type IN ('final_answer_added', 'status_final_answer_ready')
+                      AND UPPER(TRIM(COALESCE(application.change_type, ''))) NOT IN ('CHIPS', 'CHIP')
+                      AND date(event.event_at, '+3 hours') = date('now', '+3 hours')
                 """)
                 metrics["applications_summary"]["with_final_answer_today"] = final_answer_events.get("count", 0) or 0
             metrics["applications_problem_rows"] = fetch_all(db, """
@@ -321,55 +341,60 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 LIMIT 50
             """)
             metrics["urgent_applications"] = fetch_all(db, """
-                SELECT application_id, telegram_user_id, direction, sheet_name,
-                       last_seen_row_number, last_known_status, last_seen_editor,
+                SELECT application_id, telegram_user_id, direction, sheet_name, change_type,
+                       application_type, last_seen_row_number, last_known_status, last_seen_editor,
                        CASE
-                         WHEN COALESCE(last_seen_final_answer, '') != ''
-                              OR last_known_status = 'Итоговый ответ готов'
-                         THEN 1 ELSE 0
-                       END AS has_final_answer,
+                         WHEN (""" + OPEN_APPLICATION_SQL + """) THEN 1 ELSE 0
+                       END AS is_open,
                        COALESCE(submitted_at, created_at) AS created_at, updated_at
                 FROM submitted_applications
                 WHERE is_urgent = 1
-                  AND COALESCE(last_seen_final_answer, '') = ''
-                  AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
+                  AND (""" + OPEN_APPLICATION_SQL + """)
                 ORDER BY COALESCE(submitted_at, created_at) ASC
                 LIMIT 50
             """)
-            metrics["bulk_by_registration_state"] = fetch_all(db,
-                "SELECT registration_state, COUNT(*) AS count FROM bulk_batches GROUP BY registration_state")
+            metrics["bulk_reservations_by_state"] = fetch_all(db,
+                "SELECT state, COUNT(*) AS count FROM bulk_reservations GROUP BY state")
             metrics["bulk_summary"] = fetch_one(db, """
                 SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN registration_state != 'REGISTERED' THEN 1 ELSE 0 END) AS unfinished,
-                       SUM(CASE WHEN registration_state = 'REGISTERING' THEN 1 ELSE 0 END) AS registering,
-                       SUM(CASE WHEN registration_state = 'REGISTERED' THEN 1 ELSE 0 END) AS registered,
-                       SUM(CASE WHEN registration_state = 'REGISTERED'
-                                  AND date(updated_at, '+3 hours') = date('now', '+3 hours')
+                       SUM(CASE WHEN state NOT IN ('REGISTERED', 'CANCELLED', 'FAILED') THEN 1 ELSE 0 END) AS active,
+                       SUM(CASE WHEN state = 'CREATING' THEN 1 ELSE 0 END) AS creating,
+                       SUM(CASE WHEN state = 'CREATED' THEN 1 ELSE 0 END) AS ready_for_registration,
+                       SUM(CASE WHEN state = 'REGISTERING' THEN 1 ELSE 0 END) AS registering,
+                       SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failed,
+                       SUM(CASE WHEN state NOT IN ('REGISTERED', 'CANCELLED', 'FAILED')
+                                  AND datetime(updated_at) <= datetime('now', '-24 hours')
+                                THEN 1 ELSE 0 END) AS overdue_active,
+                       SUM(CASE WHEN state = 'REGISTERED'
+                                  AND date(registered_at, '+3 hours') = date('now', '+3 hours')
                                 THEN 1 ELSE 0 END) AS registered_today
-                FROM bulk_batches
+                FROM bulk_reservations
             """)
-            metrics["bulk_unfinished_by_user"] = fetch_all(db, """
-                SELECT telegram_user_id, COUNT(*) AS unfinished_batches
-                FROM bulk_batches
-                WHERE registration_state != 'REGISTERED'
+            metrics["bulk_active_by_user"] = fetch_all(db, """
+                SELECT telegram_user_id, COUNT(*) AS active_reservations
+                FROM bulk_reservations
+                WHERE state NOT IN ('REGISTERED', 'CANCELLED', 'FAILED')
                 GROUP BY telegram_user_id
-                ORDER BY unfinished_batches DESC
+                ORDER BY active_reservations DESC
                 LIMIT 20
             """)
             metrics["bulk_recent"] = fetch_all(db, """
-                SELECT batch_id, telegram_user_id, direction, sheet_name, start_row,
-                       data_start_row, reserved_rows, data_end_row, registration_state,
-                       registered_count, last_known_batch_status, registration_started_at, updated_at
-                FROM bulk_batches
+                SELECT reservation_id, telegram_user_id, direction, target_kind, change_type,
+                       requested_count, sheet_name, start_row, end_row, state,
+                       registered_count, last_error, created_at, updated_at, registered_at
+                FROM bulk_reservations
                 ORDER BY updated_at DESC
                 LIMIT 50
             """)
-            metrics["bulk_creation_by_state"] = state_counts(db, "bulk_creation_requests")
-            metrics["bulk_creation_problem_rows"] = fetch_all(db, """
-                SELECT idempotency_key, telegram_user_id, direction, state, batch_id,
-                       substr(COALESCE(last_error, ''), 1, 300) AS last_error, started_at, updated_at
-                FROM bulk_creation_requests
-                WHERE state IN ('BULK_CREATING', 'FAILED')
+            metrics["bulk_problem_rows"] = fetch_all(db, """
+                SELECT reservation_id, telegram_user_id, direction, target_kind, change_type,
+                       requested_count, sheet_name, start_row, end_row, state,
+                       registered_count, substr(COALESCE(last_error, ''), 1, 300) AS last_error,
+                       created_at, updated_at
+                FROM bulk_reservations
+                WHERE state = 'FAILED'
+                   OR (state NOT IN ('REGISTERED', 'CANCELLED', 'FAILED')
+                       AND datetime(updated_at) <= datetime('now', '-24 hours'))
                 ORDER BY updated_at DESC
                 LIMIT 50
             """)

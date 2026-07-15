@@ -295,7 +295,7 @@ function renderBusinessToday(snapshot) {
       ${row("Создано заявок", esc(number(today.created)))}
       ${row("Срочных создано", esc(number(today.urgent_created)), today.urgent_created ? "warn" : "")}
       ${row("Итоговый ответ готов", esc(number(today.final_answers)), today.final_answers ? "good" : "")}
-      ${row("Пачек зарегистрировано", esc(number(today.bulk_registered)))}
+      ${row("Массовых процессов зарегистрировано", esc(number(today.bulk_registered)))}
     </div>
   `;
 }
@@ -307,8 +307,8 @@ function renderTeamLoad(snapshot) {
     <div class="metric-list">
       ${row("Заявки без редактора", esc(number(load.without_editor)), load.without_editor ? "warn" : "good")}
       ${row("Срочные без ответственного", esc(number(load.urgent_without_editor)), load.urgent_without_editor ? "bad" : "good")}
-      ${row("Срочные без финального", esc(number(load.urgent_without_final_answer)), load.urgent_without_final_answer ? "warn" : "good")}
-      ${row("Активные пачки", esc(number(load.active_bulk_batches)), load.active_bulk_batches ? "warn" : "good")}
+      ${row("Срочные без результата", esc(number(load.urgent_without_final_answer)), load.urgent_without_final_answer ? "warn" : "good")}
+      ${row("Активные массовые процессы", esc(number(load.active_bulk_reservations)), load.active_bulk_reservations ? "warn" : "good")}
     </div>
   `;
 }
@@ -439,11 +439,10 @@ function renderPilotEvents(pilot) {
   const eventRows = [
     ["draft_started", "Черновик начат", "время создания"],
     ["application_submitted", "Заявка отправлена", "воронка"],
-    ["application_indexed", "Строка в Sheets", "индексация"],
     ["status_changed", "Статус изменен", "движение"],
     ["editor_changed", "Редактор назначен", "первое действие"],
     ["editor_comment_added", "Комментарий редактора", "пояснения"],
-    ["scriptwriter_response_added", "Ответ сценариста", "ответ пользователя"],
+    ["scriptwriter_response_added", "Ответ сценариста", "ответ сценариста"],
     ["final_answer_added", "Итоговый ответ", "полный цикл"],
     ["application_not_found", "not_found", "tracking"],
     ["application_deleted", "Удаление", "аудит"],
@@ -578,13 +577,14 @@ function renderApplications(snapshot) {
 function renderBulk(snapshot) {
   const bulk = snapshot.bulk || {};
   qs("#card-bulk").innerHTML = `
-    ${cardHeader("", "Массовые пачки", "layers")}
+    ${cardHeader("", "Массовые заявки", "layers")}
     <div class="metric-list">
-      ${row("Unfinished", esc(number(bulk.unfinished)), bulk.unfinished ? "warn" : "good")}
-      ${row("Registering", esc(number(bulk.registering)), bulk.registering ? "warn" : "")}
-      ${row("Registered", esc(number(bulk.registered)))}
-      ${row("Stale creating", esc(number(bulk.stale_creating)), bulk.stale_creating ? "bad" : "good")}
-      ${row("Stale registering", esc(number(bulk.stale_registering)), bulk.stale_registering ? "bad" : "good")}
+      ${row("Активные", esc(number(bulk.active)), bulk.active ? "warn" : "good")}
+      ${row("Создаются", esc(number(bulk.creating)), bulk.creating ? "warn" : "")}
+      ${row("Готовы к регистрации", esc(number(bulk.ready_for_registration)), bulk.ready_for_registration ? "warn" : "")}
+      ${row("Регистрируются", esc(number(bulk.registering)), bulk.registering ? "warn" : "")}
+      ${row("Ошибки", esc(number(bulk.failed)), bulk.failed ? "bad" : "good")}
+      ${row("Старше 24ч", esc(number(bulk.overdue_active)), bulk.overdue_active ? "bad" : "good")}
     </div>
   `;
 }
@@ -596,7 +596,7 @@ function renderUrgent(snapshot) {
     <div class="metric-list">
       ${row("Открытые срочные", esc(number(urgent.open)), urgent.open ? "bad" : "good")}
       ${row("Без ответственного", esc(number(urgent.no_editor)), urgent.no_editor ? "warn" : "")}
-      ${row("Без финального ответа", esc(number(urgent.no_final_answer)), urgent.no_final_answer ? "warn" : "")}
+      ${row("Без результата", esc(number(urgent.no_final_answer)), urgent.no_final_answer ? "warn" : "")}
       ${row("Возраст старейшей", esc(age(urgent.oldest_age_seconds)), urgent.oldest_age_seconds ? "warn" : "muted")}
     </div>
   `;
@@ -710,20 +710,20 @@ function renderApplicationReport(report) {
 
   const appCols = applicationColumns();
   renderTable("#report-lost-table", "Потерялись", report.lost, appCols, "Потерянных заявок нет.");
-  renderTable("#report-urgent-table", "Срочные без финального", report.urgent_without_final_answer, appCols.slice(0, 10), "Нет срочных заявок без финального ответа.");
+  renderTable("#report-urgent-table", "Срочные без результата", report.urgent_without_final_answer, appCols.slice(0, 10), "Нет открытых срочных заявок без результата.");
   renderTable("#report-owner-table", "Без ответственного", report.without_owner, appCols.slice(0, 10), "Нет заявок без ответственного.");
   renderTable("#report-clarification-table", "Нужны пояснения", report.needs_clarification, appCols.slice(0, 10), "Нет заявок в статусе «Нужны пояснения».");
   renderTable("#report-stale-table", "Долго без движения", report.stale_without_movement, appCols.slice(0, 10), "Нет заявок старше 24 часов без движения.");
-  renderTable("#report-bulk-table", "Проблемные пачки", report.problematic_bulk_batches, [
-    ["Batch ID", (item) => esc(item.batch_id)],
-    ["Состояние", (item) => esc(item.registration_state)],
-    ["Локация", (item) => esc(item.location_state)],
-    ["Промахов", (item) => esc(number(item.location_miss_count))],
+  renderTable("#report-bulk-table", "Проблемные массовые процессы", report.problematic_bulk_reservations, [
+    ["Reservation ID", (item) => esc(item.reservation_id)],
+    ["Состояние", (item) => esc(item.state)],
+    ["Тип", (item) => esc(item.change_type || "-")],
+    ["Цель", (item) => esc(item.target_kind || "-")],
     ["Лист", (item) => esc(item.sheet_name || "-")],
     ["Строка", (item) => esc(item.start_row || "-")],
     ["Ссылка", (item) => item.row_link ? `<a href="${esc(item.row_link)}" target="_blank" rel="noreferrer">открыть</a>` : "-"],
     ["Обновлено", (item) => esc(dateTime(item.updated_at))],
-  ], "Проблемных массовых пачек нет.");
+  ], "Проблемных массовых процессов нет.");
   renderTable("#report-workflows-table", "Незавершенные процессы", report.unfinished_workflows, [
     ["User ID", (item) => esc(item.telegram_user_id)],
     ["Шаг", (item) => esc(item.current_step || "-")],
@@ -767,7 +767,6 @@ function renderDeletePreview(result) {
   qs("#delete-count-applications").textContent = number(counts.submitted_applications);
   qs("#delete-count-dashboard").textContent = number(counts.dashboard_outbox);
   qs("#delete-count-notification").textContent = number(counts.notification_outbox);
-  qs("#delete-count-bulk").textContent = number(counts.affected_bulk_batches);
   qs("#delete-confirmation-phrase").textContent = preview.confirmation_phrase || "-";
   qs("#delete-confirmation-input").value = "";
   updateDeleteConfirmationState();

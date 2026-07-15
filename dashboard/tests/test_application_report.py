@@ -83,17 +83,17 @@ def sample_report_payload() -> dict:
                 "without_owner": [application],
                 "needs_clarification": [],
                 "stale_without_movement": [application],
-                "problematic_bulk_batches": [
+                "problematic_bulk_reservations": [
                     {
-                        "batch_id": "BATCH-1",
+                        "reservation_id": "RES-1",
                         "telegram_user_id": 100,
                         "spreadsheet_id": "sheet-id",
                         "sheet_id": 789,
                         "sheet_name": "Массовый ввод",
                         "start_row": 20,
-                        "registration_state": "REGISTERING",
-                        "location_state": "MISSING",
-                        "location_miss_count": 2,
+                        "state": "FAILED",
+                        "target_kind": "rollout",
+                        "change_type": "ADD",
                         "updated_at": "2026-06-25T08:00:00+00:00",
                     }
                 ],
@@ -231,6 +231,19 @@ def test_application_report_treats_final_status_as_final_answer() -> None:
     assert report.urgent_without_final_answer[0]["has_final_answer"] is True
 
 
+def test_application_report_treats_accepted_chips_as_complete() -> None:
+    payload = sample_report_payload()
+    row = payload["container_payload"]["report"]["urgent_without_final_answer"][0]
+    row["change_type"] = "CHIPS"
+    row["application_type"] = "Массовая"
+    row["last_known_status"] = "Принято"
+    row["has_final_answer"] = 0
+
+    report = normalize_application_report(payload, source_host="vps")
+
+    assert report.urgent_without_final_answer[0]["has_final_answer"] is True
+
+
 def test_application_report_command_counts_editor_not_selected_without_owner() -> None:
     command = build_application_report_command(RemoteConfig())
 
@@ -249,3 +262,6 @@ def test_application_report_command_is_read_only() -> None:
     assert "Итоговый ответ готов" in command
     assert "DELETE FROM" not in command.upper()
     assert "UPDATE submitted_applications".upper() not in command.upper()
+    assert "bulk_reservations" in command
+    assert "bulk_batches" not in command
+    assert "bulk_creation_requests" not in command

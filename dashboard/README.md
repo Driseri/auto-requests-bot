@@ -73,12 +73,24 @@ The `Заявки` tab is intentionally manual:
 The application report includes:
 
 - lost applications: `polling_state != 'ACTIVE' OR not_found_count > 0`;
-- urgent applications without a final answer;
-- applications without an owner/editor;
+- open urgent applications without a result: ADD/EDIT needs an editor final answer, while CHIPS needs `Принята` (single) or `Принято` (bulk);
+- open applications without an owner/editor;
 - applications needing clarification;
-- applications without movement for more than 24 hours;
-- problematic bulk batches;
+- open applications without movement for more than 24 hours;
+- problematic new bulk reservations: `FAILED` or active for more than 24 hours;
 - unfinished user workflows.
+
+## Metric Rules
+
+- The dashboard reads only the current bulk workflow from `bulk_reservations`. Legacy
+  `bulk_batches` and `bulk_creation_requests` are not collected or displayed.
+- An ADD/EDIT application is complete when the final-answer field is populated or its
+  status is `Итоговый ответ готов`.
+- A CHIPS application is complete when its status is `Принята` or `Принято`; it is not
+  treated as unfinished merely because its final-answer field is empty.
+- `Отклонена`, `Отложена`, and `Удаление` are closed states and are excluded from open,
+  no-owner, and no-movement alerts.
+- `Итоговый ответ готов сегодня` counts exact final-answer events for ADD/EDIT only.
 
 ## Admin Delete
 

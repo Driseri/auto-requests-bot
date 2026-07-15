@@ -1042,6 +1042,7 @@ class StatusNotificationService:
         dashboard_sync_interval_seconds: float = 300,
         completed_bulk_dashboard_scan_interval_seconds: float = 3600,
         bulk_relocation_search_interval_seconds: int = 3600,
+        legacy_bulk_enabled: bool = False,
         dashboard_outbox_retry_base_seconds: int = 60,
         dashboard_outbox_retry_max_seconds: int = 3600,
         dashboard_outbox_sending_stale_seconds: int = 300,
@@ -1068,6 +1069,7 @@ class StatusNotificationService:
         self.bulk_relocation_search_interval_seconds = (
             bulk_relocation_search_interval_seconds
         )
+        self.legacy_bulk_enabled = legacy_bulk_enabled
         self.dashboard_outbox_retry_base_seconds = dashboard_outbox_retry_base_seconds
         self.dashboard_outbox_retry_max_seconds = dashboard_outbox_retry_max_seconds
         self.dashboard_outbox_sending_stale_seconds = (
@@ -1093,17 +1095,26 @@ class StatusNotificationService:
         await self._deliver_outbox()
         await self._deliver_dashboard_outbox()
         dashboard_sync_due = self._is_dashboard_sync_due()
-        completed_bulk_scan_due = self._is_completed_bulk_scan_due()
-        if hasattr(self.repository, "list_active_bulk_batches"):
-            active_batches = await self.repository.list_active_bulk_batches()
-        else:
-            active_batches = await self.repository.list_bulk_batches()
-        completed_batches = (
-            await self.repository.list_completed_bulk_batches()
-            if completed_bulk_scan_due
-            else []
+        completed_bulk_scan_due = (
+            self.legacy_bulk_enabled and self._is_completed_bulk_scan_due()
         )
-        scan_batches = _unique_batches([*active_batches, *completed_batches])
+        # New bulk reservations are tracked as ordinary submitted applications.
+        # Do not scan retired bulk_batches in the production polling loop.
+        if self.legacy_bulk_enabled:
+            if hasattr(self.repository, "list_active_bulk_batches"):
+                active_batches = await self.repository.list_active_bulk_batches()
+            else:
+                active_batches = await self.repository.list_bulk_batches()
+            completed_batches = (
+                await self.repository.list_completed_bulk_batches()
+                if completed_bulk_scan_due
+                else []
+            )
+            scan_batches = _unique_batches([*active_batches, *completed_batches])
+        else:
+            active_batches = []
+            completed_batches = []
+            scan_batches = []
         relocated_batch_ids: set[str] = set()
         if scan_batches and hasattr(self.status_reader, "resolve_bulk_batch_locations"):
             (
@@ -1211,10 +1222,16 @@ class StatusNotificationService:
             if application.batch_id or is_chips:
                 final_answer_changed = False
             else:
+                # The sheet may receive the final status and answer text in
+                # different polling cycles, in either order.
                 final_answer_changed = (
-                    status_changed
-                    and current.status == ApplicationStatus.FINAL_ANSWER_READY.value
-                    and bool(current.final_answer)
+                    current.status == ApplicationStatus.FINAL_ANSWER_READY.value
+                    and bool((current.final_answer or "").strip())
+                    and (
+                        status_changed
+                        or (current.final_answer or "").strip()
+                        != (application.last_seen_final_answer or "").strip()
+                    )
                 )
             stable_updates: dict[str, Any] = {}
             editor_comment_change = StableFieldChange(False, {})
@@ -2301,9 +2318,7 @@ class StatusNotificationService:
     async def _keyboard_kind_for_user(self, telegram_user_id: int) -> KeyboardKind:
         settings = await self.repository.get_user_settings(telegram_user_id)
         pending_action = settings.pending_action or ""
-        if pending_action.startswith("create_bulk_direction:") or pending_action.startswith(
-            "bulk_reservation_count:"
-        ):
+        if pending_action.startswith("bulk_reservation_count:"):
             return KeyboardKind.NOTIFICATION_BULK_BACK
 
         reservation = await self.repository.get_active_bulk_reservation(telegram_user_id)

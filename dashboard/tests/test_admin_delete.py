@@ -70,15 +70,12 @@ def sample_preview_payload() -> dict:
                 "submitted_applications": 1,
                 "dashboard_outbox": 1,
                 "notification_outbox": 1,
-                "affected_bulk_batches": 1,
             },
             "export": {
                 "submitted_applications": [{"application_id": "APP-1", "batch_id": "BATCH-1"}],
                 "dashboard_outbox": [],
                 "notification_outbox": [],
-                "affected_bulk_batches": [],
             },
-            "batch_ids": ["BATCH-1"],
         },
     }
 
@@ -186,19 +183,6 @@ def create_sqlite_fixture(db_path: Path) -> None:
             updated_at TEXT,
             last_error TEXT
         );
-        CREATE TABLE bulk_batches (
-            batch_id TEXT PRIMARY KEY,
-            telegram_user_id INTEGER,
-            direction TEXT,
-            sheet_name TEXT,
-            registration_state TEXT,
-            registered_count INTEGER,
-            data_end_row INTEGER,
-            location_state TEXT,
-            location_miss_count INTEGER,
-            created_at TEXT,
-            updated_at TEXT
-        );
         """
     )
     rows = [
@@ -232,10 +216,6 @@ def create_sqlite_fixture(db_path: Path) -> None:
             "2026-01-01",
             "",
         ),
-    )
-    connection.execute(
-        "INSERT INTO bulk_batches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("BATCH-1", 100, "ФЛ", "Лист", "REGISTERING", 2, 22, "KNOWN", 0, "2026-01-01", "2026-01-01"),
     )
     connection.commit()
     connection.close()
@@ -385,7 +365,7 @@ def test_container_preview_does_not_write(tmp_path: Path) -> None:
     assert count_rows(db_path, "dashboard_outbox") == 1
 
 
-def test_container_execute_deletes_related_rows_and_recalculates_batch(tmp_path: Path) -> None:
+def test_container_execute_deletes_related_rows_without_legacy_bulk_updates(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     create_sqlite_fixture(db_path)
 
@@ -393,9 +373,6 @@ def test_container_execute_deletes_related_rows_and_recalculates_batch(tmp_path:
 
     connection = sqlite3.connect(db_path)
     try:
-        batch = connection.execute(
-            "SELECT registered_count, data_end_row FROM bulk_batches WHERE batch_id = 'BATCH-1'"
-        ).fetchone()
         remaining_ids = [row[0] for row in connection.execute("SELECT application_id FROM submitted_applications")]
     finally:
         connection.close()
@@ -404,7 +381,6 @@ def test_container_execute_deletes_related_rows_and_recalculates_batch(tmp_path:
     assert result["execution"]["deleted"]["dashboard_outbox"] == 1
     assert result["execution"]["deleted"]["notification_outbox"] == 1
     assert remaining_ids == ["APP-2"]
-    assert batch == (1, 22)
 
 
 def test_container_execute_bad_confirmation_rolls_back(tmp_path: Path) -> None:
@@ -415,5 +391,8 @@ def test_container_execute_bad_confirmation_rolls_back(tmp_path: Path) -> None:
 
     assert result["status"] == "failed"
     assert count_rows(db_path, "submitted_applications") == 2
-    assert count_rows(db_path, "dashboard_outbox") == 1
-    assert count_rows(db_path, "notification_outbox") == 1
+
+
+def test_admin_delete_has_no_legacy_bulk_query() -> None:
+    assert "bulk_batches" not in _CONTAINER_SCRIPT
+    assert "bulk_creation_requests" not in _CONTAINER_SCRIPT

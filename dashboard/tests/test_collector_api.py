@@ -7,7 +7,13 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from backend.app import create_app
-from backend.collector import DashboardCollector, _duration_stats, _normalize_status_counts
+from backend.collector import (
+    DashboardCollector,
+    _duration_stats,
+    _is_open_application,
+    _normalize_status_counts,
+    _pilot_problem_rows,
+)
 from backend.config import RemoteConfig, load_config
 from backend.remote_script import build_remote_command
 from backend.storage import JsonStorage
@@ -26,6 +32,41 @@ class FakeRunner:
         if self.fail:
             raise RuntimeError("ssh failed")
         return json.dumps(self.payload)
+
+
+def pilot_fixture_time(hour: int, minute: int = 0, *, days_before: int = 1) -> str:
+    """Return a recent UTC timestamp so seven-day tests do not expire."""
+
+    return (datetime.now(timezone.utc) - timedelta(days=days_before)).replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    ).isoformat()
+
+
+def refresh_pilot_fixture_timestamps(payload: dict) -> dict:
+    """Move the static sample from 2026-07-06 to yesterday, preserving intervals."""
+
+    source_anchor = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    target_anchor = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    shift = target_anchor - source_anchor
+
+    def refresh(value):
+        if isinstance(value, dict):
+            return {key: refresh(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [refresh(item) for item in value]
+        if isinstance(value, str) and value.startswith("2026-07-"):
+            return (datetime.fromisoformat(value.replace("Z", "+00:00")) + shift).isoformat()
+        return value
+
+    return refresh(payload)
 
 
 def sample_remote_payload() -> dict:
@@ -75,7 +116,16 @@ def sample_remote_payload() -> dict:
                     },
                     "applications_by_status": [{"status": "Новая", "count": 1}],
                     "applications_by_direction": [{"direction": "ФЛ", "count": 1}],
-                    "bulk_summary": {"total": 4, "unfinished": 0, "registering": 0, "registered": 4, "registered_today": 1},
+                    "bulk_summary": {
+                        "total": 4,
+                        "active": 0,
+                        "creating": 0,
+                        "ready_for_registration": 0,
+                        "registering": 0,
+                        "failed": 0,
+                        "overdue_active": 0,
+                        "registered_today": 1,
+                    },
                     "urgent_applications": [],
                     "drafts_summary": [],
                     "user_workflow_pending": [],
@@ -210,7 +260,7 @@ def sample_pilot_payload() -> dict:
             }
         ],
     }
-    return payload
+    return refresh_pilot_fixture_timestamps(payload)
 
 
 def make_config(tmp_path: Path):
@@ -332,6 +382,82 @@ def test_urgent_editor_not_selected_is_counted_without_owner(tmp_path: Path) -> 
     assert response.json()["snapshot"]["urgent"]["no_editor"] == 1
 
 
+def test_urgent_metrics_use_chips_specific_completion_rules(tmp_path: Path) -> None:
+    """CHIPS is complete by acceptance, not by the unused final-answer field."""
+
+    payload = sample_remote_payload()
+    payload["container_payload"]["sqlite"]["metrics"]["urgent_applications"] = [
+        {
+            "application_id": "CHIPS-SINGLE-DONE",
+            "change_type": "CHIPS",
+            "application_type": "Одиночная",
+            "last_known_status": "Принята",
+            "last_seen_editor": "Редактор",
+            "created_at": pilot_fixture_time(8),
+        },
+        {
+            "application_id": "CHIPS-BULK-DONE",
+            "change_type": "CHIPS",
+            "application_type": "Массовая",
+            "last_known_status": "Принято",
+            "last_seen_editor": "Редактор",
+            "created_at": pilot_fixture_time(8),
+        },
+        {
+            "application_id": "CHIPS-OPEN",
+            "change_type": "CHIPS",
+            "application_type": "Одиночная",
+            "last_known_status": "В работе",
+            "last_seen_editor": "",
+            "created_at": pilot_fixture_time(8),
+        },
+        {
+            "application_id": "ADD-REJECTED",
+            "change_type": "ADD",
+            "last_known_status": "Отклонена",
+            "last_seen_editor": "Редактор",
+            "created_at": pilot_fixture_time(8),
+        },
+    ]
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    client = TestClient(create_app(config_path=tmp_path / "config.local.toml", collector=collector))
+
+    urgent = client.post("/api/collect").json()["snapshot"]["urgent"]
+
+    assert urgent["open"] == 1
+    assert urgent["no_final_answer"] == 1
+    assert urgent["no_editor"] == 1
+    assert [row["application_id"] for row in urgent["rows"]] == ["CHIPS-OPEN"]
+
+
+def test_problem_rows_ignore_closed_chips_and_terminal_add_edit() -> None:
+    """Only genuinely open applications can receive the no-result problem flag."""
+
+    old = pilot_fixture_time(8, days_before=5)
+    applications = [
+        {"application_id": "CHIPS-DONE", "change_type": "CHIPS", "last_known_status": "Принята", "last_seen_editor": "Редактор", "submitted_at": old, "updated_at": old, "polling_state": "ACTIVE", "not_found_count": 0},
+        {"application_id": "ADD-REJECTED", "change_type": "ADD", "last_known_status": "Отклонена", "last_seen_editor": "Редактор", "submitted_at": old, "updated_at": old, "polling_state": "ACTIVE", "not_found_count": 0},
+        {"application_id": "CHIPS-OPEN", "change_type": "CHIPS", "last_known_status": "В работе", "last_seen_editor": "Редактор", "submitted_at": old, "updated_at": old, "polling_state": "ACTIVE", "not_found_count": 0},
+    ]
+
+    rows = _pilot_problem_rows(applications, {}, [])
+
+    assert [row["application_id"] for row in rows] == ["CHIPS-OPEN"]
+    assert _is_open_application(applications[0]) is False
+    assert _is_open_application(applications[1]) is False
+    assert _is_open_application(applications[2]) is True
+
+
+def test_remote_collection_uses_only_bulk_reservations() -> None:
+    command = build_remote_command(RemoteConfig(), include_logs=False, include_heavy=False)
+
+    assert "bulk_reservations" in command
+    assert "bulk_batches" not in command
+    assert "bulk_creation_requests" not in command
+
+
 def test_api_safe_config_never_returns_password(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     storage = JsonStorage(config.storage.data_dir)
@@ -392,17 +518,68 @@ def test_pilot_metrics_are_normalized_from_snapshot(tmp_path: Path) -> None:
     assert period["problem_rows"]
     funnel = {item["key"]: item for item in period["funnel"]}
     assert funnel["submitted"]["count"] == 1
-    assert funnel["sheets_visible"]["count"] == 1
+    assert funnel["editor_assigned"]["count"] == 1
+    assert funnel["status_changed"]["count"] == 0
     assert funnel["final_answer"]["count"] == 1
-    assert funnel["user_response"]["count"] == 0
+    assert funnel["scriptwriter_response"]["count"] == 0
     assert funnel["submitted"]["average_transition_seconds"] == 600
-    assert funnel["sheets_visible"]["average_transition_seconds"] == 300
-    assert funnel["status_changed"]["average_transition_seconds"] == 1500
+    assert funnel["editor_assigned"]["average_transition_seconds"] == 1800
+    assert funnel["status_changed"]["average_transition_seconds"] is None
     assert funnel["submitted"]["transition_sample_size"] == 1
     assert snapshot["applications"]["by_status"] == [
         {"status": "Некорректные статусы/интенты", "count": 3},
         {"status": "Новая", "count": 2},
     ]
+
+
+def test_full_cycle_counts_exact_completion_when_submission_precedes_period(tmp_path: Path) -> None:
+    """A cycle completes in the selected period even when it started earlier."""
+
+    payload = sample_pilot_payload()
+    raw = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    submitted_at = now - timedelta(days=10)
+    final_at = now - timedelta(days=1)
+    raw["applications"] = [
+        {
+            **raw["applications"][0],
+            "application_id": "APP-CROSS-PERIOD",
+            "is_urgent": 0,
+            "submitted_at": submitted_at.isoformat(),
+            "created_at": submitted_at.isoformat(),
+        }
+    ]
+    raw["events"] = [
+        {
+            "application_id": "APP-CROSS-PERIOD",
+            "telegram_user_id": 100,
+            "event_type": "application_submitted",
+            "event_at": submitted_at.isoformat(),
+            "old_value": None,
+            "new_value": None,
+        },
+        {
+            "application_id": "APP-CROSS-PERIOD",
+            "telegram_user_id": 100,
+            "event_type": "final_answer_added",
+            "event_at": final_at.isoformat(),
+            "old_value": "",
+            "new_value": "Готово",
+        },
+    ]
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    client = TestClient(create_app(config_path=tmp_path / "config.local.toml", collector=collector))
+
+    period = client.post("/api/collect").json()["snapshot"]["pilot"]["periods"]["7d"]
+
+    assert period["kpi"]["full_cycle_seconds"] == {
+        "average_seconds": 9 * 24 * 60 * 60,
+        "median_seconds": 9 * 24 * 60 * 60,
+        "sample_size": 1,
+    }
+    assert period["kpi"]["full_cycle_seconds_by_urgency"]["regular"]["sample_size"] == 1
 
 
 def test_pilot_stickiness_counts_unique_submission_users(tmp_path: Path) -> None:
@@ -444,7 +621,7 @@ def test_pilot_funnel_counts_unique_applications_for_repeated_events(tmp_path: P
                 "application_id": "APP-1",
                 "telegram_user_id": 100,
                 "event_type": "final_answer_added",
-                "event_at": "2026-07-06T09:05:00+00:00",
+                "event_at": pilot_fixture_time(9, 5),
                 "old_value": "",
                 "new_value": "present again",
             },
@@ -452,7 +629,7 @@ def test_pilot_funnel_counts_unique_applications_for_repeated_events(tmp_path: P
                 "application_id": "APP-1",
                 "telegram_user_id": 100,
                 "event_type": "editor_changed",
-                "event_at": "2026-07-06T08:40:00+00:00",
+                "event_at": pilot_fixture_time(8, 40),
                 "old_value": "",
                 "new_value": "Редактор 2",
             },
@@ -468,7 +645,69 @@ def test_pilot_funnel_counts_unique_applications_for_repeated_events(tmp_path: P
 
     funnel = {item["key"]: item["count"] for item in response.json()["snapshot"]["pilot"]["periods"]["7d"]["funnel"]}
     assert funnel["final_answer"] == 1
-    assert funnel["status_changed"] == 1
+    assert funnel["editor_assigned"] == 1
+    assert funnel["status_changed"] == 0
+
+
+def test_pilot_funnel_uses_only_actual_stage_events(tmp_path: Path) -> None:
+    """Keep Sheets indexing and unsupported user events out of the funnel."""
+
+    payload = sample_pilot_payload()
+    events = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]["events"]
+    events.extend(
+        [
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
+                "event_type": "status_changed",
+                "event_at": pilot_fixture_time(8, 20),
+                "old_value": "Новая",
+                "new_value": "В работе",
+            },
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
+                "event_type": "editor_comment_added",
+                "event_at": pilot_fixture_time(8, 30),
+                "old_value": "",
+                "new_value": "Нужны пояснения",
+            },
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
+                "event_type": "user_comment_added",
+                "event_at": pilot_fixture_time(8, 40),
+                "old_value": "",
+                "new_value": "Не используется ботом",
+            },
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
+                "event_type": "scriptwriter_response_added",
+                "event_at": pilot_fixture_time(8, 50),
+                "old_value": "",
+                "new_value": "Ответ сценариста",
+            },
+        ]
+    )
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    client = TestClient(create_app(config_path=tmp_path / "config.local.toml", collector=collector))
+
+    funnel = {
+        item["key"]: item
+        for item in client.post("/api/collect").json()["snapshot"]["pilot"]["periods"]["7d"]["funnel"]
+    }
+
+    assert "sheets_visible" not in funnel
+    assert "user_response" not in funnel
+    assert funnel["editor_assigned"]["count"] == 1
+    assert funnel["status_changed"]["count"] == 1
+    assert funnel["editor_comment"]["count"] == 1
+    assert funnel["scriptwriter_response"]["count"] == 1
+    assert funnel["scriptwriter_response"]["average_transition_seconds"] == 1200
+    assert funnel["scriptwriter_response"]["transition_sample_size"] == 1
 
 
 def test_pilot_metrics_do_not_use_current_state_fallbacks(tmp_path: Path) -> None:
@@ -485,8 +724,8 @@ def test_pilot_metrics_do_not_use_current_state_fallbacks(tmp_path: Path) -> Non
             "has_editor_comment": 1,
             "has_final_answer": 1,
             "has_scriptwriter_response": 1,
-            "submitted_at": "2026-07-06T08:00:00+00:00",
-            "updated_at": "2026-07-06T12:00:00+00:00",
+            "submitted_at": pilot_fixture_time(8),
+            "updated_at": pilot_fixture_time(12),
         }
     ]
     raw["events"] = [
@@ -494,7 +733,7 @@ def test_pilot_metrics_do_not_use_current_state_fallbacks(tmp_path: Path) -> Non
             "application_id": "APP-FALLBACK",
             "telegram_user_id": 100,
             "event_type": "application_submitted",
-            "event_at": "2026-07-06T08:00:00+00:00",
+            "event_at": pilot_fixture_time(8),
             "old_value": None,
             "new_value": None,
         }
@@ -515,9 +754,9 @@ def test_pilot_metrics_do_not_use_current_state_fallbacks(tmp_path: Path) -> Non
     assert kpi["full_cycle_seconds_by_urgency"]["urgent"]["sample_size"] == 0
     funnel = {item["key"]: item for item in period["funnel"]}
     assert funnel["submitted"]["count"] == 1
-    assert funnel["sheets_visible"]["count"] == 0
+    assert funnel["editor_assigned"]["count"] == 0
     assert funnel["editor_comment"]["count"] == 0
-    assert funnel["user_response"]["count"] == 0
+    assert funnel["scriptwriter_response"]["count"] == 0
     assert funnel["final_answer"]["count"] == 0
     assert funnel["status_changed"]["count"] == 0
 
@@ -567,7 +806,7 @@ def test_pilot_metrics_match_actual_application_event_names(tmp_path: Path) -> N
                 "application_id": "APP-2",
                 "telegram_user_id": 200,
                 "event_type": "application_indexed",
-                "event_at": "2026-07-05T08:01:00+00:00",
+                "event_at": pilot_fixture_time(8, 1, days_before=2),
                 "old_value": None,
                 "new_value": None,
             },
@@ -575,7 +814,7 @@ def test_pilot_metrics_match_actual_application_event_names(tmp_path: Path) -> N
                 "application_id": "APP-2",
                 "telegram_user_id": 200,
                 "event_type": "application_deleted",
-                "event_at": "2026-07-05T09:00:00+00:00",
+                "event_at": pilot_fixture_time(9, days_before=2),
                 "old_value": None,
                 "new_value": None,
             },

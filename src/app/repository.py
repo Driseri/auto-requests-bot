@@ -3013,6 +3013,27 @@ class DraftRepository:
             await db.execute("BEGIN IMMEDIATE")
             for item in tracking:
                 await self._save_submitted_application_in_connection(db, item, now)
+                # New bulk reservations bypass complete_submission, so record
+                # the same exact submission event in their atomic write path.
+                await self._record_application_event_in_connection(
+                    db,
+                    event_type="application_submitted",
+                    application_id=item["application_id"],
+                    telegram_user_id=item["telegram_user_id"],
+                    event_at=item.get("submitted_at") or now,
+                    metadata={
+                        "spreadsheet_id": item.get("spreadsheet_id"),
+                        "sheet_id": item.get("sheet_id"),
+                        "sheet_name": item.get("sheet_name"),
+                        "row_number": item.get("last_seen_row_number"),
+                        "direction": item.get("direction"),
+                        "answer_type": item.get("answer_type"),
+                        "application_type": item.get("application_type"),
+                        "change_type": item.get("change_type"),
+                        "is_urgent": item.get("is_urgent"),
+                    },
+                    created_at=now,
+                )
             for projection in dashboard_projections:
                 await self._upsert_dashboard_projection_in_connection(
                     db,

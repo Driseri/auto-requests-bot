@@ -15,10 +15,8 @@ from app.formatting import (
     serialize_formatting_spans,
 )
 from app.bulk import (
-    BulkApplicationRegistrar,
     BulkReservationRegistrar,
     BulkReservationServiceProtocol,
-    BulkBatchServiceProtocol,
 )
 from app.llm import LLM_ERROR_PREFIX, LlmClient
 from app.models import (
@@ -26,8 +24,6 @@ from app.models import (
     ApplicationStatus,
     ApplicationType,
     BotResponse,
-    BulkBatch,
-    BulkCreationState,
     BulkReservation,
     BulkReservationState,
     BulkTargetKind,
@@ -43,7 +39,6 @@ from app.models import (
     Priority,
     Step,
     SubmissionState,
-    generate_batch_id,
     direction_display_label,
     direction_value_from_display_label,
 )
@@ -73,8 +68,8 @@ FIELD_LABELS = {
 PENDING_SET_DEFAULT_INTENT = "set_default_intent"
 PENDING_SET_DEFAULT_SCRIPTWRITER = "set_default_scriptwriter"
 PENDING_SET_DEFAULT_DIRECTION = "set_default_direction"
-PENDING_CREATE_BULK_DIRECTION = "create_bulk_direction"
 PENDING_BULK_RESERVATION_COUNT = "bulk_reservation_count"
+RETIRED_PENDING_CREATE_BULK_DIRECTION = "create_bulk_direction:"
 
 STEP_PROMPTS = {
     Step.DIRECTION: "Выберите направление заявки.",
@@ -142,8 +137,6 @@ class ApplicationFlow:
         repository: DraftRepository,
         llm_client: LlmClient,
         submission_service: SubmissionServiceProtocol,
-        bulk_service: BulkBatchServiceProtocol | None = None,
-        bulk_registrar: BulkApplicationRegistrar | None = None,
         bulk_reservation_service: BulkReservationServiceProtocol | None = None,
         bulk_reservation_registrar: BulkReservationRegistrar | None = None,
         show_llm_response_json: bool = False,
@@ -157,8 +150,6 @@ class ApplicationFlow:
         self.repository = repository
         self.llm_client = llm_client
         self.submission_service = submission_service
-        self.bulk_service = bulk_service
-        self.bulk_registrar = bulk_registrar
         self.bulk_reservation_service = bulk_reservation_service
         self.bulk_reservation_registrar = bulk_reservation_registrar
         self.show_llm_response_json = show_llm_response_json
@@ -199,41 +190,12 @@ class ApplicationFlow:
     ) -> BotResponse:
         """Восстановить незавершенный workflow перед показом главного меню."""
         settings = await self.repository.get_user_settings(telegram_user_id)
-        pending_action = settings.pending_action or ""
+        if (settings.pending_action or "").startswith(RETIRED_PENDING_CREATE_BULK_DIRECTION):
+            # Retired legacy actions must not alter navigation for a new workflow.
+            await self.repository.save_user_setting(telegram_user_id, "pending_action", None)
         reservation = await self.repository.get_active_bulk_reservation(telegram_user_id)
         if reservation is not None:
             return self._bulk_reservation_response(reservation)
-        if pending_action.startswith(f"{PENDING_CREATE_BULK_DIRECTION}:"):
-            idempotency_key = pending_action.split(":", maxsplit=1)[1]
-            request = await self.repository.get_bulk_creation_request(idempotency_key)
-            if request is not None and request.telegram_user_id == telegram_user_id:
-                if request.state == BulkCreationState.CREATED.value:
-                    await self.repository.save_user_setting(
-                        telegram_user_id,
-                        "pending_action",
-                        None,
-                    )
-                    return self._bulk_created_response(
-                        request.batch_id,
-                        request.insert_url or "",
-                    )
-                return BotResponse(
-                    text=(
-                        "Продолжите создание массовой заявки: "
-                        "выберите направление."
-                    ),
-                    keyboard=KeyboardKind.BULK_DIRECTION,
-                    keyboard_payload=idempotency_key,
-                )
-
-        batch = await self.repository.get_latest_unregistered_bulk_batch(
-            telegram_user_id
-        )
-        if batch is not None:
-            return self._bulk_created_response(
-                batch.batch_id,
-                self._bulk_insert_url(batch),
-            )
         draft = await self.repository.get_by_user_id(telegram_user_id)
         if draft is not None and draft.is_active:
             await self.remember_author(telegram_user_id, author_name)
@@ -322,155 +284,20 @@ class ApplicationFlow:
     async def bulk_upload_stub(self, telegram_user_id: int) -> BotResponse:
         return await self.open_bulk_menu(telegram_user_id)
 
-    async def _legacy_open_bulk_menu(self, telegram_user_id: int) -> BotResponse:
-        return BotResponse(
-            text=(
-                "Массовая загрузка работает через отдельный лист Google Sheets.\n\n"
-                "1. Создайте массовую заявку.\n"
-                "2. Заполните строки сразу в Google Sheets.\n"
-                "3. Вернитесь в бот и нажмите «Заявка заполнена»."
-            ),
-            keyboard=KeyboardKind.BULK_MENU,
-        )
-
-    async def _legacy_create_bulk_batch(self, telegram_user_id: int) -> BotResponse:
-        """Запустить выбор направления перед созданием секции массовой заявки."""
-        if self.bulk_service is None:
-            return BotResponse(
-                text="Массовая загрузка не настроена.",
-                keyboard=KeyboardKind.BULK_MENU,
-            )
-        idempotency_key = uuid4().hex
-        await self.repository.create_bulk_creation_request(
-            idempotency_key=idempotency_key,
-            telegram_user_id=telegram_user_id,
-            batch_id=generate_batch_id(),
-        )
-        await self.repository.save_user_setting(
-            telegram_user_id,
-            "pending_action",
-            f"{PENDING_CREATE_BULK_DIRECTION}:{idempotency_key}",
-        )
-        return BotResponse(
-            text="Выберите направление массовой заявки.",
-            keyboard=KeyboardKind.BULK_DIRECTION,
-            keyboard_payload=idempotency_key,
-        )
-
-    async def _create_bulk_batch_for_direction(
-        self,
-        telegram_user_id: int,
-        direction: str,
-        idempotency_key: str,
-    ) -> BotResponse:
-        if self.bulk_service is None:
-            return BotResponse(text="Массовая загрузка не настроена.", keyboard=KeyboardKind.BULK_MENU)
-        request = await self.repository.claim_bulk_creation(
-            idempotency_key,
-            direction=direction,
-            stale_after_seconds=self.bulk_creation_stale_seconds,
-        )
-        if request is None or request.telegram_user_id != telegram_user_id:
-            return BotResponse(
-                text="Запрос на создание массовой заявки не найден.",
-                keyboard=KeyboardKind.BULK_MENU,
-            )
-        if request.state == BulkCreationState.CREATED:
-            return self._bulk_created_response(request.batch_id, request.insert_url or "")
-        result = await self.bulk_service.create_batch(
-            telegram_user_id,
-            direction,
-            batch_id=request.batch_id,
-        )
-        if not result.success:
-            await self.repository.fail_bulk_creation(
-                idempotency_key,
-                error=result.message,
-            )
-            return BotResponse(text=result.message, keyboard=KeyboardKind.BULK_MENU)
-        batch_id = result.batch.batch_id if result.batch else "-"
-        insert_url = result.insert_url or ""
-        await self.repository.complete_bulk_creation(
-            idempotency_key,
-            insert_url=insert_url,
-        )
-        await self.repository.save_user_setting(telegram_user_id, "pending_action", None)
-        return self._bulk_created_response(batch_id, insert_url)
-
-    async def _legacy_select_bulk_direction(
-        self,
-        telegram_user_id: int,
-        idempotency_key: str,
-        direction: Direction,
-    ) -> BotResponse:
-        return await self._create_bulk_batch_for_direction(
-            telegram_user_id,
-            direction.value,
-            idempotency_key,
-        )
-
-    def _bulk_created_response(self, batch_id: str, insert_url: str) -> BotResponse:
-        return BotResponse(
-            text=(
-                f"Создана массовая заявка <b>{escape(batch_id)}</b>.\n\n"
-                "Заполните строки в колонках A:G, начиная с первой строки по ссылке. "
-                f"Можно заполнить до {self.bulk_reserved_rows} строк.\n"
-                "После заполнения вернитесь сюда и нажмите «Заявка заполнена», чтобы бот выдал ID заявок.\n\n"
-                f'<a href="{escape(insert_url, quote=True)}">Открыть место для вставки</a>'
-            ),
-            keyboard=KeyboardKind.BULK_CREATED,
-            keyboard_payload=batch_id if batch_id != "-" else None,
-            parse_mode="HTML",
-        )
-
-    @staticmethod
-    def _bulk_insert_url(batch: BulkBatch) -> str:
-        return (
-            f"https://docs.google.com/spreadsheets/d/{batch.spreadsheet_id}/edit"
-            f"#gid={batch.sheet_id}&range=A{batch.data_start_row}:G{batch.data_start_row}"
-        )
-
     async def confirm_bulk_batch_filled(
         self,
         telegram_user_id: int,
         batch_id: str,
     ) -> BotResponse:
-        """По подтверждению автора зарегистрировать строки массовой заявки."""
-        if self.bulk_registrar is None:
-            return BotResponse(
-                text="Регистрация массовой заявки не настроена.",
-                keyboard=KeyboardKind.BULK_CREATED,
-                keyboard_payload=batch_id,
-            )
-        result = await self.bulk_registrar.register_batch(batch_id, telegram_user_id)
-        if not result.success:
-            link = (
-                "\n\n"
-                f'<a href="{escape(result.insert_url, quote=True)}">'
-                "Открыть исходный диапазон</a>"
-                if result.insert_url
-                else ""
-            )
-            if not result.retry_allowed:
-                return BotResponse(
-                    text=f"{escape(result.message)}{link}",
-                    keyboard=KeyboardKind.BULK_MENU,
-                    parse_mode="HTML",
-                )
-            return BotResponse(
-                text=f"{escape(result.message)}{link}",
-                keyboard=KeyboardKind.BULK_CREATED,
-                keyboard_payload=batch_id,
-                parse_mode="HTML",
-            )
+        """Safely close a callback from a legacy bulk-batch message."""
         return BotResponse(
-            text=result.message,
-            keyboard=KeyboardKind.BULK_COMPLETED,
+            text="Старый формат массовых заявок отключен. Создайте новую массовую заявку.",
+            keyboard=KeyboardKind.BULK_MENU,
         )
 
     async def open_bulk_menu(self, telegram_user_id: int) -> BotResponse:
         if self.bulk_reservation_service is None:
-            return await self._legacy_open_bulk_menu(telegram_user_id)
+            return BotResponse(text="Массовые заявки не настроены.", keyboard=KeyboardKind.CREATE_MODE)
         return BotResponse(
             text=(
                 "Массовая заявка создает обычные строки сразу в нужном рабочем листе.\n\n"
@@ -482,7 +309,7 @@ class ApplicationFlow:
 
     async def create_bulk_batch(self, telegram_user_id: int) -> BotResponse:
         if self.bulk_reservation_service is None:
-            return await self._legacy_create_bulk_batch(telegram_user_id)
+            return BotResponse(text="Массовые заявки не настроены.", keyboard=KeyboardKind.CREATE_MODE)
         active = await self.repository.get_active_bulk_reservation(telegram_user_id)
         if active is not None:
             return self._bulk_reservation_response(active)
@@ -505,11 +332,7 @@ class ApplicationFlow:
         direction: Direction,
     ) -> BotResponse:
         if self.bulk_reservation_service is None:
-            return await self._legacy_select_bulk_direction(
-                telegram_user_id,
-                reservation_id,
-                direction,
-            )
+            return BotResponse(text="Массовые заявки не настроены.", keyboard=KeyboardKind.CREATE_MODE)
         reservation = await self.repository.get_bulk_reservation(reservation_id)
         if reservation is None or reservation.telegram_user_id != telegram_user_id:
             return BotResponse(text="Массовый резерв не найден.", keyboard=KeyboardKind.BULK_MENU)
@@ -826,15 +649,6 @@ class ApplicationFlow:
                 draft,
                 prefix="Направление по умолчанию пока не задано.",
             )
-        if settings.pending_action and settings.pending_action.startswith(
-            f"{PENDING_CREATE_BULK_DIRECTION}:"
-        ):
-            idempotency_key = settings.pending_action.split(":", maxsplit=1)[1]
-            return await self._create_bulk_batch_for_direction(
-                telegram_user_id,
-                settings.default_direction,
-                idempotency_key,
-            )
         return await self.select_direction(
             telegram_user_id,
             Direction(settings.default_direction),
@@ -1096,17 +910,6 @@ class ApplicationFlow:
         }
 
     async def select_direction(self, telegram_user_id: int, direction: Direction) -> BotResponse:
-        settings = await self.repository.get_user_settings(telegram_user_id)
-        if settings.pending_action and settings.pending_action.startswith(
-            f"{PENDING_CREATE_BULK_DIRECTION}:"
-        ):
-            idempotency_key = settings.pending_action.split(":", maxsplit=1)[1]
-            return await self._create_bulk_batch_for_direction(
-                telegram_user_id,
-                direction.value,
-                idempotency_key,
-            )
-
         draft = await self._get_active_or_start(telegram_user_id)
         if draft.current_step not in {Step.DIRECTION, Step.EDIT_DIRECTION}:
             return await self._prompt_response_for_user(

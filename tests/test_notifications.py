@@ -2496,6 +2496,48 @@ async def test_single_final_answer_waits_for_final_answer_ready_status(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_final_answer_event_is_recorded_when_text_appears_after_final_status(tmp_path):
+    repository = DraftRepository(str(tmp_path / "final_answer_after_status.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="A1B2C3D4",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.FINAL_ANSWER_READY.value,
+        last_seen_final_answer="",
+    )
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader(
+            {
+                "A1B2C3D4": SheetApplicationStatus(
+                    application_id="A1B2C3D4",
+                    spreadsheet_id=FL_SPREADSHEET,
+                    sheet_name=WEEK_SHEET,
+                    sheet_id=100,
+                    row_number=7,
+                    status=ApplicationStatus.FINAL_ANSWER_READY.value,
+                    editor_comment="",
+                    final_answer="Финальный текст после смены статуса",
+                )
+            }
+        ),
+        notifier=FakeNotifier(),
+    )
+
+    await service.run_once()
+    events = await repository.list_application_events(
+        application_id="A1B2C3D4",
+        event_type="final_answer_added",
+    )
+
+    assert len(events) == 1
+    assert events[0].new_value == "Финальный текст после смены статуса"
+
+
+@pytest.mark.asyncio
 async def test_notification_service_persists_event_if_send_fails(tmp_path):
     repository = DraftRepository(str(tmp_path / "send_failure.db"))
     await repository.init()
@@ -2629,9 +2671,9 @@ async def test_notification_keyboard_returns_to_pending_bulk_creation(tmp_path):
     kind = await service._keyboard_kind_for_user(100)
     keyboard = build_keyboard(kind)
 
-    assert kind == KeyboardKind.NOTIFICATION_BULK_BACK
+    assert kind == KeyboardKind.NOTIFICATION
     assert keyboard is not None
-    assert keyboard.inline_keyboard[0][0].text == "Назад к заявке"
+    assert keyboard.inline_keyboard[0][0].text == "Главное меню"
     assert keyboard.inline_keyboard[0][0].callback_data == "app:notification:new"
 
 
@@ -2887,6 +2929,7 @@ async def test_notification_service_sends_bulk_batch_status_change(tmp_path):
         repository=repository,
         status_reader=reader,
         notifier=notifier,
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -2936,6 +2979,7 @@ async def test_bulk_done_notification_retries_when_telegram_send_fails(tmp_path)
         repository=repository,
         status_reader=reader,
         notifier=FakeNotifier(fail=True),
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -3248,6 +3292,7 @@ async def test_notification_service_does_not_notify_for_bulk_batch_in_progress(t
         status_reader=reader,
         notifier=notifier,
         dashboard_sync=dashboard_sync,
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -3302,6 +3347,7 @@ async def test_bulk_dashboard_projection_aggregates_final_answers_and_editors(tm
         status_reader=FakeBulkRowsStatusReader(statuses),
         notifier=FakeNotifier(),
         dashboard_sync=dashboard_sync,
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -3342,6 +3388,7 @@ async def test_completed_bulk_batches_are_scanned_no_more_than_hourly(tmp_path):
         dashboard_sync=FakeDashboardSync(),
         completed_bulk_dashboard_scan_interval_seconds=3600,
         clock=lambda: now[0],
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -3445,6 +3492,7 @@ async def test_completed_bulk_application_marked_missing_when_archive_batch_scan
         dashboard_sync=FakeDashboardSync(),
         status_not_found_threshold=2,
         status_not_found_recheck_seconds=3600,
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -3486,6 +3534,7 @@ async def test_active_bulk_application_marked_missing_when_batch_scanned(tmp_pat
         notifier=FakeNotifier(),
         status_not_found_threshold=2,
         status_not_found_recheck_seconds=3600,
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -3541,6 +3590,7 @@ async def test_found_bulk_application_resets_not_found_state(tmp_path):
         repository=repository,
         status_reader=FakeBulkRowsStatusReader({"A1B2C3D4": status}),
         notifier=FakeNotifier(),
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -3620,6 +3670,7 @@ async def test_notification_service_restores_moved_bulk_batch_and_dashboard_link
         status_reader=reader,
         notifier=FakeNotifier(),
         dashboard_sync=dashboard_sync,
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()
@@ -3681,6 +3732,7 @@ async def test_notification_service_counts_missing_bulk_rows_only_after_full_sea
         notifier=FakeNotifier(),
         dashboard_sync=FakeDashboardSync(),
         status_not_found_threshold=20,
+        legacy_bulk_enabled=True,
     )
 
     await service.run_once()

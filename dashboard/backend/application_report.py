@@ -14,6 +14,7 @@ from .storage import JsonStorage
 
 
 FINAL_ANSWER_READY_STATUS = "\u0418\u0442\u043e\u0433\u043e\u0432\u044b\u0439 \u043e\u0442\u0432\u0435\u0442 \u0433\u043e\u0442\u043e\u0432"
+CHIPS_SUCCESS_STATUSES = {"\u041f\u0440\u0438\u043d\u044f\u0442\u0430", "\u041f\u0440\u0438\u043d\u044f\u0442\u043e"}
 
 
 class ReportCommandRunner(Protocol):
@@ -99,7 +100,7 @@ def normalize_application_report(raw: dict[str, Any], *, source_host: str) -> Ap
             "without_owner": len(without_owner),
             "needs_clarification": len(clarification),
             "stale_without_movement": len(stale),
-            "problematic_bulk_batches": len(report.get("problematic_bulk_batches", [])),
+            "problematic_bulk_reservations": len(report.get("problematic_bulk_reservations", [])),
             "unfinished_workflows": len(report.get("unfinished_workflows", [])),
         },
         "lost": lost,
@@ -107,8 +108,8 @@ def normalize_application_report(raw: dict[str, Any], *, source_host: str) -> Ap
         "without_owner": without_owner,
         "needs_clarification": clarification,
         "stale_without_movement": stale,
-        "problematic_bulk_batches": [
-            _normalize_bulk_row(row) for row in report.get("problematic_bulk_batches", [])
+        "problematic_bulk_reservations": [
+            _normalize_bulk_row(row) for row in report.get("problematic_bulk_reservations", [])
         ],
         "unfinished_workflows": report.get("unfinished_workflows", []),
     }
@@ -132,17 +133,14 @@ def _normalize_application_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(row)
     normalized["problem"] = _application_problem(row)
     normalized["type_label"] = _application_type(row)
-    normalized["has_final_answer"] = (
-        bool(row.get("has_final_answer"))
-        or row.get("last_known_status") == FINAL_ANSWER_READY_STATUS
-    )
+    normalized["has_final_answer"] = _has_result(row)
     normalized["row_link"] = _row_link(row)
     normalized["problem_age_seconds"] = _age_from(row.get("last_not_found_at") or row.get("updated_at"))
     return normalized
 
 
 def _normalize_bulk_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Attach a safe row link for problematic bulk batches."""
+    """Attach a safe row link for problematic bulk reservations."""
 
     normalized = dict(row)
     normalized["row_link"] = _row_link(row, row_number_key="start_row")
@@ -170,6 +168,18 @@ def _application_type(row: dict[str, Any]) -> str:
     if change_type:
         parts.append(str(change_type))
     return " / ".join(parts)
+
+
+def _has_result(row: dict[str, Any]) -> bool:
+    """Use the same type-specific completion rule as the monitoring snapshot."""
+
+    is_chips = str(row.get("change_type") or "").strip().upper() in {"CHIPS", "CHIP"}
+    if is_chips:
+        return str(row.get("last_known_status") or "").strip() in CHIPS_SUCCESS_STATUSES
+    return bool(
+        row.get("has_final_answer")
+        or row.get("last_known_status") == FINAL_ANSWER_READY_STATUS
+    )
 
 
 def _row_link(row: dict[str, Any], *, row_number_key: str = "last_seen_row_number") -> str | None:
@@ -264,6 +274,25 @@ _CONTAINER_SCRIPT = textwrap.dedent(
         return [dict(zip(names, row)) for row in cursor.fetchall()]
 
 
+    # Completion differs by type: CHIPS finishes with an accepted status,
+    # whereas ADD/EDIT finishes with an editor final answer.
+    CHIPS_SQL = "UPPER(TRIM(COALESCE(change_type, ''))) IN ('CHIPS', 'CHIP')"
+    CLOSED_STATUS_SQL = "COALESCE(last_known_status, '') IN ('Итоговый ответ готов', 'Принята', 'Принято', 'Отклонена', 'Отложена', 'Удаление')"
+    CHIPS_SUCCESS_SQL = "COALESCE(last_known_status, '') IN ('Принята', 'Принято')"
+    OPEN_APPLICATION_SQL = f"""
+        CASE
+          WHEN {CHIPS_SQL} THEN NOT (
+            {CHIPS_SUCCESS_SQL}
+            OR COALESCE(last_known_status, '') IN ('Отклонена', 'Отложена', 'Удаление')
+          )
+          ELSE NOT (
+            COALESCE(last_seen_final_answer, '') != ''
+            OR {CLOSED_STATUS_SQL}
+          )
+        END
+    """
+
+
     APPLICATION_COLUMNS = """
         application_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
         last_seen_row_number, last_known_status, direction, answer_type,
@@ -298,8 +327,7 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 SELECT {APPLICATION_COLUMNS}
                 FROM submitted_applications
                 WHERE is_urgent = 1
-                  AND COALESCE(last_seen_final_answer, '') = ''
-                  AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
+                  AND ({OPEN_APPLICATION_SQL})
                 ORDER BY COALESCE(submitted_at, created_at) ASC
                 LIMIT ?
             """, (LIMIT,))
@@ -307,8 +335,7 @@ _CONTAINER_SCRIPT = textwrap.dedent(
                 SELECT {APPLICATION_COLUMNS}
                 FROM submitted_applications
                 WHERE COALESCE(last_seen_editor, '') IN ('', 'Редактор не выбран')
-                  AND COALESCE(last_seen_final_answer, '') = ''
-                  AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
+                  AND ({OPEN_APPLICATION_SQL})
                 ORDER BY updated_at ASC
                 LIMIT ?
             """, (LIMIT,))
@@ -322,23 +349,20 @@ _CONTAINER_SCRIPT = textwrap.dedent(
             report["stale_without_movement"] = fetch_all(db, f"""
                 SELECT {APPLICATION_COLUMNS}
                 FROM submitted_applications
-                WHERE COALESCE(last_seen_final_answer, '') = ''
-                  AND COALESCE(last_known_status, '') != 'Итоговый ответ готов'
+                WHERE ({OPEN_APPLICATION_SQL})
                   AND datetime(updated_at) <= datetime('now', '-24 hours')
                 ORDER BY updated_at ASC
                 LIMIT ?
             """, (LIMIT,))
-            report["problematic_bulk_batches"] = fetch_all(db, """
-                SELECT batch_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
-                       start_row, data_start_row, data_end_row, reserved_rows, direction,
-                       registration_state, registered_count, last_known_batch_status,
-                       location_state, location_miss_count, last_location_search_at,
-                       next_location_search_at, substr(COALESCE(last_location_error, ''), 1, 300) AS last_location_error,
-                       created_at, updated_at
-                FROM bulk_batches
-                WHERE registration_state != 'REGISTERED'
-                   OR location_state != 'KNOWN'
-                   OR location_miss_count > 0
+            report["problematic_bulk_reservations"] = fetch_all(db, """
+                SELECT reservation_id, telegram_user_id, spreadsheet_id, sheet_id, sheet_name,
+                       start_row, end_row, direction, target_kind, change_type, requested_count,
+                       state, registered_count, substr(COALESCE(last_error, ''), 1, 300) AS last_error,
+                       created_at, updated_at, registered_at
+                FROM bulk_reservations
+                WHERE state = 'FAILED'
+                   OR (state NOT IN ('REGISTERED', 'CANCELLED', 'FAILED')
+                       AND datetime(updated_at) <= datetime('now', '-24 hours'))
                 ORDER BY updated_at DESC
                 LIMIT ?
             """, (LIMIT,))

@@ -78,8 +78,8 @@ def summarize_snapshot(snapshot: dict[str, Any]) -> tuple[Summary, dict[str, Any
         raise_to("DEGRADED", "Есть заявки в NOT_FOUND.", "Проверить polling диапазоны Google Sheets.")
 
     bulk = snapshot.get("bulk", {})
-    if int(bulk.get("stale_creating", 0) or 0) > 0 or int(bulk.get("stale_registering", 0) or 0) > 0:
-        raise_to("ACTION_REQUIRED", "Есть stale массовые пачки.", "Проверить bulk workflow.")
+    if int(bulk.get("failed", 0) or 0) > 0 or int(bulk.get("overdue_active", 0) or 0) > 0:
+        raise_to("ACTION_REQUIRED", "Есть проблемные массовые процессы.", "Проверить bulk reservations.")
 
     log_events = snapshot.get("log_events", {})
     if log_events.get("traceback"):
