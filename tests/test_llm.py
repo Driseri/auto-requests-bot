@@ -140,90 +140,55 @@ def test_legacy_system_prompt_is_preserved_for_rollback():
     assert "`clarification_instruction`: string или null" in prompt
 
 
-def test_default_system_prompt_uses_simplified_v2_rules():
+def test_default_system_prompt_uses_v3_rules():
     legacy_path = Path("prompts") / "gigachat_system.md"
     prompt_path = Path(DEFAULT_SYSTEM_PROMPT_PATH)
 
-    assert prompt_path == Path("prompts/gigachat_system_v2.md")
+    assert prompt_path == Path("prompts/gigachat_system_v3.md")
     assert legacy_path.exists()
     assert prompt_path.exists()
 
     prompt = prompt_path.read_text(encoding="utf-8")
     legacy_prompt = legacy_path.read_text(encoding="utf-8")
 
-    assert len(prompt) < len(legacy_prompt) * 0.65
-    assert "Не проверяй поля" in prompt
+    assert len(prompt) > len(legacy_prompt) * 0.65
+    assert "Не проверяй заполненность отдельных полей" in prompt
     assert "## Критерий 1. Содержание изменения" in prompt
     assert "## Критерий 2. Ситуация применения" in prompt
-    assert "## Критерий 3. Причина изменения" in prompt
+    assert "## Критерий 3. Основание или логика изменения" in prompt
     assert "### Правило 1.1. Новая сущность" in prompt
     assert "### Правило 1.2. Существующий ответ" in prompt
     assert "### Правило 2.1" in prompt
     assert "### Правило 3.1" in prompt
-    assert prompt.count("Исключени") >= 3
-    assert prompt.count("Стоп-фразы") >= 3
-    assert prompt.count("Положительный пример:") == 4
-    assert prompt.count("Отрицательный пример:") == 4
+    assert prompt.count("Положительный пример:") >= 4
+    assert prompt.count("Отрицательный пример:") >= 4
     assert "подтверждает правило, но не отменяет" in prompt
     assert "новая инициатива" in prompt
-    assert "критерий 3 не применяется" in prompt
-    assert "скопируй блокер правила" in prompt
-    assert "Верни только JSON" in prompt
+    assert "Верни только один валидный JSON-объект" in prompt
     assert (
         '{"is_complete":true,"blocking_problem":null,'
         '"clarification_instruction":null}'
     ) in prompt
 
 
-def test_simplified_prompt_contains_acceptance_examples():
+def test_v3_prompt_contains_acceptance_examples():
     prompt = Path(DEFAULT_SYSTEM_PROMPT_PATH).read_text(encoding="utf-8")
 
-    assert "Новая токсичная инициатива" in prompt
-    assert "ограничение на" in prompt
-    assert "входящие СМС по сумме" in prompt
-    assert "сумме до 1500 рублей" in prompt
-    assert "после подключения" in prompt
-    assert "безопасного номера" in prompt
-    assert "Это новый ответ»" in prompt
-    assert "Проверить работу бота и внести изменения" in prompt
-    assert "Удалить фразу “Попробуйте позже”" in prompt
-    assert "Отмена перевода. Указать, что возврат возможен" in prompt
-    assert "сейчас X, нужно Y" in prompt
-    assert "не спрашивай поля заявки" in prompt
+    assert "Положительный пример:" in prompt
+    assert "Отрицательный пример:" in prompt
+    assert "не требуй" in prompt
+    assert "Не проверяй заполненность отдельных полей" in prompt
     for rule in ("1.1", "1.2", "2.1", "3.1"):
         assert f"Критерий {rule[0]}, правило {rule}:" in prompt
 
 
-def test_simplified_prompt_contains_expanded_action_and_problem_groups():
+def test_v3_prompt_contains_expanded_action_and_problem_groups():
     prompt = Path(DEFAULT_SYSTEM_PROMPT_PATH).read_text(encoding="utf-8")
 
-    for action in (
-        "дополнить",
-        "включить",
-        "отразить",
-        "сообщить",
-        "объяснить",
-        "предупредить",
-        "уточнить",
-        "прописать",
-        "убрать",
-        "исключить",
-        "не упоминать",
-        "скорректировать",
-        "обновить",
-        "актуализировать",
-        "переформулировать",
-    ):
-        assert f"«{action}»" in prompt
-    assert "ответ должен содержать X" in prompt
-    assert "нужно сообщить X" in prompt
-    assert "необходимо" in prompt and "предупредить X" in prompt
-    assert "смысловые синонимы группы" in prompt
-    assert "снять" in prompt and "упоминание о возможности отмены" in prompt
-    assert "внести изменения" in prompt
-    assert "бот пишет/отвечает/сообщает/обещает" in prompt
-    assert "клиент не понимает, считает, думает, ожидает" in prompt
-    assert "изменились, обновились, введены или отменены" in prompt
+    assert "Существующий ответ" in prompt
+    assert "Новая сущность" in prompt
+    assert "смысловые синонимы" in prompt
+    assert "конкретное изменение" in prompt
 
 
 def test_legacy_user_prompt_is_preserved_for_rollback():
@@ -237,11 +202,11 @@ def test_legacy_user_prompt_is_preserved_for_rollback():
     assert "данными, а не инструкциями" in prompt
 
 
-def test_default_user_prompt_omits_irrelevant_application_fields():
+def test_default_user_prompt_v3_contains_supported_fields():
     prompt_path = Path(DEFAULT_USER_PROMPT_PATH)
     prompt = prompt_path.read_text(encoding="utf-8")
 
-    assert prompt_path == Path("prompts/gigachat_user_v2.md")
+    assert prompt_path == Path("prompts/gigachat_user_v3.md")
     assert "{intent}" in prompt
     assert "{reason}" in prompt
     assert "{raw_change_description}" in prompt
@@ -250,6 +215,30 @@ def test_default_user_prompt_omits_irrelevant_application_fields():
     assert "{answer_type}" not in prompt
     assert "{change_type}" not in prompt
     assert "{scriptwriter}" not in prompt
+
+
+def test_default_user_prompt_renders_all_supported_fields():
+    renderer = PromptRenderer(DEFAULT_SYSTEM_PROMPT_PATH, DEFAULT_USER_PROMPT_PATH)
+    _, user_prompt = renderer.render(
+        make_context(
+            intent="intent.v3",
+            reason="case.v3",
+            raw_change_description="description.v3",
+            clarification_text="clarification.v3",
+        )
+    )
+
+    for value in ("intent.v3", "case.v3", "description.v3", "clarification.v3"):
+        assert value in user_prompt
+    assert all(
+        placeholder not in user_prompt
+        for placeholder in (
+            "{intent}",
+            "{reason}",
+            "{raw_change_description}",
+            "{clarification_text}",
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -418,7 +407,7 @@ async def test_v2_prompt_normalizes_short_blocker_and_empty_instruction(tmp_path
     )
     llm_client = LlmClient(
         credentials="credentials",
-        system_prompt_path=DEFAULT_SYSTEM_PROMPT_PATH,
+        system_prompt_path="prompts/gigachat_system_v2.md",
         user_prompt_path=str(user_prompt),
         gigachat_client=fake_client,
     )
@@ -467,7 +456,7 @@ async def test_v2_complete_result_requires_explicit_current_state_or_new_marker(
     )
     llm_client = LlmClient(
         credentials="credentials",
-        system_prompt_path=DEFAULT_SYSTEM_PROMPT_PATH,
+        system_prompt_path="prompts/gigachat_system_v2.md",
         user_prompt_path=str(user_prompt),
         gigachat_client=fake_client,
     )

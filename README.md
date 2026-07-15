@@ -61,8 +61,8 @@ GIGACHAT_CA_BUNDLE_FILE=
 GIGACHAT_TIMEOUT=60
 GIGACHAT_MAX_RETRIES=3
 GIGACHAT_RETRY_BACKOFF_FACTOR=1
-GIGACHAT_SYSTEM_PROMPT_PATH=prompts/gigachat_system_v2.md
-GIGACHAT_USER_PROMPT_PATH=prompts/gigachat_user_v2.md
+GIGACHAT_SYSTEM_PROMPT_PATH=prompts/gigachat_system_v3.md
+GIGACHAT_USER_PROMPT_PATH=prompts/gigachat_user_v3.md
 GIGACHAT_SHOW_RESPONSE_JSON=false
 
 STATUS_POLLING_ENABLED=true
@@ -180,7 +180,7 @@ Google-таблицы создаются администратором вруч
 | `GIGACHAT_TIMEOUT` | `60` секунд. Это предельное время одного запроса проверки. |
 | `GIGACHAT_MAX_RETRIES` | `3` для временных сетевых ошибок. |
 | `GIGACHAT_RETRY_BACKOFF_FACTOR` | `1`; увеличение замедляет повторы. |
-| `GIGACHAT_SYSTEM_PROMPT_PATH`, `GIGACHAT_USER_PROMPT_PATH` | По умолчанию используются `prompts/gigachat_system_v2.md` и `prompts/gigachat_user_v2.md`. Для полного отката укажите старые `prompts/gigachat_system.md` и `prompts/gigachat_user.md`. |
+| `GIGACHAT_SYSTEM_PROMPT_PATH`, `GIGACHAT_USER_PROMPT_PATH` | По умолчанию используются `prompts/gigachat_system_v3.md` и `prompts/gigachat_user_v3.md`. Для отката укажите `prompts/gigachat_system_v2.md` и `prompts/gigachat_user_v2.md` либо старые `prompts/gigachat_system.md` и `prompts/gigachat_user.md`. |
 | `GIGACHAT_SHOW_RESPONSE_JSON` | `false` в обычной работе. `true` использовать только для диагностики структуры ответа. |
 
 ### Polling И Heartbeat

@@ -14,8 +14,8 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from app.models import LlmContext, LlmResult
 
 
-DEFAULT_SYSTEM_PROMPT_PATH = "prompts/gigachat_system_v2.md"
-DEFAULT_USER_PROMPT_PATH = "prompts/gigachat_user_v2.md"
+DEFAULT_SYSTEM_PROMPT_PATH = "prompts/gigachat_system_v3.md"
+DEFAULT_USER_PROMPT_PATH = "prompts/gigachat_user_v3.md"
 GIGACHAT_JSON_RETRY_ATTEMPTS = 2
 GIGACHAT_JSON_RETRY_DELAY_SECONDS = 1.0
 GIGACHAT_RESPONSE_PREVIEW_CHARS = 300
