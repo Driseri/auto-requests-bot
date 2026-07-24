@@ -91,6 +91,12 @@ The application report includes:
 - `Отклонена`, `Отложена`, and `Удаление` are closed states and are excluded from open,
   no-owner, and no-movement alerts.
 - `Итоговый ответ готов сегодня` counts exact final-answer events for ADD/EDIT only.
+- `Полный цикл` uses only exact events after `application_submitted`: `final_answer_added`
+  for ADD/EDIT and `status_changed` to `Принята` or `Принято` for CHIPS.
+- `Пояснения среди взятых в работу` is the share of unique applications with an exact
+  `editor_comment_added` or `clarification_requested` event among applications
+  with an exact editor action in the selected period. Repeated events do not
+  increase either count.
 
 ## Admin Delete
 

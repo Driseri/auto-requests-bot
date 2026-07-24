@@ -588,6 +588,7 @@ class DraftRepository:
         llm_score: float | None,
         raw_change_description: str | None = None,
         clarification_count: int | None = None,
+        application_event: dict[str, Any] | None = None,
     ) -> Draft:
         values: dict[str, Any] = {
             "formatted_change_description": formatted_change_description,
@@ -598,7 +599,27 @@ class DraftRepository:
             values["raw_change_description"] = raw_change_description
         if clarification_count is not None:
             values["clarification_count"] = clarification_count
-        await self._update_fields(telegram_user_id, values)
+        now = utc_now_iso()
+        values["updated_at"] = now
+        assignments = ", ".join(f"{field} = ?" for field in values)
+        async with self._connection() as db:
+            await db.execute(
+                f"UPDATE drafts SET {assignments} WHERE telegram_user_id = ?",
+                [*values.values(), telegram_user_id],
+            )
+            if application_event is not None:
+                await self._record_application_event_in_connection(
+                    db,
+                    event_type=str(application_event["event_type"]),
+                    application_id=application_event.get("application_id"),
+                    telegram_user_id=application_event.get("telegram_user_id"),
+                    event_at=application_event.get("event_at"),
+                    old_value=application_event.get("old_value"),
+                    new_value=application_event.get("new_value"),
+                    metadata=application_event.get("metadata"),
+                    created_at=now,
+                )
+            await db.commit()
         draft = await self.get_by_user_id(telegram_user_id)
         if draft is None:
             raise LookupError(f"Draft not found for user {telegram_user_id}")

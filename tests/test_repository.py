@@ -791,6 +791,67 @@ async def test_repository_replaces_old_llm_rewrite_only_once_for_active_draft(tm
 
 
 @pytest.mark.asyncio
+async def test_save_llm_result_records_event_in_same_transaction(tmp_path):
+    repository = DraftRepository(str(tmp_path / "llm-event.db"))
+    await repository.init()
+    draft = await repository.get_or_create(62)
+
+    updated = await repository.save_llm_result(
+        62,
+        formatted_change_description="Проверенное описание",
+        llm_check_status="complete",
+        llm_score=None,
+        application_event={
+            "event_type": "llm_check_completed",
+            "application_id": draft.application_id,
+            "telegram_user_id": 62,
+            "new_value": "passed",
+            "metadata": {"schema_version": 1, "stage": "initial"},
+        },
+    )
+
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    )
+    assert updated.llm_check_status == "complete"
+    assert len(events) == 1
+    assert events[0].new_value == "passed"
+
+
+@pytest.mark.asyncio
+async def test_save_llm_result_rolls_back_when_event_cannot_be_serialized(tmp_path):
+    repository = DraftRepository(str(tmp_path / "llm-event-rollback.db"))
+    await repository.init()
+    draft = await repository.get_or_create(63)
+
+    with pytest.raises(TypeError):
+        await repository.save_llm_result(
+            63,
+            formatted_change_description="Не должно сохраниться",
+            llm_check_status="complete",
+            llm_score=None,
+            application_event={
+                "event_type": "llm_check_completed",
+                "application_id": draft.application_id,
+                "telegram_user_id": 63,
+                "new_value": "passed",
+                "metadata": {"not_json": object()},
+            },
+        )
+
+    unchanged = await repository.get_by_user_id(63)
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    )
+    assert unchanged is not None
+    assert unchanged.llm_check_status == "not_checked"
+    assert unchanged.formatted_change_description is None
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_new_draft_gets_application_id(tmp_path):
     repository = DraftRepository(str(tmp_path / "drafts.db"))
     await repository.init()

@@ -30,6 +30,7 @@
 - [Ежедневный контроль](#ежедневный-контроль-за-23-минуты)
 - [Первичная подготовка VPS](#первичная-подготовка-vps)
 - [Подробный мониторинг](#подробный-мониторинг)
+- [События и LLM-статистика](#события-и-llm-статистика)
 - [Управление контейнером](#управление-контейнером)
 - [Ручное обновление](#ручное-обновление)
 - [Выкладка текущих локальных изменений](#выкладка-текущих-локальных-изменений-на-vps)
@@ -620,6 +621,12 @@ Healthcheck не отправляет тестовое сообщение в ч�
 `urgent-editor-application-created`, а бот отправит в общий чат короткое сообщение со
 ссылкой `Открыть заявку`.
 
+Тот же чат получает durable-уведомление `urgent-editor-scriptwriter-response`, когда
+поле `Ответ сценариста` срочной одиночной заявки стабильно заполнено три
+polling-цикла. Регистрация нескольких срочных строк нового массового резерва создаёт
+одно агрегированное событие `urgent-editor-bulk-reservation-created`. Эти события
+создаются только при включённом `URGENT_EDITOR_NOTIFICATIONS_ENABLED`.
+
 Проверить последние editor-chat события:
 
 ```bash
@@ -631,7 +638,11 @@ for row in connection.execute(
     """
     SELECT telegram_user_id, state, attempts, updated_at
     FROM notification_outbox
-    WHERE event_type = 'urgent-editor-application-created'
+    WHERE event_type IN (
+        'urgent-editor-application-created',
+        'urgent-editor-scriptwriter-response',
+        'urgent-editor-bulk-reservation-created'
+    )
     ORDER BY updated_at DESC
     LIMIT 20
     """
@@ -640,6 +651,70 @@ for row in connection.execute(
 connection.close()
 PY
 ```
+
+### События и LLM-статистика
+
+Продуктовые события хранятся в SQLite-таблице `application_events`. Это отдельный
+журнал от `notification_outbox`: событие описывает изменение бизнес-состояния, а
+outbox отвечает за доставку Telegram-сообщения. Полный контракт всех полей и 13
+текущих event types приведён в
+[`APPLICATION_EVENTS_REFERENCE.md`](APPLICATION_EVENTS_REFERENCE.md).
+
+Проверить объём событий без остановки контейнера:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+connection = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
+connection.execute("PRAGMA query_only=ON")
+for row in connection.execute("""
+    SELECT event_type, COUNT(*), MIN(event_at), MAX(event_at)
+    FROM application_events
+    GROUP BY event_type
+    ORDER BY event_type
+"""):
+    print(row)
+connection.close()
+PY
+```
+
+Краткая статистика проверок GigaChat:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
+import sqlite3
+
+connection = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
+connection.execute("PRAGMA query_only=ON")
+for row in connection.execute("""
+    SELECT
+        json_extract(metadata_json, '$.stage') AS stage,
+        json_extract(metadata_json, '$.trigger') AS trigger,
+        new_value AS outcome,
+        COUNT(*) AS checks
+    FROM application_events
+    WHERE event_type = 'llm_check_completed'
+    GROUP BY stage, trigger, outcome
+    ORDER BY stage, trigger, outcome
+"""):
+    print(row)
+connection.close()
+PY
+```
+
+Интерпретация create-flow:
+
+- `initial / passed` — принято LLM с первого раза;
+- `initial / needs_clarification` — запрошено уточнение;
+- `clarification / passed` — принято после уточнения;
+- `clarification / needs_clarification` — после второй проверки осталось
+  `needs_attention`;
+- `technical_fallback` — техническая ошибка, которую нельзя считать отказом LLM.
+
+События собираются только после выкладки producer-кода. Исторические LLM-проверки
+задним числом не восстанавливаются. CHIPS, массовые заявки и автоматически созданная
+ADD/EDIT-строка после CHIPS не вызывают GigaChat и не создают LLM-события.
 
 ### Очередь дашборда
 
@@ -1116,13 +1191,10 @@ Rollback переключает код на старый image, но не отк
 | `pilot15` | 15 пользователей, по 10 одиночных заявок, 3 массовых резерва по 30 строк, 30 polling cycles |
 | `stress` | 30 пользователей, по 5 одиночных заявок, 5 массовых резервов по 30 строк, 60 polling cycles |
 
-По умолчанию loadtest проверяет новый workflow `bulk_reservations`: бот вставляет резерв строк в боевой лист, заполняет его тестовыми данными и регистрирует строки как обычные одиночные заявки.
-
-Для старого workflow с `bulk_batches` оставлен совместимый режим:
-
-```bash
---bulk-mode legacy
-```
+Loadtest проверяет только актуальный workflow `bulk_reservations`: бот вставляет
+резерв строк в рабочий лист, заполняет его тестовыми данными и регистрирует строки
+как обычные одиночные заявки. CLI принимает только `--bulk-mode reservations`;
+legacy `bulk_batches` нагрузочным тестом больше не запускается.
 
 ### Перед тестом
 
@@ -1227,7 +1299,7 @@ cat loadtest-reports/loadtest-LOADTEST-YYYYMMDD-HHMMSS.json
 - `errors` должен быть пустым;
 - `counts.single_created` соответствует профилю;
 - `counts.bulk_reservations_created` соответствует профилю при `--bulk-mode reservations`;
-- `counts.bulk_batches_created` используется только для `--bulk-mode legacy`;
+- `counts.bulk_reservations_created` показывает число созданных актуальных резервов;
 - `counts.bulk_rows_registered` соответствует профилю;
 - `sqlite.cleanup` показывает удаление тестовых записей;
 - `manual_google_cleanup.ranges` содержит диапазоны, которые нужно удалить из Google Sheets вручную;
@@ -2091,7 +2163,7 @@ docker compose -f docker-compose.prod.yml logs --since=30m bot \
 Признаки:
 
 - ошибки авторизации, timeout или SSL в логах;
-- одиночная заявка не проходит LLM-проверку.
+- в логах появляется технический fallback проверки.
 
 При этом массовые заявки GigaChat не используют.
 
@@ -2100,7 +2172,11 @@ docker compose -f docker-compose.prod.yml logs --since=30m bot \
 1. Проверить, повторяется ли ошибка.
 2. Проверить сетевую доступность и настройки GigaChat.
 3. Не перезапускать весь VPS из-за одной LLM-ошибки.
-4. Если ошибка постоянная, предупредить пользователей одиночного workflow.
+4. Учитывать, что заявка при технической ошибке не блокируется: бот сохраняет
+   пользовательский текст, ставит внутренний `llm_check_status=error` и продолжает
+   заполнение.
+5. Если ошибка постоянная, предупредить пользователей, что автоматическая проверка
+   временно работает в fallback-режиме.
 
 ### Заполнен диск
 

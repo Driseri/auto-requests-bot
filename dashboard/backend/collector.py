@@ -516,13 +516,11 @@ def _pilot_period(
 
     creation_durations = _durations_between(events_by_app, {"draft_started"}, {"application_submitted"})
     first_editor_durations = _first_editor_durations(period_apps, events_by_app)
-    completed_ids = _application_ids_with_event(
-        period_events,
-        {"final_answer_added", "status_final_answer_ready"},
+    completed_apps = _completed_applications(
+        applications,
+        all_events_by_app,
+        completion_since=since,
     )
-    completed_apps = [
-        app for app in applications if str(app.get("application_id") or "") in completed_ids
-    ]
     full_cycle_durations = _full_cycle_durations(
         completed_apps,
         all_events_by_app,
@@ -532,7 +530,37 @@ def _pilot_period(
     regular_apps = [app for app in period_apps if not _is_urgent(app)]
     completed_urgent_apps = [app for app in completed_apps if _is_urgent(app)]
     completed_regular_apps = [app for app in completed_apps if not _is_urgent(app)]
-    clarification_count = sum(1 for app in period_apps if _has_clarification(app, events_by_app.get(str(app.get("application_id") or ""), [])))
+    clarification_count = sum(
+        1
+        for app in period_apps
+        if _has_clarification(
+            app,
+            events_by_app.get(str(app.get("application_id") or ""), []),
+        )
+    )
+    # This KPI is intentionally event-only: current row state can show an old
+    # comment, but does not prove that the editor action belongs to this period.
+    taken_in_work_ids = _application_ids_with_event(
+        period_events,
+        {
+            "editor_changed",
+            "status_changed",
+            "editor_comment_added",
+            "final_answer_added",
+            "status_final_answer_ready",
+        },
+    )
+    clarification_request_ids = _application_ids_with_event(
+        period_events,
+        {"editor_comment_added", "clarification_requested"},
+    )
+    period_app_ids = {
+        str(app.get("application_id") or "")
+        for app in period_apps
+        if app.get("application_id")
+    }
+    taken_in_work_ids &= period_app_ids
+    clarification_request_ids &= taken_in_work_ids
     not_found_count = sum(1 for app in period_apps if int(app.get("not_found_count", 0) or 0) > 0 or app.get("polling_state") != "ACTIVE")
 
     return {
@@ -565,6 +593,12 @@ def _pilot_period(
             },
             "clarification_share_percent": _percent(clarification_count, len(period_apps)),
             "clarification_count": clarification_count,
+            "clarification_among_taken_in_work_percent": _percent(
+                len(clarification_request_ids),
+                len(taken_in_work_ids),
+            ),
+            "clarification_among_taken_in_work_count": len(clarification_request_ids),
+            "taken_in_work_count": len(taken_in_work_ids),
             "not_found_or_tracking_errors": not_found_count,
             "notification_errors": len(period_errors),
         },
@@ -603,14 +637,12 @@ def _pilot_daily(
         day_events_by_app = {app_id: events_by_app.get(app_id, []) for app_id in app_ids}
         day_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
         day_end = day_start + timedelta(days=1)
-        completed_app_ids = {
-            app_id
-            for app_id, app_events in all_events_by_app.items()
-            if _first_event_at(app_events, {"final_answer_added", "status_final_answer_ready"}, since=day_start, before=day_end)
-        }
-        completed_apps = [
-            app for app in all_applications if str(app.get("application_id") or "") in completed_app_ids
-        ]
+        completed_apps = _completed_applications(
+            all_applications,
+            all_events_by_app,
+            completion_since=day_start,
+            completion_before=day_end,
+        )
         rows.append(
             {
                 "date": day.isoformat(),
@@ -835,21 +867,71 @@ def _full_cycle_durations(
     final_since: datetime | None = None,
     final_before: datetime | None = None,
 ) -> list[int]:
-    """Measure cycles completed in a period from exact submission and final events."""
+    """Measure cycles from submission to the first exact type-specific result."""
 
     durations: list[int] = []
     for app in applications:
         events = events_by_app.get(str(app.get("application_id") or ""), [])
         submitted_at = _first_event_at(events, {"application_submitted"})
-        final_at = _first_event_at(
+        final_at = _completion_event_at(
+            app,
             events,
-            {"final_answer_added", "status_final_answer_ready"},
             since=final_since,
             before=final_before,
         )
         if submitted_at and final_at and final_at >= submitted_at:
             durations.append(int((final_at - submitted_at).total_seconds()))
     return durations
+
+
+def _completed_applications(
+    applications: list[dict[str, Any]],
+    events_by_app: dict[str, list[dict[str, Any]]],
+    *,
+    completion_since: datetime | None = None,
+    completion_before: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Select applications that have an exact business result in a time window."""
+
+    return [
+        app
+        for app in applications
+        if _completion_event_at(
+            app,
+            events_by_app.get(str(app.get("application_id") or ""), []),
+            since=completion_since,
+            before=completion_before,
+        )
+    ]
+
+
+def _completion_event_at(
+    app: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    since: datetime | None = None,
+    before: datetime | None = None,
+) -> datetime | None:
+    """Return the first exact result event for ADD/EDIT or CHIPS respectively."""
+
+    change_type = str(app.get("change_type") or "").strip().upper()
+    if change_type in {"ADD", "EDIT"}:
+        return _first_event_at(events, {"final_answer_added"}, since=since, before=before)
+    if not _is_chips(app):
+        return None
+
+    moments = [
+        _parse_datetime(event.get("event_at"))
+        for event in events
+        if event.get("event_type") == "status_changed"
+        and str(event.get("new_value") or "").strip() in CHIPS_SUCCESS_STATUSES
+    ]
+    moments = [moment for moment in moments if moment is not None]
+    if since is not None:
+        moments = [moment for moment in moments if moment >= since]
+    if before is not None:
+        moments = [moment for moment in moments if moment < before]
+    return min(moments) if moments else None
 
 
 def _durations_between(events_by_app: dict[str, list[dict[str, Any]]], start_types: set[str], end_types: set[str]) -> list[int]:

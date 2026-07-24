@@ -512,6 +512,11 @@ def test_pilot_metrics_are_normalized_from_snapshot(tmp_path: Path) -> None:
     assert period["kpi"]["first_editor_action_seconds_by_urgency"]["urgent"]["median_seconds"] is None
     assert period["kpi"]["full_cycle_seconds_by_urgency"]["regular"]["median_seconds"] == 3600
     assert period["kpi"]["full_cycle_seconds_by_urgency"]["urgent"]["median_seconds"] is None
+    # Current row state says there is a comment, but the fixture has no exact
+    # clarification event. The new business metric must not infer one.
+    assert period["kpi"]["clarification_among_taken_in_work_percent"] == 0
+    assert period["kpi"]["clarification_among_taken_in_work_count"] == 0
+    assert period["kpi"]["taken_in_work_count"] == 1
     assert period["kpi"]["not_found_or_tracking_errors"] == 1
     assert snapshot["pilot"]["stickiness"]["wau"] == 2
     assert snapshot["pilot"]["stickiness"]["mau"] == 2
@@ -530,6 +535,44 @@ def test_pilot_metrics_are_normalized_from_snapshot(tmp_path: Path) -> None:
         {"status": "Некорректные статусы/интенты", "count": 3},
         {"status": "Новая", "count": 2},
     ]
+
+
+def test_clarification_metric_uses_unique_exact_events(tmp_path: Path) -> None:
+    """Count a clarification request once and only among worked applications."""
+
+    payload = sample_pilot_payload()
+    events = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]["events"]
+    events.extend(
+        [
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
+                "event_type": "editor_comment_added",
+                "event_at": pilot_fixture_time(8, 45),
+                "old_value": None,
+                "new_value": "Нужны пояснения",
+            },
+            {
+                "application_id": "APP-1",
+                "telegram_user_id": 100,
+                "event_type": "clarification_requested",
+                "event_at": pilot_fixture_time(8, 50),
+                "old_value": None,
+                "new_value": "Повторное напоминание",
+            },
+        ]
+    )
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    client = TestClient(create_app(config_path=tmp_path / "config.local.toml", collector=collector))
+
+    response = client.post("/api/collect")
+
+    kpi = response.json()["snapshot"]["pilot"]["periods"]["7d"]["kpi"]
+    assert kpi["taken_in_work_count"] == 1
+    assert kpi["clarification_among_taken_in_work_count"] == 1
+    assert kpi["clarification_among_taken_in_work_percent"] == 100
 
 
 def test_full_cycle_counts_exact_completion_when_submission_precedes_period(tmp_path: Path) -> None:
@@ -580,6 +623,86 @@ def test_full_cycle_counts_exact_completion_when_submission_precedes_period(tmp_
         "sample_size": 1,
     }
     assert period["kpi"]["full_cycle_seconds_by_urgency"]["regular"]["sample_size"] == 1
+
+
+def test_full_cycle_uses_type_specific_exact_result_events(tmp_path: Path) -> None:
+    """ADD/EDIT ends with a final answer; CHIPS ends with accepted status only."""
+
+    payload = sample_pilot_payload()
+    raw = payload["container_payload"]["sqlite"]["metrics"]["pilot_metrics_raw"]
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    submitted_at = now - timedelta(days=2)
+    accepted_at = now - timedelta(days=1)
+    raw["applications"] = [
+        {
+            **raw["applications"][0],
+            "application_id": "CHIPS-COMPLETE",
+            "change_type": "CHIPS",
+            "submitted_at": submitted_at.isoformat(),
+            "created_at": submitted_at.isoformat(),
+        },
+        {
+            **raw["applications"][0],
+            "application_id": "ADD-NO-FINAL-ANSWER",
+            "change_type": "ADD",
+            "submitted_at": submitted_at.isoformat(),
+            "created_at": submitted_at.isoformat(),
+        },
+    ]
+    raw["events"] = [
+        {
+            "application_id": "CHIPS-COMPLETE",
+            "telegram_user_id": 100,
+            "event_type": "application_submitted",
+            "event_at": submitted_at.isoformat(),
+            "old_value": None,
+            "new_value": None,
+        },
+        {
+            "application_id": "CHIPS-COMPLETE",
+            "telegram_user_id": 100,
+            "event_type": "status_changed",
+            "event_at": accepted_at.isoformat(),
+            "old_value": "В работе",
+            "new_value": "Принята",
+        },
+        {
+            "application_id": "ADD-NO-FINAL-ANSWER",
+            "telegram_user_id": 100,
+            "event_type": "application_submitted",
+            "event_at": submitted_at.isoformat(),
+            "old_value": None,
+            "new_value": None,
+        },
+        {
+            "application_id": "ADD-NO-FINAL-ANSWER",
+            "telegram_user_id": 100,
+            "event_type": "status_changed",
+            "event_at": accepted_at.isoformat(),
+            "old_value": "В работе",
+            "new_value": "Итоговый ответ готов",
+        },
+        {
+            "application_id": "ADD-NO-FINAL-ANSWER",
+            "telegram_user_id": 100,
+            "event_type": "status_final_answer_ready",
+            "event_at": accepted_at.isoformat(),
+            "old_value": None,
+            "new_value": None,
+        },
+    ]
+    config = make_config(tmp_path)
+    storage = JsonStorage(config.storage.data_dir)
+    collector = DashboardCollector(config=config, storage=storage, runner=FakeRunner(payload))
+    client = TestClient(create_app(config_path=tmp_path / "config.local.toml", collector=collector))
+
+    period = client.post("/api/collect").json()["snapshot"]["pilot"]["periods"]["7d"]
+
+    assert period["kpi"]["full_cycle_seconds"] == {
+        "average_seconds": 24 * 60 * 60,
+        "median_seconds": 24 * 60 * 60,
+        "sample_size": 1,
+    }
 
 
 def test_pilot_stickiness_counts_unique_submission_users(tmp_path: Path) -> None:

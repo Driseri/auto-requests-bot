@@ -106,6 +106,28 @@ def test_prompt_renderer_substitutes_all_placeholders(tmp_path):
     assert "clarification=Не было." in user
 
 
+def test_prompt_identity_uses_template_content_without_user_data(tmp_path):
+    system_prompt = tmp_path / "gigachat_system_v3.md"
+    user_prompt = tmp_path / "gigachat_user_v3.md"
+    system_prompt.write_text("System template", encoding="utf-8")
+    user_prompt.write_text("reason={reason}", encoding="utf-8")
+    renderer = PromptRenderer(str(system_prompt), str(user_prompt))
+
+    renderer.render(make_context(reason="Первый клиентский текст"))
+    first_identity = renderer.identity()
+    renderer.render(make_context(reason="Другой клиентский текст"))
+    second_identity = renderer.identity()
+
+    assert first_identity == second_identity
+    assert first_identity[0] == "v3"
+    assert first_identity[1] is not None
+    assert len(first_identity[1]) == 12
+
+    user_prompt.write_text("reason={reason}\nintent={intent}", encoding="utf-8")
+    changed_renderer = PromptRenderer(str(system_prompt), str(user_prompt))
+    assert changed_renderer.identity()[1] != first_identity[1]
+
+
 def test_legacy_system_prompt_is_preserved_for_rollback():
     prompt = (Path("prompts") / "gigachat_system.md").read_text(encoding="utf-8")
 
@@ -554,6 +576,10 @@ async def test_invalid_json_gigachat_response_retries_once_and_succeeds(
 
     assert result.is_complete is True
     assert len(fake_client.calls) == 2
+    assert result.telemetry is not None
+    assert result.telemetry.response_attempts == 2
+    assert result.telemetry.validation_retries == 1
+    assert result.telemetry.error_kind is None
     assert "response_kind=invalid_json" in caplog.text
     assert "raw_preview=<html>bad gateway</html>" in caplog.text
 
@@ -582,6 +608,10 @@ async def test_invalid_json_twice_returns_fallback_with_safe_preview(
     assert result.blocking_problem is not None
     assert result.blocking_problem.startswith(LLM_ERROR_PREFIX)
     assert len(fake_client.calls) == 2
+    assert result.telemetry is not None
+    assert result.telemetry.response_attempts == 2
+    assert result.telemetry.validation_retries == 1
+    assert result.telemetry.error_kind == "invalid_json"
     assert "response_kind=invalid_json" in caplog.text
     assert "raw_len=" in caplog.text
     assert long_raw not in caplog.text
@@ -665,7 +695,27 @@ async def test_transport_error_does_not_json_retry(tmp_path, monkeypatch, caplog
     assert result.is_complete is True
     assert result.blocking_problem == f"{LLM_ERROR_PREFIX} RuntimeError: boom"
     assert len(fake_client.calls) == 1
+    assert result.telemetry is not None
+    assert result.telemetry.error_kind == "unknown"
     assert "response_kind=transport_or_sdk_error" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_normalized_in_fallback_telemetry(tmp_path, monkeypatch):
+    monkeypatch.setattr(llm_module.asyncio, "sleep", _noop_sleep)
+    system_prompt, user_prompt = write_prompts(tmp_path)
+    llm_client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(exc=TimeoutError("slow provider")),
+    )
+
+    result = await llm_client.check_change_description(make_context())
+
+    assert result.telemetry is not None
+    assert result.telemetry.error_kind == "timeout"
+    assert result.telemetry.response_attempts == 1
 
 
 async def _noop_sleep(_seconds):

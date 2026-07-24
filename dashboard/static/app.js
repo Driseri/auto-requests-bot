@@ -502,6 +502,15 @@ function renderPilot(snapshot) {
   renderPilotKpiCard("#pilot-kpi-editor", "До действия редактора", editor.main, editor.detail, editor.css);
   renderPilotKpiCard("#pilot-kpi-cycle", "Полный цикл", cycle.main, cycle.detail, cycle.css);
   renderPilotKpiCard("#pilot-kpi-quality", "Пояснения / ошибки", `${number(kpi.clarification_share_percent)}%`, `not_found ${number(kpi.not_found_or_tracking_errors)}, уведомления ${number(kpi.notification_errors)}`, kpi.not_found_or_tracking_errors ? "warn" : "");
+  const clarificationRequests = number(kpi.clarification_among_taken_in_work_count);
+  const takenInWork = number(kpi.taken_in_work_count);
+  renderPilotKpiCard(
+    "#pilot-kpi-clarifications-in-work",
+    "Пояснения среди взятых в работу",
+    `${number(kpi.clarification_among_taken_in_work_percent)}%`,
+    `пояснения ${clarificationRequests} из ${takenInWork} · точные события`,
+    clarificationRequests ? "warn" : "muted",
+  );
   renderPilotKpiCard("#pilot-kpi-stickiness-wau", "Липкость DAU / WAU", `${number(stickiness.dau_wau_percent)}%`, `DAU ${number(stickiness.dau)}, WAU ${number(stickiness.wau)}`, stickiness.dau_wau_percent ? "good" : "muted");
   renderPilotKpiCard("#pilot-kpi-stickiness-mau", "Липкость DAU / MAU", `${number(stickiness.dau_mau_percent)}%`, `DAU ${number(stickiness.dau)}, MAU ${number(stickiness.mau)}`, stickiness.dau_mau_percent ? "good" : "muted");
   renderPilotKpiCard("#pilot-kpi-stickiness-wau-mau", "Липкость WAU / MAU", `${number(stickiness.wau_mau_percent)}%`, `WAU ${number(stickiness.wau)}, MAU ${number(stickiness.mau)}`, stickiness.wau_mau_percent ? "good" : "muted");

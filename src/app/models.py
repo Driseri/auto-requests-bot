@@ -379,10 +379,22 @@ class LlmContext:
 
 
 @dataclass(slots=True)
+class LlmTelemetry:
+    prompt_version: str = "unknown"
+    prompt_hash: str | None = None
+    model: str | None = None
+    duration_ms: int | None = None
+    response_attempts: int | None = None
+    validation_retries: int | None = None
+    error_kind: str | None = None
+
+
+@dataclass(slots=True)
 class LlmResult:
     is_complete: bool
     blocking_problem: str | None
     clarification_instruction: str | None
+    telemetry: LlmTelemetry | None = None
 
 
 @dataclass(slots=True)

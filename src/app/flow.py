@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from html import escape
 from uuid import uuid4
@@ -46,6 +47,8 @@ from app.repository import DraftRepository
 from app.submission import SubmissionServiceProtocol, dashboard_projection, dashboard_row
 
 URGENT_EDITOR_NOTIFICATION_EVENT_TYPE = "urgent-editor-application-created"
+LLM_CHECK_COMPLETED_EVENT_TYPE = "llm_check_completed"
+LLM_CLARIFICATION_SUBMITTED_EVENT_TYPE = "llm_clarification_submitted"
 
 
 FIELD_LABELS = {
@@ -1655,6 +1658,13 @@ class ApplicationFlow:
             llm_check_status=status,
             llm_score=None,
             clarification_count=0,
+            application_event=_llm_check_completed_event(
+                draft,
+                llm_result,
+                stage="initial",
+                trigger="edit" if edit_mode else "create",
+                status=status,
+            ),
         )
 
         if llm_result.is_complete or status == LlmCheckStatus.ERROR.value:
@@ -1696,6 +1706,18 @@ class ApplicationFlow:
                 return self._review_response(draft)
             return await self._prompt_response_for_user(telegram_user_id, draft)
 
+        trigger = "edit" if draft.source_text else "create"
+        clarification_number = draft.clarification_count + 1
+        await self.repository.record_application_event(
+            event_type=LLM_CLARIFICATION_SUBMITTED_EVENT_TYPE,
+            application_id=draft.application_id,
+            telegram_user_id=telegram_user_id,
+            metadata={
+                "schema_version": 1,
+                "clarification_number": clarification_number,
+                "trigger": trigger,
+            },
+        )
         original_description = draft.raw_change_description or ""
         combined_description = (
             f"{original_description}\n\n"
@@ -1719,7 +1741,14 @@ class ApplicationFlow:
             formatted_change_description=combined_description,
             llm_check_status=status,
             llm_score=None,
-            clarification_count=1,
+            clarification_count=clarification_number,
+            application_event=_llm_check_completed_event(
+                draft,
+                llm_result,
+                stage="clarification",
+                trigger=trigger,
+                status=status,
+            ),
         )
         next_step = Step.REVIEW if draft.source_text and draft.is_urgent is not None else Step.SOURCE_TEXT
         draft = await self.repository.set_step(telegram_user_id, next_step)
@@ -2299,6 +2328,49 @@ def _is_llm_error_result(llm_result) -> bool:
         or problem == "GIGACHAT_CREDENTIALS не задан."
         or problem == "GIGACHAT_CREDENTIALS РЅРµ Р·Р°РґР°РЅ."
     )
+
+
+def _llm_check_completed_event(
+    draft: Draft,
+    llm_result,
+    *,
+    stage: str,
+    trigger: str,
+    status: str,
+) -> dict[str, object]:
+    telemetry = getattr(llm_result, "telemetry", None)
+    if status == LlmCheckStatus.ERROR.value:
+        outcome = "technical_fallback"
+    elif llm_result.is_complete:
+        outcome = "passed"
+    else:
+        outcome = "needs_clarification"
+    return {
+        "event_type": LLM_CHECK_COMPLETED_EVENT_TYPE,
+        "application_id": draft.application_id,
+        "telegram_user_id": draft.telegram_user_id,
+        "new_value": outcome,
+        "metadata": {
+            "schema_version": 1,
+            "stage": stage,
+            "trigger": trigger,
+            "prompt_version": getattr(telemetry, "prompt_version", "unknown"),
+            "prompt_hash": getattr(telemetry, "prompt_hash", None),
+            "model": getattr(telemetry, "model", None),
+            "blocking_rule": _llm_blocking_rule(llm_result.blocking_problem),
+            "duration_ms": getattr(telemetry, "duration_ms", None),
+            "response_attempts": getattr(telemetry, "response_attempts", None),
+            "validation_retries": getattr(telemetry, "validation_retries", None),
+            "error_kind": getattr(telemetry, "error_kind", None),
+        },
+    }
+
+
+def _llm_blocking_rule(blocking_problem: str | None) -> str | None:
+    match = re.search(r"правило\s+(1\.[12]|[23]\.1)", blocking_problem or "", re.IGNORECASE)
+    if match and match.group(1) in {"1.1", "1.2", "2.1", "3.1"}:
+        return match.group(1)
+    return None
 
 
 def _llm_result_to_json(llm_result) -> str:

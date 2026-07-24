@@ -18,6 +18,7 @@ from app.models import (
     KeyboardKind,
     LlmCheckStatus,
     LlmResult,
+    LlmTelemetry,
     Step,
     SubmissionResult,
 )
@@ -343,6 +344,10 @@ async def test_chips_collects_dedicated_fields_without_gigachat(tmp_path):
         "after",
     )
     assert llm_client.calls == []
+    assert await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    ) == []
 
 
 @pytest.mark.asyncio
@@ -1404,6 +1409,22 @@ async def test_incomplete_change_description_asks_one_clarification(tmp_path):
     assert llm_client.calls[0].change_type == ChangeType.ADD.value
     assert llm_client.calls[1].raw_change_description == "Поменять срок"
     assert llm_client.calls[1].clarification_text == "Нужно указать 5 рабочих дней"
+    events = await repository.list_application_events(application_id=draft.application_id)
+    events = [event for event in events if event.event_type.startswith("llm_")]
+    assert [event.event_type for event in reversed(events)] == [
+        "llm_check_completed",
+        "llm_clarification_submitted",
+        "llm_check_completed",
+    ]
+    clarification_metadata = json.loads(events[1].metadata_json or "{}")
+    repeated_check_metadata = json.loads(events[0].metadata_json or "{}")
+    assert clarification_metadata == {
+        "schema_version": 1,
+        "clarification_number": 1,
+        "trigger": "create",
+    }
+    assert repeated_check_metadata["stage"] == "clarification"
+    assert repeated_check_metadata["trigger"] == "create"
 
 
 @pytest.mark.asyncio
@@ -1477,6 +1498,19 @@ async def test_complete_check_keeps_score_empty(tmp_path):
     assert draft.current_step == Step.SOURCE_TEXT
     assert draft.llm_check_status == LlmCheckStatus.COMPLETE.value
     assert draft.llm_score is None
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    )
+    assert len(events) == 1
+    assert events[0].new_value == "passed"
+    assert events[0].application_id == draft.application_id
+    assert events[0].event_at.endswith("+00:00")
+    metadata = json.loads(events[0].metadata_json or "{}")
+    assert metadata["stage"] == "initial"
+    assert metadata["trigger"] == "create"
+    assert metadata["prompt_version"] == "unknown"
+    assert metadata["prompt_hash"] is None
 
 
 @pytest.mark.asyncio
@@ -1487,6 +1521,7 @@ async def test_llm_error_keeps_user_text_and_continues(tmp_path):
                 is_complete=True,
                 blocking_problem="Ошибка GigaChat: ConnectError",
                 clarification_instruction=None,
+                telemetry=LlmTelemetry(error_kind="network"),
             )
         ]
     )
@@ -1510,6 +1545,13 @@ async def test_llm_error_keeps_user_text_and_continues(tmp_path):
     assert draft.llm_score is None
     assert "GigaChat временно не смог корректно проверить описание" in response.text
     assert "Продолжаем заполнение заявки" in response.text
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    )
+    assert len(events) == 1
+    assert events[0].new_value == "technical_fallback"
+    assert json.loads(events[0].metadata_json or "{}")["error_kind"] == "network"
 
 
 @pytest.mark.asyncio
@@ -1518,9 +1560,19 @@ async def test_incomplete_check_keeps_score_empty(tmp_path):
         [
             LlmResult(
                 is_complete=False,
-                blocking_problem="Не указано, что изменить",
+                blocking_problem=(
+                    "Критерий 1, правило 1.2: не указано конкретное изменение"
+                ),
                 clarification_instruction=(
                     "Дополните поле: укажите изменяемый фрагмент и требуемый результат."
+                ),
+                telemetry=LlmTelemetry(
+                    prompt_version="v3",
+                    prompt_hash="abc123def456",
+                    model="GigaChat-2-Max",
+                    duration_ms=321,
+                    response_attempts=2,
+                    validation_retries=1,
                 ),
             )
         ]
@@ -1541,6 +1593,29 @@ async def test_incomplete_check_keeps_score_empty(tmp_path):
     assert draft.current_step == Step.CHANGE_DESCRIPTION_CLARIFICATION
     assert draft.llm_check_status == LlmCheckStatus.NEEDS_ATTENTION.value
     assert draft.llm_score is None
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    )
+    assert len(events) == 1
+    assert events[0].new_value == "needs_clarification"
+    metadata = json.loads(events[0].metadata_json or "{}")
+    assert metadata == {
+        "schema_version": 1,
+        "stage": "initial",
+        "trigger": "create",
+        "prompt_version": "v3",
+        "prompt_hash": "abc123def456",
+        "model": "GigaChat-2-Max",
+        "blocking_rule": "1.2",
+        "duration_ms": 321,
+        "response_attempts": 2,
+        "validation_retries": 1,
+        "error_kind": None,
+    }
+    serialized = events[0].metadata_json or ""
+    assert "Обновить текст" not in serialized
+    assert "Дополните поле" not in serialized
 
 
 @pytest.mark.asyncio
@@ -1572,6 +1647,13 @@ async def test_edit_change_description_runs_llm_again(tmp_path):
     assert draft.raw_change_description == "Новая суть"
     assert draft.clarification_count == 0
     assert len(llm_client.calls) == 2
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    )
+    assert len(events) == 2
+    assert json.loads(events[0].metadata_json or "{}")["trigger"] == "edit"
+    assert json.loads(events[1].metadata_json or "{}")["trigger"] == "create"
 
 
 @pytest.mark.asyncio

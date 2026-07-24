@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import hashlib
 import json
 import logging
 import re
 from pathlib import Path
 from string import Formatter
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from app.models import LlmContext, LlmResult
+from app.models import LlmContext, LlmResult, LlmTelemetry
 
 
 DEFAULT_SYSTEM_PROMPT_PATH = "prompts/gigachat_system_v3.md"
@@ -178,11 +181,13 @@ class PromptRenderer:
     def __init__(self, system_prompt_path: str, user_prompt_path: str) -> None:
         self.system_prompt_path = Path(system_prompt_path)
         self.user_prompt_path = Path(user_prompt_path)
+        self._prompt_hash: str | None = None
 
     def render(self, context: LlmContext) -> tuple[str, str]:
         """Собрать system/user prompts из шаблонов и уже известных полей заявки."""
         system_prompt = self._read_prompt(self.system_prompt_path)
         user_template = self._read_prompt(self.user_prompt_path)
+        self._prompt_hash = _prompt_templates_hash(system_prompt, user_template)
         values = {
             "direction": context.direction or "Не указано.",
             "answer_type": context.answer_type or "Не указан.",
@@ -194,6 +199,17 @@ class PromptRenderer:
             "clarification_text": context.clarification_text or "Не было.",
         }
         return system_prompt, _format_prompt(user_template, values)
+
+    def identity(self) -> tuple[str, str | None]:
+        if self._prompt_hash is None:
+            try:
+                self._prompt_hash = _prompt_templates_hash(
+                    self._read_prompt(self.system_prompt_path),
+                    self._read_prompt(self.user_prompt_path),
+                )
+            except OSError:
+                return _prompt_version(self.system_prompt_path), None
+        return _prompt_version(self.system_prompt_path), self._prompt_hash
 
     @staticmethod
     def _read_prompt(path: Path) -> str:
@@ -238,13 +254,19 @@ class LlmClient:
 
     async def check_change_description(self, context: LlmContext) -> LlmResult:
         """Check description completeness with one retry for malformed JSON responses."""
+        started_at = perf_counter()
         if not self.credentials and self._client is None:
             logger.warning(
                 "GigaChat credentials are not configured; using fallback LLM result"
             )
-            return _fallback_result(
-                context,
-                "GIGACHAT_CREDENTIALS РЅРµ Р·Р°РґР°РЅ.",
+            return self._with_telemetry(
+                _fallback_result(
+                    context,
+                    "GIGACHAT_CREDENTIALS РЅРµ Р·Р°РґР°РЅ.",
+                ),
+                started_at=started_at,
+                response_attempts=0,
+                error_kind="not_configured",
             )
 
         logger.info(
@@ -292,7 +314,11 @@ class LlmClient:
                     attempt,
                     GIGACHAT_JSON_RETRY_ATTEMPTS,
                 )
-                return result
+                return self._with_telemetry(
+                    result,
+                    started_at=started_at,
+                    response_attempts=attempt,
+                )
             except LlmResponseError as exc:
                 last_error = exc
                 self._log_response_failure(exc, attempt, GIGACHAT_JSON_RETRY_ATTEMPTS)
@@ -326,9 +352,36 @@ class LlmClient:
                 )
                 break
         assert last_error is not None
-        return _fallback_result(
-            context,
-            f"{LLM_ERROR_PREFIX} {_exception_chain(last_error) or last_error}",
+        return self._with_telemetry(
+            _fallback_result(
+                context,
+                f"{LLM_ERROR_PREFIX} {_exception_chain(last_error) or last_error}",
+            ),
+            started_at=started_at,
+            response_attempts=attempt,
+            error_kind=_normalized_error_kind(last_error),
+        )
+
+    def _with_telemetry(
+        self,
+        result: LlmResult,
+        *,
+        started_at: float,
+        response_attempts: int,
+        error_kind: str | None = None,
+    ) -> LlmResult:
+        prompt_version, prompt_hash = self.prompt_renderer.identity()
+        return replace(
+            result,
+            telemetry=LlmTelemetry(
+                prompt_version=prompt_version,
+                prompt_hash=prompt_hash,
+                model=self.model,
+                duration_ms=max(0, round((perf_counter() - started_at) * 1000)),
+                response_attempts=response_attempts,
+                validation_retries=max(0, response_attempts - 1),
+                error_kind=error_kind,
+            ),
         )
 
     async def _request_structured_result(
@@ -676,6 +729,76 @@ def _header_value(headers: Any, name: str) -> Any:
     if hasattr(headers, "get"):
         return headers.get(name) or headers.get(name.title())
     return None
+
+
+def _prompt_version(system_prompt_path: Path) -> str:
+    match = re.search(r"_v(?P<version>\d+)$", system_prompt_path.stem, re.IGNORECASE)
+    if match:
+        return f"v{match.group('version')}"
+    return system_prompt_path.stem or "unknown"
+
+
+def _prompt_templates_hash(system_prompt: str, user_template: str) -> str:
+    payload = f"{system_prompt}\0{user_template}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+
+def _normalized_error_kind(exc: BaseException) -> str:
+    if isinstance(exc, LlmResponseError):
+        return exc.kind if exc.kind in {
+            "empty_response",
+            "invalid_json",
+            "schema_validation",
+            "truncated_response",
+        } else "unknown"
+
+    metadata = _response_metadata(exc)
+    try:
+        status_code = int(metadata.get("status_code"))
+    except (TypeError, ValueError):
+        status_code = 0
+    if status_code in {401, 403}:
+        return "auth"
+    if status_code == 429:
+        return "rate_limit"
+    if status_code >= 500:
+        return "provider_error"
+
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    text = " ".join(
+        f"{type(item).__name__} {item}" for item in chain
+    ).lower()
+    if any(isinstance(item, TimeoutError) for item in chain) or "timeout" in text:
+        return "timeout"
+    if any(token in text for token in ("unauthorized", "forbidden", "autherror")):
+        return "auth"
+    if any(token in text for token in ("rate limit", "ratelimit", "too many requests")):
+        return "rate_limit"
+    if any(token in text for token in ("bad gateway", "service unavailable")):
+        return "provider_error"
+    if "truncat" in text or "finish_reason" in text and "length" in text:
+        return "truncated_response"
+    if any(
+        token in text
+        for token in (
+            "connection",
+            "network",
+            "dns",
+            "connector",
+            "connecterror",
+            "connectionerror",
+            "clienterror",
+            "socketerror",
+        )
+    ):
+        return "network"
+    return "unknown"
 
 
 def _format_prompt(template: str, values: dict[str, str]) -> str:
