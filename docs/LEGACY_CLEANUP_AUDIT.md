@@ -378,6 +378,25 @@ Cleanup завершён, когда:
 - destructive SQLite migration проверена восстановлением backup;
 - rollback-план соответствует новой схеме БД.
 
+## Результат этапа 1 в production
+
+Этап выполнен 27.07.2026 на версии `20260727-8a608a8`.
+
+- перед операцией созданы backups `app-20260727-155449.db` и
+  `app-20260727-155551.db`;
+- production dry-run подтвердил 36 legacy applications, 5 `bulk_batches`,
+  7 `bulk_creation_requests`, отсутствие blockers и legacy delivery events;
+- из SQLite удалены ровно эти 36 tracking-записей, 5 batches и 7 requests;
+- Google Sheets не изменялись;
+- повторный dry-run не находит legacy applications, batches или requests;
+- сохранены 145 актуальных `submitted_applications`, 8 `bulk_reservations` и
+  все 443 `application_events`;
+- `PRAGMA integrity_check = ok`, schema version `2`;
+- production healthcheck возвращает `ok`, контейнер healthy;
+- результат execute сохранён на VPS в
+  `/data/legacy-cleanup-result-20260727.json`, inventory после очистки — в
+  `/opt/alfa-auto-requests/legacy-inventory-post-cleanup-20260727.json`.
+
 ## Подтверждённые решения 27.07.2026
 
 - целевая кодовая база: локальный `HEAD` на момент начала очистки;
