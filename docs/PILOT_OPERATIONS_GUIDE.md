@@ -2351,6 +2351,80 @@ Compose.
 6. Согласовать с разработчиком восстановление tracking по Google Sheets.
 7. Предупредить пользователей, что часть незавершенных черновиков и уведомлений потеряна.
 
+## Read-only inventory перед удалением legacy
+
+Инструмент ничего не изменяет в SQLite и Google Sheets. По умолчанию он
+читает только БД:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot \
+  python -m app.legacy_inventory \
+  --sqlite-path /data/app.db
+```
+
+Для сверки старых массовых строк с Google Sheets:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot \
+  python -m app.legacy_inventory \
+  --sqlite-path /data/app.db \
+  --with-google \
+  --credentials-path /run/secrets/google_credentials.json
+```
+
+Чтобы сохранить JSON на VPS без записи внутрь контейнера:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot \
+  python -m app.legacy_inventory \
+  --sqlite-path /data/app.db \
+  --with-google \
+  --credentials-path /run/secrets/google_credentials.json \
+  > legacy-inventory.json
+```
+
+Поле `blockers` перечисляет причины, по которым destructive cleanup пока
+нельзя выполнять. Наличие blockers не означает ошибку inventory. Флаг
+`--fail-on-blockers` нужен для CI/операционного скрипта и возвращает код `2`,
+если blockers обнаружены.
+
+Перед любым `--execute` следующего этапа обязательно:
+
+1. создать и проверить SQLite backup;
+2. сохранить копию backup вне VPS;
+3. сделать копии затрагиваемых Google Sheets;
+4. получить пустой список ошибок Google и проверить все coordinate mismatch;
+5. сохранить JSON inventory рядом с журналом миграции.
+
+## Очистка tracking старой массовой модели
+
+Команда работает только с SQLite и не изменяет Google Sheets. Сначала получите
+план и токен подтверждения:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T bot \
+  python -m app.legacy_cleanup --sqlite-path /data/app.db \
+  > legacy-cleanup-dry-run.json
+```
+
+Проверьте `blockers`, списки ID и количества. Перед execute контейнер бота должен
+быть остановлен, а SQLite backup создан и проверен. Токен берётся из поля
+`confirmation_token` свежего dry-run:
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm --no-deps bot \
+  python -m app.legacy_cleanup \
+  --sqlite-path /data/app.db \
+  --execute \
+  --confirm-token "<token>" \
+  --output /data/legacy-cleanup-result.json
+```
+
+После запуска бота повторите dry-run: количества legacy-записей должны стать
+нулевыми. История `application_events` сохраняется. Если в недоставленном
+уведомлении одновременно найдены legacy и актуальные заявки, execute
+останавливается без изменений.
+
 ## Таблица команд и рисков
 
 | Команда | Что делает | Когда применять | Риск |

@@ -34,6 +34,8 @@ from app.models import (
     utc_now_iso,
 )
 
+LATEST_SCHEMA_VERSION = 2
+
 
 class DraftRepository:
     """Единая точка доступа к черновикам, tracking и массовым заявкам в SQLite."""
@@ -50,6 +52,7 @@ class DraftRepository:
         async with self._connection() as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA synchronous=NORMAL")
+            await self._assert_supported_schema_version(db)
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS drafts (
@@ -354,6 +357,15 @@ class DraftRepository:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
             await self._ensure_bulk_batches_column(db, "spreadsheet_id", "TEXT")
             await self._ensure_bulk_batches_column(db, "direction", "TEXT")
             await self._ensure_bulk_batches_column(db, "batch_status", "TEXT")
@@ -491,7 +503,7 @@ class DraftRepository:
                 ON application_events(telegram_user_id, event_at)
                 """
             )
-            await self._migrate_llm_completeness_check(db)
+            await self._run_schema_migrations(db)
             await db.commit()
 
     async def get_or_create(self, telegram_user_id: int) -> Draft:
@@ -3787,23 +3799,56 @@ class DraftRepository:
             await db.close()
 
     @staticmethod
-    async def _migrate_llm_completeness_check(db: aiosqlite.Connection) -> None:
+    async def _assert_supported_schema_version(db: aiosqlite.Connection) -> None:
         cursor = await db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         version = int(row[0]) if row else 0
+        if version > LATEST_SCHEMA_VERSION:
+            raise RuntimeError(
+                "SQLite schema is newer than this application version: "
+                f"database={version} application={LATEST_SCHEMA_VERSION}"
+            )
+
+    @staticmethod
+    async def _run_schema_migrations(db: aiosqlite.Connection) -> None:
+        cursor = await db.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        version = int(row[0]) if row else 0
+
+        if version < 1:
+            await db.execute(
+                """
+                UPDATE drafts
+                SET formatted_change_description = raw_change_description,
+                    llm_score = NULL
+                WHERE current_step != ?
+                  AND raw_change_description IS NOT NULL
+                """,
+                (Step.COMPLETED.value,),
+            )
+            await db.execute("PRAGMA user_version = 1")
+            version = 1
+
         if version >= 1:
-            return
-        await db.execute(
-            """
-            UPDATE drafts
-            SET formatted_change_description = raw_change_description,
-                llm_score = NULL
-            WHERE current_step != ?
-              AND raw_change_description IS NOT NULL
-            """,
-            (Step.COMPLETED.value,),
-        )
-        await db.execute("PRAGMA user_version = 1")
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (version, name, applied_at)
+                VALUES (1, 'llm_completeness_check', ?)
+                """,
+                (utc_now_iso(),),
+            )
+
+        if version < 2:
+            # Version 2 intentionally changes no business data. It establishes
+            # an explicit migration ledger before legacy cleanup becomes destructive.
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (version, name, applied_at)
+                VALUES (2, 'versioned_migration_framework', ?)
+                """,
+                (utc_now_iso(),),
+            )
+            await db.execute("PRAGMA user_version = 2")
 
     @staticmethod
     async def _ensure_user_settings_column(
