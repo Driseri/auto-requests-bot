@@ -1,0 +1,17 @@
+.env
+.venv
+.codex/
+__pycache__
+.pytest_cache
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+data
+dashboard/
+.docker-config-release/
+output/
+credentials.json
+*.tar
+*.xlsx
+~$*

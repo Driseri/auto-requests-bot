@@ -1,0 +1,25 @@
+[ssh]
+host = "206.223.244.31"
+port = 22
+username = "root"
+password = "change-me"
+connect_timeout_seconds = 5
+command_timeout_seconds = 30
+
+[remote]
+project_dir = "/opt/alfa-auto-requests"
+compose_file = "docker-compose.prod.yml"
+service = "bot"
+
+[collector]
+fast_interval_seconds = 60
+logs_interval_seconds = 120
+heavy_interval_seconds = 300
+auto_collect = true
+
+[admin]
+destructive_actions_enabled = false
+max_delete_ids = 20
+
+[storage]
+data_dir = "data"

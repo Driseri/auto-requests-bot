@@ -1,0 +1,53 @@
+name: alfa-auto-requests
+
+services:
+  bot:
+    image: alfa-auto-requests-bot:${APP_VERSION:?APP_VERSION is required}
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      SQLITE_PATH: /data/app.db
+      GOOGLE_CREDENTIALS_PATH: /run/secrets/google_credentials.json
+      STATUS_POLLING_HEARTBEAT_PATH: /data/status-polling-heartbeat.json
+      MALLOC_ARENA_MAX: "2"
+      TZ: ${BOT_TIMEZONE:-Europe/Moscow}
+    volumes:
+      - bot-data:/data
+      - ./credentials.json:/run/secrets/google_credentials.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.health"]
+      interval: 30s
+      timeout: 60s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  backup:
+    image: alfa-auto-requests-bot:${APP_VERSION:?APP_VERSION is required}
+    profiles: ["maintenance"]
+    environment:
+      SQLITE_PATH: /data/app.db
+    volumes:
+      - bot-data:/data
+      - ${BACKUP_DIR:-./backups}:/backups
+    command:
+      - python
+      - -m
+      - app.maintenance
+      - backup
+      - --source
+      - /data/app.db
+      - --directory
+      - /backups
+      - --retention-days
+      - "7"
+    restart: "no"
+
+volumes:
+  bot-data:

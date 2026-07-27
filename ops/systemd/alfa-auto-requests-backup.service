@@ -1,0 +1,10 @@
+[Unit]
+Description=Backup Alfa auto requests SQLite database
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/alfa-auto-requests
+Environment=APP_VERSION=replace-with-tested-commit-sha
+ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml --profile maintenance run --rm backup
