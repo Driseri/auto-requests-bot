@@ -1194,7 +1194,7 @@ Rollback переключает код на старый image, но не отк
 Loadtest проверяет только актуальный workflow `bulk_reservations`: бот вставляет
 резерв строк в рабочий лист, заполняет его тестовыми данными и регистрирует строки
 как обычные одиночные заявки. CLI принимает только `--bulk-mode reservations`;
-legacy `bulk_batches` нагрузочным тестом больше не запускается.
+Старая модель пачек из runtime удалена.
 
 ### Перед тестом
 
@@ -1800,111 +1800,7 @@ PY
 
 Используйте это, когда строка есть в таблице, но tracking ушел в редкую проверку.
 
-### 6. Preview массовой пачки по batch_id
-
-Команда только читает SQLite:
-
-```bash
-docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
-import sqlite3
-
-batch_id = "BATCH_ID"
-conn = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
-conn.row_factory = sqlite3.Row
-
-print("bulk_batch")
-for row in conn.execute(
-    """
-    SELECT batch_id, telegram_user_id, direction, sheet_name, start_row,
-           data_start_row, data_end_row, reserved_rows, registration_state,
-           last_known_batch_status, registered_count, created_at, updated_at
-    FROM bulk_batches
-    WHERE batch_id = ?
-    """,
-    (batch_id,),
-):
-    print(dict(row))
-
-print("submitted_applications")
-for row in conn.execute(
-    """
-    SELECT application_id, last_known_status, last_seen_row_number,
-           polling_state, not_found_count, updated_at
-    FROM submitted_applications
-    WHERE batch_id = ?
-    ORDER BY last_seen_row_number, application_id
-    """,
-    (batch_id,),
-):
-    print(dict(row))
-
-conn.close()
-PY
-```
-
-### 7. Удалить локальный tracking массовой пачки
-
-Используйте только для тестовой или ошибочной пачки, которую точно больше не нужно
-отслеживать. Строки в Google Sheets не удаляются.
-
-```bash
-docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
-import sqlite3
-
-batch_id = "BATCH_ID"
-
-conn = sqlite3.connect("/data/app.db")
-conn.row_factory = sqlite3.Row
-conn.execute("BEGIN IMMEDIATE")
-
-apps = conn.execute(
-    """
-    SELECT application_id, last_known_status, last_seen_row_number
-    FROM submitted_applications
-    WHERE batch_id = ?
-    ORDER BY last_seen_row_number, application_id
-    """,
-    (batch_id,),
-).fetchall()
-batch = conn.execute(
-    """
-    SELECT batch_id, telegram_user_id, registration_state, last_known_batch_status
-    FROM bulk_batches
-    WHERE batch_id = ?
-    """,
-    (batch_id,),
-).fetchone()
-
-print("will_delete_batch", dict(batch) if batch else None)
-print("will_delete_applications", [dict(row) for row in apps])
-
-conn.execute(
-    "DELETE FROM dashboard_outbox WHERE entity_type = 'BULK_BATCH' AND entity_id = ?",
-    (batch_id,),
-)
-conn.execute(
-    "DELETE FROM bulk_creation_requests WHERE batch_id = ?",
-    (batch_id,),
-)
-conn.execute(
-    "DELETE FROM submitted_applications WHERE batch_id = ?",
-    (batch_id,),
-)
-conn.execute(
-    "DELETE FROM bulk_batches WHERE batch_id = ?",
-    (batch_id,),
-)
-
-print("deleted_total_changes", conn.total_changes)
-conn.commit()
-conn.close()
-PY
-```
-
-Не используйте этот сценарий для обычной завершенной пачки: завершенные пачки
-специально остаются в tracking и проверяются архивным scan раз в час.
-
-### 8. Проверить результат удаления
+### 6. Проверить результат удаления
 
 Для одиночных заявок:
 
@@ -1924,29 +1820,7 @@ PY
 
 Ожидаемый результат: `0`.
 
-Для массовой пачки:
-
-```bash
-docker compose -f docker-compose.prod.yml exec -T bot python - <<'PY'
-import sqlite3
-
-batch_id = "BATCH_ID"
-conn = sqlite3.connect("file:/data/app.db?mode=ro", uri=True)
-print("bulk_batches", conn.execute(
-    "SELECT COUNT(*) FROM bulk_batches WHERE batch_id = ?",
-    (batch_id,),
-).fetchone()[0])
-print("submitted_applications", conn.execute(
-    "SELECT COUNT(*) FROM submitted_applications WHERE batch_id = ?",
-    (batch_id,),
-).fetchone()[0])
-conn.close()
-PY
-```
-
-Ожидаемый результат: оба значения `0`.
-
-### 9. Чего не делать
+### 7. Чего не делать
 
 - Не выполняйте `DELETE` без `WHERE`.
 - Не удаляйте `/data/app.db`, `/data/app.db-wal`, `/data/app.db-shm` вручную.

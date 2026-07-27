@@ -323,20 +323,20 @@ Skipped tests следует удалить вместе с retired code, migrat
 
 ### Этап 1. Старые массовые заявки
 
-- [ ] Получить бизнес-решение по 36 активным legacy rows.
-- [ ] Временно восстановить узкий polling или мигрировать/архивировать их.
-- [ ] Добиться нулевого числа активных `submitted_applications.batch_id`.
-- [ ] Закрыть старые dashboard rows и pending outbox.
-- [ ] Проверить пустой повторный migration dry-run.
+- [x] Получить бизнес-решение по 36 активным legacy rows.
+- [x] Удалить завершенный tracking без изменения Google Sheets.
+- [x] Добиться нулевого числа активных `submitted_applications.batch_id`.
+- [x] Закрыть старые dashboard rows и pending outbox.
+- [x] Проверить пустой повторный migration dry-run.
 
 ### Этап 2. Удаление legacy bulk runtime
 
-- [ ] Оставить изолированный tombstone callback.
-- [ ] Удалить старые bulk services, registrar и helpers.
-- [ ] Удалить batch readers, relocation, notifications и projections.
-- [ ] Удалить старые repository methods и models.
-- [ ] Удалить legacy bulk config и skipped tests.
-- [ ] Обновить dashboard и эксплуатационную документацию.
+- [x] Оставить изолированный tombstone callback.
+- [x] Удалить старые bulk services, registrar и helpers.
+- [x] Удалить batch readers, relocation, notifications и projections.
+- [x] Удалить старые repository methods и models.
+- [x] Удалить legacy bulk config и skipped tests.
+- [x] Обновить dashboard и эксплуатационную документацию.
 
 ### Этап 3. Унификация Sheets
 
@@ -423,3 +423,27 @@ Google API и не создаёт dashboard delete events.
 - сохранены все 443 `application_events`;
 - сохранены 145 актуальных `submitted_applications`;
 - `PRAGMA integrity_check = ok`.
+
+## Результат этапа 2
+
+Этап выполнен 27.07.2026 в локальной кодовой базе после production-очистки
+этапа 1.
+
+- удалены старые сервис создания пачек и registrar;
+- удалены runtime-чтение статусов пачек, relocation, архивный scan,
+  уведомления и dashboard projection по `batch_id`;
+- удалены старые repository API, модели, enum, config и skipped tests;
+- текущие массовые заявки продолжают работать только через
+  `bulk_reservations` и после регистрации отслеживаются как одиночные;
+- callback `app:bulk_ready:*` оставлен изолированным tombstone: Google Sheets и
+  SQLite он не изменяет;
+- offline-инструменты инвентаризации и DB-only cleanup сохранены;
+- физические таблицы `bulk_batches` и `bulk_creation_requests` временно
+  остаются в SQLite до этапа 5 и runtime не используются;
+- актуальные dashboard- и эксплуатационные документы больше не обещают
+  поддержку старого workflow;
+- полный набор тестов: `404 passed`, skipped tests отсутствуют;
+- Ruff, `compileall` и обе Compose-проверки прошли;
+- инициализация repository на копии очищенной production-БД сохранила
+  145 заявок, 8 резервов и 443 события, подняла schema version с `1` до `2`;
+  до и после инициализации `PRAGMA integrity_check = ok`.

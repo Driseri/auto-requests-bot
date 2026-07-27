@@ -23,8 +23,6 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert settings.status_polling_memory_log_interval == 40
     assert settings.status_not_found_threshold == 20
     assert settings.status_not_found_recheck_seconds == 3600
-    assert settings.bulk_relocation_search_interval_seconds == 3600
-    assert settings.bulk_reserved_rows == 100
     assert settings.bulk_registration_stale_seconds == 600
     assert settings.bulk_creation_stale_seconds == 600
     assert settings.daily_sheet_grouping_enabled is True
@@ -64,13 +62,6 @@ def test_load_settings_uses_custom_status_polling_memory_log_interval(monkeypatc
     assert settings.status_polling_memory_log_interval == 0
 
 
-def test_load_settings_rejects_invalid_bulk_relocation_interval(monkeypatch):
-    monkeypatch.setenv("BULK_RELOCATION_SEARCH_INTERVAL_SECONDS", "0")
-
-    with pytest.raises(ValueError, match="BULK_RELOCATION_SEARCH_INTERVAL_SECONDS"):
-        load_settings()
-
-
 def test_load_settings_uses_editor_urgent_chat_id(monkeypatch):
     monkeypatch.setenv("URGENT_EDITOR_NOTIFICATIONS_ENABLED", "true")
     monkeypatch.setenv("EDITOR_URGENT_CHAT_ID", "-100123456")
@@ -97,13 +88,11 @@ def test_load_settings_rejects_invalid_editor_urgent_chat_id(monkeypatch):
 
 
 def test_load_settings_uses_custom_bulk_limits(monkeypatch):
-    monkeypatch.setenv("BULK_RESERVED_ROWS", "75")
     monkeypatch.setenv("BULK_REGISTRATION_STALE_SECONDS", "900")
     monkeypatch.setenv("BULK_CREATION_STALE_SECONDS", "700")
 
     settings = load_settings()
 
-    assert settings.bulk_reserved_rows == 75
     assert settings.bulk_registration_stale_seconds == 900
     assert settings.bulk_creation_stale_seconds == 700
 
@@ -130,8 +119,6 @@ def test_load_settings_rejects_invalid_daily_sheet_maintenance_time(monkeypatch)
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("BULK_RESERVED_ROWS", "0"),
-        ("BULK_RESERVED_ROWS", "-1"),
         ("BULK_REGISTRATION_STALE_SECONDS", "0"),
         ("BULK_REGISTRATION_STALE_SECONDS", "-1"),
         ("BULK_CREATION_STALE_SECONDS", "0"),

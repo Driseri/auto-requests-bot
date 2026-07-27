@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
@@ -21,7 +21,6 @@ from app.models import (
     AnswerType,
     ApplicationStatus,
     ApplicationType,
-    BulkBatch,
     ChangeType,
     DashboardOutboxItem,
     Direction,
@@ -192,22 +191,12 @@ DASHBOARD_HEADERS = [
     *LEGACY_DASHBOARD_HEADERS[9:],
 ]
 
-BATCH_DASHBOARD_HEADERS = [
-    "ID пачки",
-    "Дата создания",
-    "Направление",
-    "Автор заявки",
-    "Статус пачки",
-    "Ссылка на пачку",
-]
-
 SHEET_HEADERS = WORKSHEET_HEADERS
 LEGACY_SHEET_HEADERS = LEGACY_WORKSHEET_HEADERS
 LEGACY_SHEET_COLUMN_COUNT = len(LEGACY_WORKSHEET_HEADERS)
 CURRENT_SHEET_COLUMN_COUNT = len(CURRENT_WORKSHEET_HEADERS)
 SHEET_COLUMN_COUNT = len(WORKSHEET_HEADERS)
 DASHBOARD_SHEET_NAME = "Заявки"
-BATCH_DASHBOARD_SHEET_NAME = "Пачки"
 INTEGRATION_SHEET_NAME = "Интеграции"
 URGENT_SHEET_NAME = "Срочные"
 ROLLOUT_SECTION_MARKERS = tuple(change_type.value for change_type in ChangeType)
@@ -1767,10 +1756,7 @@ class DashboardSyncService:
         for item in items:
             snapshot = json.loads(item.snapshot_json)
             if snapshot.get("action") == "delete":
-                key = (
-                    "batch" if item.entity_type == "BULK_BATCH" else "application",
-                    item.entity_id,
-                )
+                key = ("application", item.entity_id)
                 projected_keys.add(key)
                 requests.extend(
                     {
@@ -1790,10 +1776,7 @@ class DashboardSyncService:
             projected.extend([""] * (len(DASHBOARD_HEADERS) - len(projected)))
             key = _dashboard_entity_key(projected)
             if key is None:
-                key = (
-                    "batch" if item.entity_type == "BULK_BATCH" else "application",
-                    item.entity_id,
-                )
+                key = ("application", item.entity_id)
             projected_keys.add(key)
             matches = groups.get(key, [])
             if matches:
@@ -1992,83 +1975,7 @@ class DashboardSyncService:
             body={"values": [row]},
         ).execute()
 
-    def upsert_bulk_batch(
-        self,
-        *,
-        batch: BulkBatch,
-        status: str,
-        row_link: str,
-        final_answer_present: bool = False,
-        editors: tuple[str, ...] = (),
-    ) -> None:
-        """Создать или обновить единственную строку пачки по batch_id."""
-        with self._lock:
-            self._upsert_bulk_batch(
-                batch=batch,
-                status=status,
-                row_link=row_link,
-                final_answer_present=final_answer_present,
-                editors=editors,
-            )
 
-    def _upsert_bulk_batch(
-        self,
-        *,
-        batch: BulkBatch,
-        status: str,
-        row_link: str,
-        final_answer_present: bool = False,
-        editors: tuple[str, ...] = (),
-    ) -> None:
-        if not self.spreadsheet_id:
-            return
-        api = self._get_sheets_api()
-        sheet_id = self._ensure_dashboard_sheet(api, DASHBOARD_SHEET_NAME, DASHBOARD_HEADERS)
-        rows = self._read_dashboard_rows(api, sheet_id)
-        row_number = _find_row_by_batch_id(rows, batch.batch_id)
-        existing_row = rows[row_number - 1] if row_number is not None and row_number - 1 < len(rows) else []
-        row = dashboard_bulk_batch_row(
-            batch=batch,
-            status=status,
-            row_link=row_link,
-            final_answer_present=final_answer_present,
-            editors=editors,
-            existing_row=existing_row,
-        )
-        if row_number is None:
-            date_value = batch.created_at
-            api.spreadsheets().batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={
-                    "requests": [
-                        {
-                            "appendCells": {
-                                "sheetId": sheet_id,
-                                "rows": [
-                                    {
-                                        "values": _dashboard_row_cells(
-                                            row,
-                                            date_value=date_value,
-                                            timezone_name=self.timezone_name,
-                                        )
-                                    }
-                                ],
-                                "fields": (
-                                    "userEnteredValue,"
-                                    "userEnteredFormat.numberFormat"
-                                ),
-                            }
-                        }
-                    ]
-                },
-            ).execute()
-            return
-        api.spreadsheets().values().update(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{quote_sheet_name(DASHBOARD_SHEET_NAME)}!A{row_number}:L{row_number}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [row]},
-        ).execute()
 
     def _ensure_dashboard_sheet(self, api: Any, sheet_name: str, headers: list[str]) -> int:
         if sheet_name in self._prepared_sheets:
@@ -2497,42 +2404,6 @@ def dashboard_tracked_row(
     ]
 
 
-def dashboard_bulk_batch_row(
-    *,
-    batch: BulkBatch,
-    status: str,
-    row_link: str,
-    final_answer_present: bool,
-    editors: tuple[str, ...] = (),
-    existing_row: list[Any] | None = None,
-) -> list[Any]:
-    existing = list(existing_row or [])
-    existing.extend([""] * (len(DASHBOARD_HEADERS) - len(existing)))
-    selected_editors = {
-        editor
-        for editor in editors
-        if editor and editor != EDITOR_NOT_SELECTED
-    }
-    if len(selected_editors) > 1:
-        editor_value = "Несколько редакторов"
-    elif selected_editors:
-        editor_value = next(iter(selected_editors))
-    else:
-        editor_value = EDITOR_NOT_SELECTED
-    return [
-        "\u041f\u0430\u0447\u043a\u0430",
-        batch.batch_id,
-        existing[2] or batch.created_at,
-        batch.direction or existing[3],
-        ApplicationType.BULK.value,
-        existing[5],
-        _repair_sheet_bool(existing[6]),
-        existing[7] or f"Telegram {batch.telegram_user_id}",
-        status or batch.last_known_batch_status,
-        editor_value,
-        bool_to_sheet_value(final_answer_present or _sheet_value_is_yes(existing[10])),
-        row_link,
-    ]
 
 
 def bool_to_sheet_value(value: bool | None) -> str:

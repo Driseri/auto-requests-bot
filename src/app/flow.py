@@ -143,7 +143,6 @@ class ApplicationFlow:
         bulk_reservation_service: BulkReservationServiceProtocol | None = None,
         bulk_reservation_registrar: BulkReservationRegistrar | None = None,
         show_llm_response_json: bool = False,
-        bulk_reserved_rows: int = 100,
         bulk_max_rows: int = 50,
         bulk_creation_stale_seconds: int = 600,
         dashboard_enabled: bool = False,
@@ -156,7 +155,6 @@ class ApplicationFlow:
         self.bulk_reservation_service = bulk_reservation_service
         self.bulk_reservation_registrar = bulk_reservation_registrar
         self.show_llm_response_json = show_llm_response_json
-        self.bulk_reserved_rows = bulk_reserved_rows
         self.bulk_max_rows = bulk_max_rows
         self.bulk_creation_stale_seconds = bulk_creation_stale_seconds
         self.dashboard_enabled = dashboard_enabled

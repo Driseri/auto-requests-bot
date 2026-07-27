@@ -254,7 +254,7 @@ ORDER BY COUNT(*) DESC;
 Показывать:
 
 - количество по state: `PENDING`, `SENDING`;
-- количество по entity_type: `APPLICATION`, `BULK_BATCH`;
+- количество по `entity_type` (в актуальном runtime используется `APPLICATION`);
 - самый старый `PENDING`;
 - записи с большим числом attempts;
 - последние ошибки;
@@ -343,80 +343,81 @@ LIMIT 50;
 
 ## Массовые пачки
 
-Массовые заявки имеют отдельную логику, поэтому их нельзя смешивать с одиночными.
+Массовые заявки создаются через `bulk_reservations`. После регистрации каждая
+заполненная строка становится обычной одиночной заявкой, поэтому отдельно
+контролируется только жизненный цикл резерва.
 
 Показывать:
 
-- активные незарегистрированные пачки;
-- пачки в `BULK_CREATING`;
-- пачки в регистрации;
-- зарегистрированные пачки;
-- пачки со stale `registration_started_at`;
-- пачки по пользователям;
-- `reserved_rows`, `data_start_row`, `data_end_row`, `registered_count`;
-- последний известный статус пачки;
+- активные незарегистрированные резервы;
+- резервы в `CREATING` и `REGISTERING`;
+- зарегистрированные и неуспешные резервы;
+- stale `started_at`;
+- резервы по пользователям и целевым разделам;
+- `requested_count`, `start_row`, `end_row`, `registered_count`;
 - время последнего обновления;
-- есть ли поздние итоговые ответы после регистрации.
+- последнюю ошибку.
 
 SQL:
 
 ```sql
-SELECT registration_state, COUNT(*)
-FROM bulk_batches
-GROUP BY registration_state;
+SELECT state, COUNT(*)
+FROM bulk_reservations
+GROUP BY state;
 ```
 
 ```sql
-SELECT telegram_user_id, COUNT(*) AS unfinished_batches
-FROM bulk_batches
-WHERE registration_state != 'REGISTERED'
+SELECT telegram_user_id, COUNT(*) AS unfinished_reservations
+FROM bulk_reservations
+WHERE state NOT IN ('REGISTERED', 'CANCELLED')
 GROUP BY telegram_user_id
-ORDER BY unfinished_batches DESC;
+ORDER BY unfinished_reservations DESC;
 ```
 
 ```sql
-SELECT batch_id, telegram_user_id, direction, sheet_name,
-       start_row, data_start_row, reserved_rows, data_end_row,
-       registration_state, registered_count,
-       last_known_batch_status, updated_at
-FROM bulk_batches
+SELECT reservation_id, telegram_user_id, direction, target_kind, change_type,
+       sheet_name, start_row, end_row, requested_count, state,
+       registered_count, last_error, updated_at
+FROM bulk_reservations
 ORDER BY updated_at DESC
 LIMIT 50;
 ```
 
 Проблемные признаки:
 
-- пачка долго в `CREATING` или `BULK_CREATING`;
+- резерв долго находится в `CREATING`;
 - регистрация началась, но не завершилась;
-- пользователь имеет несколько незавершенных пачек;
-- `registered_count=0` у пачки, которую пользователь считает заполненной;
-- новая пачка попала в диапазон старой пачки;
+- пользователь имеет несколько незавершенных резервов;
+- `registered_count=0` у резерва, который пользователь считает заполненным;
+- диапазоны активных резервов пересекаются;
 - после регистрации нет dashboard projection.
 
-## Создание массовых пачек
+## Создание массовых резервов
 
-Таблица `bulk_creation_requests` нужна для идемпотентности.
+Создание и регистрация хранятся в одной таблице `bulk_reservations`.
 
 Показывать:
 
-- запросы по state: `AWAITING_DIRECTION`, `BULK_CREATING`, `CREATED`, `FAILED`;
-- stale `BULK_CREATING` старше `BULK_CREATION_STALE_SECONDS`;
+- резервы по state: `AWAITING_DIRECTION`, `AWAITING_TARGET`,
+  `AWAITING_CHANGE_TYPE`, `AWAITING_COUNT`, `AWAITING_CONFIRMATION`,
+  `CREATING`, `CREATED`, `REGISTERING`, `REGISTERED`, `CANCELLED`, `FAILED`;
+- stale `CREATING` старше `BULK_CREATION_STALE_SECONDS`;
 - last_error;
-- batch_id и insert_url для диагностики.
+- reservation_id и insert_url для диагностики.
 
 SQL:
 
 ```sql
 SELECT state, COUNT(*)
-FROM bulk_creation_requests
+FROM bulk_reservations
 GROUP BY state;
 ```
 
 ```sql
-SELECT idempotency_key, telegram_user_id, direction, state,
-       batch_id, last_error, started_at, updated_at
-FROM bulk_creation_requests
-WHERE state IN ('BULK_CREATING', 'FAILED')
+SELECT reservation_id, idempotency_key, telegram_user_id, direction,
+       target_kind, change_type, state, last_error, started_at, updated_at
+FROM bulk_reservations
+WHERE state IN ('CREATING', 'REGISTERING', 'FAILED')
 ORDER BY updated_at DESC
 LIMIT 50;
 ```
@@ -596,9 +597,10 @@ LIMIT 50;
 - read-only подключение: `file:/data/app.db?mode=ro`;
 - основные таблицы: `drafts`, `user_settings`, `submitted_applications`,
   `bulk_reservations`, `application_events`, `notification_outbox`,
-  `dashboard_outbox`;
-- legacy-таблицы, пока сохраняется совместимость: `bulk_batches`,
-  `bulk_creation_requests`.
+  `dashboard_outbox`.
+
+Физические таблицы retired workflow могут временно оставаться в старой SQLite
+схеме до отдельной миграции, но runtime и дашборд их больше не используют.
 
 Для локального дашборда лучше не копировать базу каждую секунду. Достаточно:
 

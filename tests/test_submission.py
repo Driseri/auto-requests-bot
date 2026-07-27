@@ -12,7 +12,6 @@ from app.models import (
     AnswerType,
     ApplicationStatus,
     ApplicationType,
-    BulkBatch,
     BulkReservationState,
     ChangeType,
     DashboardOutboxItem,
@@ -1927,124 +1926,10 @@ def test_dashboard_tracked_row_preserves_existing_unknown_fields():
     assert row[11] == "new-link"
 
 
-def test_dashboard_bulk_batch_upsert_updates_existing_batch_row():
-    api = FakeSheetsApi(
-        sheets={DASHBOARD_SPREADSHEET: {DASHBOARD_SHEET_NAME: 100}},
-        headers={(DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): DASHBOARD_HEADERS},
-        rows={
-            (DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): [
-                DASHBOARD_HEADERS,
-                ["Пачка", "BATCH-ABC12345", "old-date", Direction.FL.value, ApplicationType.BULK.value, "", "", "Telegram 123", ApplicationStatus.NEW.value, "Редактор не выбран", "Нет", "old-link"],
-            ]
-        },
-    )
-    service = DashboardSyncService(
-        spreadsheet_id=DASHBOARD_SPREADSHEET,
-        credentials_path="missing-for-test.json",
-        sheets_api=api,
-    )
-    batch = BulkBatch(
-        batch_id="BATCH-ABC12345",
-        telegram_user_id=123,
-        spreadsheet_id=FL_SPREADSHEET,
-        direction=Direction.FL.value,
-        sheet_name="Массовый ввод",
-        sheet_id=300,
-        start_row=2,
-        data_start_row=4,
-        reserved_rows=2,
-    )
-
-    service.upsert_bulk_batch(
-        batch=batch,
-        status=ApplicationStatus.IN_PROGRESS.value,
-        row_link="new-link",
-    )
-
-    assert api.append_cells == []
-    assert api.updated_rows == [
-        (
-            DASHBOARD_SPREADSHEET,
-            DASHBOARD_SHEET_NAME,
-            ["Пачка", "BATCH-ABC12345", "old-date", Direction.FL.value, ApplicationType.BULK.value, "", "", "Telegram 123", ApplicationStatus.IN_PROGRESS.value, "Редактор не выбран", "Нет", "new-link"],
-        )
-    ]
-    dashboard_reads = [
-        call for call in api.value_get_calls if call["range"].endswith("!A:L")
-    ]
-    assert dashboard_reads[-1]["valueRenderOption"] == "UNFORMATTED_VALUE"
 
 
-def test_dashboard_bulk_batch_upsert_finds_legacy_batch_id_in_first_column():
-    api = FakeSheetsApi(
-        sheets={DASHBOARD_SPREADSHEET: {DASHBOARD_SHEET_NAME: 100}},
-        headers={(DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): DASHBOARD_HEADERS},
-        rows={
-            (DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): [
-                DASHBOARD_HEADERS,
-                ["BATCH-ABC12345", "", "old-date", Direction.FL.value, ApplicationType.BULK.value, "", "", "Telegram 123", ApplicationStatus.NEW.value, "Редактор не выбран", "Нет", "old-link"],
-            ]
-        },
-    )
-    service = DashboardSyncService(
-        spreadsheet_id=DASHBOARD_SPREADSHEET,
-        credentials_path="missing-for-test.json",
-        sheets_api=api,
-    )
-    batch = BulkBatch(
-        batch_id="BATCH-ABC12345",
-        telegram_user_id=123,
-        spreadsheet_id=FL_SPREADSHEET,
-        direction=Direction.FL.value,
-        sheet_name="Массовый ввод",
-        sheet_id=300,
-        start_row=2,
-        data_start_row=4,
-        reserved_rows=2,
-    )
-
-    service.upsert_bulk_batch(
-        batch=batch,
-        status=ApplicationStatus.IN_PROGRESS.value,
-        row_link="new-link",
-    )
-
-    assert api.append_cells == []
-    assert len(api.updated_rows) == 1
 
 
-def test_dashboard_bulk_batch_aggregates_multiple_editors():
-    api = FakeSheetsApi(
-        sheets={DASHBOARD_SPREADSHEET: {DASHBOARD_SHEET_NAME: 100}},
-        headers={(DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): DASHBOARD_HEADERS},
-        rows={(DASHBOARD_SPREADSHEET, DASHBOARD_SHEET_NAME): [DASHBOARD_HEADERS]},
-    )
-    service = DashboardSyncService(
-        spreadsheet_id=DASHBOARD_SPREADSHEET,
-        credentials_path="missing-for-test.json",
-        sheets_api=api,
-    )
-    batch = BulkBatch(
-        batch_id="BATCH-ABC12345",
-        telegram_user_id=123,
-        spreadsheet_id=FL_SPREADSHEET,
-        direction=Direction.FL.value,
-        sheet_name="Массовый ввод",
-        sheet_id=300,
-        start_row=2,
-        data_start_row=4,
-        reserved_rows=2,
-    )
-
-    service.upsert_bulk_batch(
-        batch=batch,
-        status=ApplicationStatus.IN_PROGRESS.value,
-        row_link="new-link",
-        editors=("редактор 1", "редактор 2"),
-    )
-
-    values = _append_cell_values(api.append_cells[0][1])
-    assert values[9] == "Несколько редакторов"
 
 
 def test_dashboard_sync_batches_updates_and_merges_duplicates():

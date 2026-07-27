@@ -462,11 +462,12 @@ def create_router(flow: ApplicationFlow) -> Router:
     @router.callback_query(F.data.startswith("app:bulk_ready:"))
     async def callback_bulk_ready(callback: CallbackQuery) -> None:
         batch_id = (callback.data or "").split(":", maxsplit=2)[2]
-        await _answer_bulk_registration(
+        await ui.answer_callback(
             callback,
-            flow,
-            ui,
-            batch_id,
+            await flow.confirm_bulk_batch_filled(
+                _callback_user_id(callback),
+                batch_id,
+            ),
         )
 
     @router.callback_query(F.data == CallbackData.DEFAULTS)
@@ -716,67 +717,6 @@ async def _show_callback_processing(callback: CallbackQuery, text: str) -> None:
             )
 
 
-async def _answer_bulk_registration(
-    callback: CallbackQuery,
-    flow: ApplicationFlow,
-    ui: ActiveMessageManager,
-    batch_id: str,
-) -> None:
-    """Оставить исходную ссылку и показывать прогресс отдельным сообщением."""
-    if callback.message is None:
-        return
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        LOGGER.exception("Could not disable bulk registration button: batch_id=%s", batch_id)
-    progress_message = await callback.message.answer(
-        "Массовая заявка регистрируется в Google Sheets. Подождите..."
-    )
-    try:
-        response = await flow.confirm_bulk_batch_filled(
-            _callback_user_id(callback),
-            batch_id,
-        )
-    except Exception:
-        LOGGER.exception(
-            "Unexpected bulk registration failure: batch_id=%s telegram_user_id=%s",
-            batch_id,
-            _callback_user_id(callback),
-        )
-        response = BotResponse(
-            text=(
-                "Не удалось завершить регистрацию массовой заявки. "
-                "Исходный диапазон доступен в сообщении выше. Повторите попытку."
-            ),
-            keyboard=KeyboardKind.BULK_CREATED,
-            keyboard_payload=batch_id,
-        )
-    markup = build_keyboard(response.keyboard, response.keyboard_payload)
-    if progress_message is not None:
-        try:
-            await progress_message.edit_text(
-                response.text,
-                reply_markup=markup,
-                parse_mode=response.parse_mode,
-            )
-            await ui.track_response_message(
-                _callback_user_id(callback),
-                progress_message,
-                markup,
-            )
-            return
-        except Exception:
-            LOGGER.exception("Could not edit bulk registration progress: batch_id=%s", batch_id)
-    sent = await callback.message.answer(
-        response.text,
-        reply_markup=markup,
-        parse_mode=response.parse_mode,
-    )
-    await ui.track_response_message(
-        _callback_user_id(callback),
-        sent,
-        markup,
-    )
 
 
 async def _answer_bulk_reservation_registration(

@@ -10,16 +10,116 @@ import sqlite3
 import sys
 from typing import Any
 
-from app.bulk import (
-    BULK_STAGING_HEADERS,
-    CURRENT_BULK_STAGING_HEADERS,
-    LEGACY_BULK_STAGING_HEADERS,
-)
 from app.config import load_settings
-from app.notifications import _bulk_row_layout
 from app.submission import build_google_sheets_api, quote_sheet_name
 
 INVENTORY_SCHEMA_VERSION = 1
+
+
+CURRENT_BULK_INPUT_HEADERS = [
+    "Тип ответа",
+    "Интент",
+    "Закрепленный сценарист",
+    "Причина изменений",
+    "Суть изменений",
+    "Исходный текст",
+    "Тип изменения",
+]
+
+
+CURRENT_BULK_SERVICE_HEADERS = [
+    "ID заявки",
+    "Статус",
+    "Редактор",
+    "Вопросы/комментарии редактора",
+    "Ответ/комментарий сценариста",
+    "Итоговый ответ редактора",
+]
+
+
+LEGACY_BULK_SERVICE_HEADERS = [
+    "ID заявки",
+    "Статус",
+    "Вопросы/комментарии редактора",
+    "Ответ/комментарий сценариста",
+    "Итоговый ответ редактора",
+]
+
+
+BULK_INPUT_HEADERS = [
+    "Тип ответа",
+    "Тип изменения",
+    "Закрепленный сценарист",
+    "Интент",
+    "Кейс или сообщения клиента",
+    "Суть изменений",
+    "Исходный текст",
+]
+
+
+BULK_SERVICE_HEADERS = [
+    "Итоговый ответ редактора",
+    "Комментарий качества",
+    "Вопросы/комментарии редактора",
+    "Ответ сценариста",
+    "Статус",
+    "Редактор",
+    "ID заявки",
+]
+
+
+LEGACY_BULK_STAGING_HEADERS = [
+    *CURRENT_BULK_INPUT_HEADERS,
+    *LEGACY_BULK_SERVICE_HEADERS,
+]
+
+
+CURRENT_BULK_STAGING_HEADERS = [
+    *CURRENT_BULK_INPUT_HEADERS,
+    *CURRENT_BULK_SERVICE_HEADERS,
+]
+
+
+BULK_STAGING_HEADERS = [*BULK_INPUT_HEADERS, *BULK_SERVICE_HEADERS]
+
+
+def _bulk_row_layout(header_row: list[Any]) -> dict[str, Any] | None:
+    headers = [str(value).strip() for value in header_row]
+    if headers[: len(BULK_STAGING_HEADERS)] == BULK_STAGING_HEADERS:
+        return {
+            "answer_type": 0,
+            "application_id": 13,
+            "status": 11,
+            "editor": 12,
+            "comment": 9,
+            "final_answer": 7,
+            "batch_status": 11,
+            "end_column": "N",
+        }
+    if headers[: len(CURRENT_BULK_STAGING_HEADERS)] == CURRENT_BULK_STAGING_HEADERS:
+        return {
+            "answer_type": 0,
+            "application_id": 7,
+            "status": 8,
+            "editor": 9,
+            "comment": 10,
+            "final_answer": 12,
+            "batch_status": 10,
+            "end_column": "M",
+        }
+    if headers[: len(LEGACY_BULK_STAGING_HEADERS)] == LEGACY_BULK_STAGING_HEADERS:
+        return {
+            "answer_type": 0,
+            "application_id": 7,
+            "status": 8,
+            "editor": -1,
+            "comment": 9,
+            "final_answer": 11,
+            "batch_status": 9,
+            "end_column": "L",
+        }
+    return None
+
 
 
 def build_legacy_inventory(

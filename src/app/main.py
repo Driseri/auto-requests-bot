@@ -48,7 +48,7 @@ async def main() -> None:
         "gigachat_retry_backoff_factor=%s gigachat_show_response_json=%s "
         "status_polling_enabled=%s status_polling_interval_seconds=%s "
         "dashboard_sync_interval_seconds=%s "
-        "bulk_max_rows=%s bulk_reserved_rows=%s bulk_registration_stale_seconds=%s "
+        "bulk_max_rows=%s bulk_registration_stale_seconds=%s "
         "bot_timezone=%s rollout_wednesday_cutoff=%s rollout_thursday_cutoff=%s "
         "application_editors_count=%s daily_sheet_grouping_enabled=%s "
         "daily_sheet_maintenance_enabled=%s daily_sheet_maintenance_time=%s",
@@ -76,7 +76,6 @@ async def main() -> None:
         settings.status_polling_interval_seconds,
         settings.dashboard_sync_interval_seconds,
         settings.bulk_max_rows,
-        settings.bulk_reserved_rows,
         settings.bulk_registration_stale_seconds,
         settings.rollout_schedule.timezone_name,
         cutoff_to_string(settings.rollout_schedule.wednesday_cutoff),
@@ -155,7 +154,6 @@ async def main() -> None:
         bulk_reservation_service=bulk_reservation_service,
         bulk_reservation_registrar=bulk_reservation_registrar,
         bulk_max_rows=settings.bulk_max_rows,
-        bulk_reserved_rows=settings.bulk_reserved_rows,
         bulk_creation_stale_seconds=settings.bulk_creation_stale_seconds,
         dashboard_enabled=bool(settings.google_dashboard_spreadsheet_id),
         urgent_editor_notifications_enabled=(
@@ -185,19 +183,12 @@ async def main() -> None:
                         google_api_retry=settings.google_api_retry,
                     ),
                     dashboard_sync=dashboard_sync,
-                    legacy_bulk_enabled=False,
                     dashboard_sync_interval_seconds=(
                         settings.dashboard_sync_interval_seconds
                     ),
                     status_not_found_threshold=settings.status_not_found_threshold,
                     status_not_found_recheck_seconds=(
                         settings.status_not_found_recheck_seconds
-                    ),
-                    completed_bulk_dashboard_scan_interval_seconds=(
-                        settings.completed_bulk_dashboard_scan_interval_seconds
-                    ),
-                    bulk_relocation_search_interval_seconds=(
-                        settings.bulk_relocation_search_interval_seconds
                     ),
                     dashboard_outbox_retry_base_seconds=(
                         settings.dashboard_outbox_retry_base_seconds

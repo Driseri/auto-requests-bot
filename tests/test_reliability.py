@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
@@ -20,7 +19,6 @@ from app.health import ExternalProbeError, check_health, write_heartbeat
 from app.maintenance import create_backup, restore_backup, verify_database
 from app.models import (
     AnswerType,
-    BulkBatchStatus,
     ChangeType,
     Direction,
     LlmResult,
@@ -504,30 +502,3 @@ def test_healthcheck_recovers_after_external_failure(tmp_path):
         google_probe=lambda *_: None,
         now=current + timedelta(seconds=301),
     ) == (True, "ok")
-
-
-@pytest.mark.asyncio
-async def test_completed_bulk_batches_are_excluded_from_active_polling(tmp_path):
-    repository = DraftRepository(str(tmp_path / "active_batches.db"))
-    await repository.init()
-    for batch_id in ("BATCH-AAAABBBB", "BATCH-CCCCDDDD"):
-        await repository.save_bulk_batch(
-            batch_id=batch_id,
-            telegram_user_id=100,
-            spreadsheet_id="spreadsheet",
-            direction=Direction.FL.value,
-            sheet_name="Массовый ввод",
-            sheet_id=1,
-            start_row=1,
-            data_start_row=3,
-            reserved_rows=10,
-        )
-    await repository.update_bulk_batch_status(
-        "BATCH-AAAABBBB",
-        batch_status=BulkBatchStatus.DONE.value,
-        last_known_batch_status=BulkBatchStatus.DONE.value,
-    )
-
-    active = await repository.list_active_bulk_batches()
-
-    assert [batch.batch_id for batch in active] == ["BATCH-CCCCDDDD"]

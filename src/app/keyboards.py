@@ -65,9 +65,6 @@ class CallbackData:
         return f"app:chip_after_action:{value}"
 
     @staticmethod
-    def bulk_ready(batch_id: str) -> str:
-        return f"app:bulk_ready:{batch_id}"
-
     @staticmethod
     def bulk_direction(idempotency_key: str, direction: str) -> str:
         return f"app:bulk_direction:{idempotency_key}:{direction}"
@@ -479,19 +476,6 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                     ]
                 ]
             )
-        case KeyboardKind.BULK_CREATED:
-            if not payload:
-                return build_keyboard(KeyboardKind.BULK_MENU)
-            return InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Заявка заполнена",
-                            callback_data=CallbackData.bulk_ready(payload),
-                        )
-                    ],
-                ]
-            )
         case KeyboardKind.DEFAULTS_MENU:
             return InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -557,7 +541,7 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                     ]
                 ]
             )
-        case KeyboardKind.NOTIFICATION_BULK_BACK:
+        case KeyboardKind.NOTIFICATION_BULK_RESERVATION_BACK:
             return InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -575,17 +559,6 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                         InlineKeyboardButton(
                             text="Назад к заведению заявки",
                             callback_data=CallbackData.NOTIFICATION_NEW,
-                        )
-                    ]
-                ]
-            )
-        case KeyboardKind.BULK_COMPLETED:
-            return InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Главное меню",
-                            callback_data=CallbackData.NEW,
                         )
                     ]
                 ]

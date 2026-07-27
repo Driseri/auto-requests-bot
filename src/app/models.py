@@ -116,25 +116,6 @@ class ChipAfterTextAction(StrEnum):
 
 class ApplicationType(StrEnum):
     SINGLE = "Одиночная"
-    BULK = "Массовая"
-
-
-class BulkBatchStatus(StrEnum):
-    NEW = "Новая пачка"
-    IN_PROGRESS = "В работе"
-    DONE = "Готова"
-
-
-class BulkApplicationStatus(StrEnum):
-    NEW = "Новая"
-    NEEDS_CLARIFICATION = "Нужны пояснения"
-    ACCEPTED = "Принято"
-
-
-class BulkRegistrationState(StrEnum):
-    DRAFT = "DRAFT"
-    REGISTERING = "REGISTERING"
-    REGISTERED = "REGISTERED"
 
 
 class BulkReservationState(StrEnum):
@@ -155,12 +136,6 @@ class BulkTargetKind(StrEnum):
     ROLLOUT = "rollout"
     URGENT = "urgent"
     INTEGRATION = "integration"
-
-
-class BulkBatchLocationState(StrEnum):
-    KNOWN = "KNOWN"
-    MISSING = "MISSING"
-    AMBIGUOUS = "AMBIGUOUS"
 
 
 class SubmissionState(StrEnum):
@@ -217,15 +192,13 @@ class KeyboardKind(StrEnum):
     BULK_TARGET = "bulk_target"
     BULK_CHANGE_TYPE = "bulk_change_type"
     BULK_COUNT_CONFIRM = "bulk_count_confirm"
-    BULK_CREATED = "bulk_created"
     BULK_RESERVATION_CREATED = "bulk_reservation_created"
     BULK_RESERVATION_COMPLETED = "bulk_reservation_completed"
     DEFAULTS_MENU = "defaults_menu"
     DEFAULTS_BACK = "defaults_back"
     NOTIFICATION = "notification"
-    NOTIFICATION_BULK_BACK = "notification_bulk_back"
+    NOTIFICATION_BULK_RESERVATION_BACK = "notification_bulk_reservation_back"
     NOTIFICATION_SINGLE_BACK = "notification_single_back"
-    BULK_COMPLETED = "bulk_completed"
     NONE = "none"
 
 
@@ -243,19 +216,11 @@ class DashboardOutboxState(StrEnum):
 
 class DashboardEntityType(StrEnum):
     APPLICATION = "APPLICATION"
-    BULK_BATCH = "BULK_BATCH"
 
 
 class StatusPollingState(StrEnum):
     ACTIVE = "ACTIVE"
     NOT_FOUND = "NOT_FOUND"
-
-
-class BulkCreationState(StrEnum):
-    AWAITING_DIRECTION = "AWAITING_DIRECTION"
-    BULK_CREATING = "BULK_CREATING"
-    CREATED = "CREATED"
-    FAILED = "FAILED"
 
 
 class FieldName(StrEnum):
@@ -304,10 +269,6 @@ def utc_now_iso() -> str:
 
 def generate_application_id(now: datetime | None = None) -> str:
     return token_hex(4).upper()
-
-
-def generate_batch_id(now: datetime | None = None) -> str:
-    return f"BATCH-{token_hex(4).upper()}"
 
 
 @dataclass(slots=True)
@@ -466,32 +427,6 @@ class ApplicationEvent:
     created_at: str
 
 
-@dataclass(slots=True)
-class BulkBatch:
-    batch_id: str
-    telegram_user_id: int
-    spreadsheet_id: str
-    direction: str
-    sheet_name: str
-    sheet_id: int
-    start_row: int
-    data_start_row: int
-    reserved_rows: int
-    data_end_row: int | None = None
-    registration_state: str = BulkRegistrationState.DRAFT.value
-    registration_started_at: str | None = None
-    registered_count: int = 0
-    status_schema_version: int = 2
-    batch_status: str = BulkBatchStatus.NEW.value
-    last_known_batch_status: str = BulkBatchStatus.NEW.value
-    last_seen_final_answers_digest_at: str | None = None
-    location_state: str = BulkBatchLocationState.KNOWN.value
-    location_miss_count: int = 0
-    last_location_search_at: str | None = None
-    next_location_search_at: str | None = None
-    last_location_error: str | None = None
-    created_at: str = ""
-    updated_at: str = ""
 
 
 @dataclass(slots=True)
@@ -528,18 +463,6 @@ class DashboardOutboxItem:
     updated_at: str = ""
 
 
-@dataclass(slots=True)
-class BulkCreationRequest:
-    idempotency_key: str
-    telegram_user_id: int
-    state: str
-    batch_id: str
-    direction: str | None = None
-    insert_url: str | None = None
-    last_error: str | None = None
-    started_at: str | None = None
-    created_at: str = ""
-    updated_at: str = ""
 
 
 @dataclass(slots=True)

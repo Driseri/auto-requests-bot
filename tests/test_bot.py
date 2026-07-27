@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 from types import SimpleNamespace
 
@@ -13,7 +12,6 @@ from app.bot import (
     CallbackQueryAckMiddleware,
     PrivateChatOnlyMiddleware,
     UserActionLockMiddleware,
-    _answer_bulk_registration,
     _show_callback_processing,
 )
 from app.models import BotResponse, KeyboardKind
@@ -503,101 +501,3 @@ async def test_notification_menu_opens_when_keyboard_removal_fails(tmp_path) -> 
     assert notification.edits == []
     assert notification.answers[0]["text"] == "Главное меню"
     assert settings.active_message_id == 31
-
-
-@pytest.mark.asyncio
-async def test_bulk_registration_result_becomes_active_message(tmp_path) -> None:
-    repository = DraftRepository(str(tmp_path / "bulk_result_active.db"))
-    await repository.init()
-    source = UiMessage(message_id=10, answer_message_id=20)
-    callback = FakeCallback(message=source)
-    manager = ActiveMessageManager(repository)
-
-    class Flow:
-        async def confirm_bulk_batch_filled(self, telegram_user_id, batch_id):
-            assert telegram_user_id == 100
-            assert batch_id == "BATCH-1234"
-            return BotResponse(
-                text="Массовая заявка зарегистрирована.",
-                keyboard=KeyboardKind.BULK_COMPLETED,
-            )
-
-    await _answer_bulk_registration(callback, Flow(), manager, "BATCH-1234")
-
-    progress = source.last_answer
-    assert progress is not None
-    settings = await repository.get_user_settings(100)
-    assert settings.active_message_id == 20
-    assert progress.edits[0]["reply_markup"] is not None
-
-    menu_callback = FakeCallback(message=progress, data="app:new")
-    handled = False
-
-    async def handler(event, data):
-        nonlocal handled
-        handled = True
-
-    await CallbackQueryAckMiddleware(repository)(handler, menu_callback, {})
-
-    assert handled
-    assert menu_callback.answer_texts == [None]
-
-
-@pytest.mark.asyncio
-async def test_bulk_registration_fallback_message_becomes_active(tmp_path) -> None:
-    repository = DraftRepository(str(tmp_path / "bulk_result_fallback.db"))
-    await repository.init()
-    source = UiMessage(message_id=10)
-    progress = UiMessage(message_id=20, edit_error=RuntimeError("edit failed"))
-    fallback = UiMessage(message_id=21)
-    answers = iter([progress, fallback])
-
-    async def answer(text, reply_markup=None, parse_mode=None):
-        return next(answers)
-
-    source.answer = answer
-    callback = FakeCallback(message=source)
-    manager = ActiveMessageManager(repository)
-
-    class Flow:
-        async def confirm_bulk_batch_filled(self, telegram_user_id, batch_id):
-            return BotResponse(
-                text="Повторите регистрацию.",
-                keyboard=KeyboardKind.BULK_CREATED,
-                keyboard_payload=batch_id,
-            )
-
-    await _answer_bulk_registration(callback, Flow(), manager, "BATCH-1234")
-
-    settings = await repository.get_user_settings(100)
-    assert settings.active_message_id == 21
-
-
-@pytest.mark.asyncio
-async def test_bulk_registration_disables_result_keyboard_if_tracking_fails(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    repository = DraftRepository(str(tmp_path / "bulk_result_tracking_failure.db"))
-    await repository.init()
-    source = UiMessage(message_id=10, answer_message_id=20)
-    callback = FakeCallback(message=source)
-    manager = ActiveMessageManager(repository)
-
-    async def fail_save(*args, **kwargs):
-        raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(repository, "set_active_message", fail_save)
-
-    class Flow:
-        async def confirm_bulk_batch_filled(self, telegram_user_id, batch_id):
-            return BotResponse(
-                text="Массовая заявка зарегистрирована.",
-                keyboard=KeyboardKind.BULK_COMPLETED,
-            )
-
-    await _answer_bulk_registration(callback, Flow(), manager, "BATCH-1234")
-
-    progress = source.last_answer
-    assert progress is not None
-    assert progress.markup_edits == [None]

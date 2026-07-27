@@ -10,12 +10,6 @@ import aiosqlite
 
 from app.models import (
     ApplicationEvent,
-    BulkCreationRequest,
-    BulkCreationState,
-    BulkBatch,
-    BulkBatchLocationState,
-    BulkBatchStatus,
-    BulkRegistrationState,
     BulkReservation,
     BulkReservationState,
     DashboardOutboxItem,
@@ -30,7 +24,6 @@ from app.models import (
     TEXT_FIELDS,
     UserSettings,
     generate_application_id,
-    generate_batch_id,
     utc_now_iso,
 )
 
@@ -366,73 +359,6 @@ class DraftRepository:
                 )
                 """
             )
-            await self._ensure_bulk_batches_column(db, "spreadsheet_id", "TEXT")
-            await self._ensure_bulk_batches_column(db, "direction", "TEXT")
-            await self._ensure_bulk_batches_column(db, "batch_status", "TEXT")
-            await self._ensure_bulk_batches_column(db, "last_known_batch_status", "TEXT")
-            await self._ensure_bulk_batches_column(db, "last_seen_final_answers_digest_at", "TEXT")
-            await self._ensure_bulk_batches_column(
-                db,
-                "location_state",
-                "TEXT NOT NULL DEFAULT 'KNOWN'",
-            )
-            await self._ensure_bulk_batches_column(
-                db,
-                "location_miss_count",
-                "INTEGER NOT NULL DEFAULT 0",
-            )
-            await self._ensure_bulk_batches_column(db, "last_location_search_at", "TEXT")
-            await self._ensure_bulk_batches_column(db, "next_location_search_at", "TEXT")
-            await self._ensure_bulk_batches_column(db, "last_location_error", "TEXT")
-            await self._ensure_bulk_batches_column(
-                db,
-                "status_schema_version",
-                "INTEGER NOT NULL DEFAULT 1",
-            )
-            await self._ensure_bulk_batches_column(db, "data_end_row", "INTEGER")
-            registration_state_added = await self._ensure_bulk_batches_column(
-                db,
-                "registration_state",
-                "TEXT NOT NULL DEFAULT 'DRAFT'",
-            )
-            await self._ensure_bulk_batches_column(db, "registration_started_at", "TEXT")
-            await self._ensure_bulk_batches_column(
-                db,
-                "registered_count",
-                "INTEGER NOT NULL DEFAULT 0",
-            )
-            await db.execute(
-                """
-                UPDATE bulk_batches
-                SET data_end_row = data_start_row + MAX(reserved_rows, 1) - 1
-                WHERE data_end_row IS NULL
-                """
-            )
-            if registration_state_added:
-                await db.execute(
-                    """
-                    UPDATE bulk_batches
-                    SET registration_state = 'REGISTERED',
-                        registered_count = (
-                            SELECT COUNT(*)
-                            FROM submitted_applications
-                            WHERE submitted_applications.batch_id = bulk_batches.batch_id
-                        ),
-                        data_end_row = COALESCE(
-                            (
-                                SELECT MAX(last_seen_row_number)
-                                FROM submitted_applications
-                                WHERE submitted_applications.batch_id = bulk_batches.batch_id
-                            ),
-                            data_end_row
-                        )
-                    WHERE EXISTS (
-                        SELECT 1
-                        FROM submitted_applications
-                        WHERE submitted_applications.batch_id = bulk_batches.batch_id
-                    )
-                    """
-                )
             await self._ensure_user_settings_column(db, "pending_action", "TEXT")
             await self._ensure_user_settings_column(db, "default_direction", "TEXT")
             await self._ensure_user_settings_column(db, "active_chat_id", "INTEGER")
@@ -457,12 +383,6 @@ class DraftRepository:
             )
             await db.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_bulk_batches_active
-                ON bulk_batches(registration_state, last_known_batch_status)
-                """
-            )
-            await db.execute(
-                """
                 CREATE INDEX IF NOT EXISTS idx_notification_outbox_delivery
                 ON notification_outbox(state, next_attempt_at, created_at)
                 """
@@ -471,12 +391,6 @@ class DraftRepository:
                 """
                 CREATE INDEX IF NOT EXISTS idx_notification_outbox_user
                 ON notification_outbox(telegram_user_id, created_at, chunk_index)
-                """
-            )
-            await db.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_bulk_creation_user
-                ON bulk_creation_requests(telegram_user_id, created_at)
                 """
             )
             await db.execute(
@@ -1567,458 +1481,17 @@ class DraftRepository:
             )
             await db.commit()
 
-    async def mark_bulk_batch_applications_not_found(
-        self,
-        batch_id: str,
-        *,
-        threshold: int,
-        recheck_seconds: int,
-    ) -> int:
-        """Count one confirmed missing-source check for every tracked row in a batch."""
-        now = datetime.now(timezone.utc)
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute(
-                "SELECT application_id, not_found_count FROM submitted_applications WHERE batch_id = ?",
-                (batch_id,),
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            for row in rows:
-                count = int(row["not_found_count"] or 0) + 1
-                next_check_at = (
-                    (now + timedelta(seconds=recheck_seconds)).isoformat()
-                    if count >= threshold
-                    else None
-                )
-                await db.execute(
-                    """
-                    UPDATE submitted_applications
-                    SET polling_state = ?, not_found_count = ?,
-                        last_not_found_at = ?, next_status_check_at = ?, updated_at = ?
-                    WHERE application_id = ?
-                    """,
-                    (
-                        (
-                            StatusPollingState.NOT_FOUND.value
-                            if count >= threshold
-                            else StatusPollingState.ACTIVE.value
-                        ),
-                        count,
-                        now.isoformat(),
-                        next_check_at,
-                        now.isoformat(),
-                        row["application_id"],
-                    ),
-                )
-            await db.commit()
-        return len(rows)
 
-    async def save_bulk_batch(
-        self,
-        *,
-        batch_id: str | None = None,
-        telegram_user_id: int,
-        sheet_name: str,
-        sheet_id: int,
-        start_row: int,
-        data_start_row: int,
-        reserved_rows: int,
-        data_end_row: int | None = None,
-        spreadsheet_id: str = "",
-        direction: str = "",
-        batch_status: str | None = None,
-        status_schema_version: int = 2,
-        created_at: str | None = None,
-    ) -> BulkBatch:
-        batch_id = batch_id or generate_batch_id()
-        now = created_at or utc_now_iso()
-        async with self._connection() as db:
-            await db.execute(
-                """
-                INSERT INTO bulk_batches (
-                    batch_id, telegram_user_id, spreadsheet_id, direction, sheet_name, sheet_id,
-                    start_row, data_start_row, reserved_rows, data_end_row, batch_status,
-                    last_known_batch_status, status_schema_version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(batch_id) DO UPDATE SET
-                    telegram_user_id = excluded.telegram_user_id,
-                    spreadsheet_id = excluded.spreadsheet_id,
-                    direction = excluded.direction,
-                    sheet_name = excluded.sheet_name,
-                    sheet_id = excluded.sheet_id,
-                    start_row = excluded.start_row,
-                    data_start_row = excluded.data_start_row,
-                    reserved_rows = excluded.reserved_rows,
-                    data_end_row = excluded.data_end_row,
-                    batch_status = excluded.batch_status,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    batch_id,
-                    telegram_user_id,
-                    spreadsheet_id,
-                    direction,
-                    sheet_name,
-                    sheet_id,
-                    start_row,
-                    data_start_row,
-                    reserved_rows,
-                    data_end_row or data_start_row + max(reserved_rows, 1) - 1,
-                    batch_status or "Новая пачка",
-                    batch_status or "Новая пачка",
-                    status_schema_version,
-                    now,
-                    now,
-                ),
-            )
-            await db.commit()
-        batch = await self.get_bulk_batch(batch_id)
-        if batch is None:
-            raise LookupError(f"Bulk batch not found: {batch_id}")
-        return batch
 
-    async def get_bulk_batch(self, batch_id: str) -> BulkBatch | None:
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM bulk_batches WHERE batch_id = ?",
-                (batch_id,),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-        return self._bulk_batch_from_row(row) if row is not None else None
 
-    async def list_bulk_batches(self) -> list[BulkBatch]:
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM bulk_batches ORDER BY created_at ASC")
-            rows = await cursor.fetchall()
-            await cursor.close()
-        return [self._bulk_batch_from_row(row) for row in rows]
 
-    async def get_latest_unregistered_bulk_batch(
-        self,
-        telegram_user_id: int,
-    ) -> BulkBatch | None:
-        """Вернуть последнюю пачку пользователя, которую еще можно зарегистрировать."""
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                """
-                SELECT *
-                FROM bulk_batches
-                WHERE telegram_user_id = ?
-                  AND registration_state != ?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (
-                    telegram_user_id,
-                    BulkRegistrationState.REGISTERED.value,
-                ),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-        return self._bulk_batch_from_row(row) if row is not None else None
 
-    async def list_active_bulk_batches(self) -> list[BulkBatch]:
-        """Вернуть пачки, которые еще требуется проверять в частом polling."""
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                """
-                SELECT *
-                FROM bulk_batches
-                WHERE COALESCE(last_known_batch_status, '') != ?
-                ORDER BY created_at ASC
-                """,
-                (BulkBatchStatus.DONE.value,),
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-        return [self._bulk_batch_from_row(row) for row in rows]
 
-    async def update_bulk_batch_status(
-        self,
-        batch_id: str,
-        *,
-        batch_status: str,
-        last_known_batch_status: str,
-        dashboard_projection: dict[str, Any] | None = None,
-    ) -> None:
-        async with self._connection() as db:
-            now = utc_now_iso()
-            await db.execute("BEGIN IMMEDIATE")
-            await db.execute(
-                """
-                UPDATE bulk_batches
-                SET batch_status = ?,
-                    last_known_batch_status = ?,
-                    updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (
-                    batch_status,
-                    last_known_batch_status,
-                    now,
-                    batch_id,
-                ),
-            )
-            if dashboard_projection is not None:
-                await self._upsert_dashboard_projection_in_connection(
-                    db,
-                    entity_type="BULK_BATCH",
-                    entity_id=batch_id,
-                    snapshot=dashboard_projection,
-                    now=now,
-                )
-            await db.commit()
 
-    async def restore_bulk_batch_location(
-        self,
-        batch_id: str,
-        *,
-        spreadsheet_id: str,
-        sheet_name: str,
-        sheet_id: int,
-        start_row: int,
-    ) -> BulkBatch | None:
-        """Atomically move a batch and all tracked child rows to verified coordinates."""
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute(
-                "SELECT * FROM bulk_batches WHERE batch_id = ?",
-                (batch_id,),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            if row is None:
-                await db.rollback()
-                return None
 
-            old_start_row = int(row["start_row"])
-            row_delta = start_row - old_start_row
-            data_start_row = start_row + 2
-            old_data_end_row = row["data_end_row"]
-            data_end_row = (
-                int(old_data_end_row) + row_delta
-                if old_data_end_row is not None
-                else None
-            )
-            now = utc_now_iso()
-            await db.execute(
-                """
-                UPDATE bulk_batches
-                SET spreadsheet_id = ?, sheet_name = ?, sheet_id = ?,
-                    start_row = ?, data_start_row = ?, data_end_row = ?,
-                    location_state = ?, location_miss_count = 0,
-                    last_location_search_at = ?, next_location_search_at = NULL,
-                    last_location_error = NULL, updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (
-                    spreadsheet_id,
-                    sheet_name,
-                    sheet_id,
-                    start_row,
-                    data_start_row,
-                    data_end_row,
-                    BulkBatchLocationState.KNOWN.value,
-                    now,
-                    now,
-                    batch_id,
-                ),
-            )
-            await db.execute(
-                """
-                UPDATE submitted_applications
-                SET spreadsheet_id = ?, sheet_name = ?, sheet_id = ?,
-                    last_seen_row_number = CASE
-                        WHEN last_seen_row_number IS NULL THEN NULL
-                        ELSE last_seen_row_number + ?
-                    END,
-                    polling_state = ?, not_found_count = 0,
-                    last_not_found_at = NULL, next_status_check_at = NULL,
-                    updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (
-                    spreadsheet_id,
-                    sheet_name,
-                    sheet_id,
-                    row_delta,
-                    StatusPollingState.ACTIVE.value,
-                    now,
-                    batch_id,
-                ),
-            )
-            insert_url = (
-                f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
-                f"#gid={sheet_id}&range=A{data_start_row}:G{data_start_row}"
-            )
-            await db.execute(
-                """
-                UPDATE bulk_creation_requests
-                SET insert_url = ?, updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (insert_url, now, batch_id),
-            )
-            await db.commit()
-        return await self.get_bulk_batch(batch_id)
 
-    async def record_bulk_batch_location_problem(
-        self,
-        batch_id: str,
-        *,
-        state: str,
-        error: str,
-        recheck_seconds: int,
-    ) -> None:
-        now = datetime.now(timezone.utc)
-        next_check = now + timedelta(seconds=recheck_seconds)
-        async with self._connection() as db:
-            await db.execute(
-                """
-                UPDATE bulk_batches
-                SET location_state = ?,
-                    location_miss_count = location_miss_count + CASE WHEN ? = ? THEN 1 ELSE 0 END,
-                    last_location_search_at = ?, next_location_search_at = ?,
-                    last_location_error = ?, updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (
-                    state,
-                    state,
-                    BulkBatchLocationState.MISSING.value,
-                    now.isoformat(),
-                    next_check.isoformat(),
-                    error[:500],
-                    now.isoformat(),
-                    batch_id,
-                ),
-            )
-            await db.commit()
 
-    async def update_bulk_batch_reserved_rows(
-        self,
-        batch_id: str,
-        *,
-        reserved_rows: int,
-    ) -> None:
-        async with self._connection() as db:
-            await db.execute(
-                """
-                UPDATE bulk_batches
-                SET reserved_rows = ?,
-                    updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (
-                    reserved_rows,
-                    utc_now_iso(),
-                    batch_id,
-                ),
-            )
-            await db.commit()
 
-    async def claim_bulk_batch_registration(
-        self,
-        batch_id: str,
-        *,
-        stale_after_seconds: int,
-    ) -> str:
-        """Атомарно захватить пачку для регистрации или восстановить stale-захват."""
-        now = datetime.now(timezone.utc)
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute(
-                """
-                SELECT registration_state, registration_started_at
-                FROM bulk_batches
-                WHERE batch_id = ?
-                """,
-                (batch_id,),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            if row is None:
-                await db.rollback()
-                return "NOT_FOUND"
-
-            state = row["registration_state"] or BulkRegistrationState.DRAFT.value
-            if state == BulkRegistrationState.REGISTERED.value:
-                await db.commit()
-                return BulkRegistrationState.REGISTERED.value
-            if state == BulkRegistrationState.REGISTERING.value:
-                started_at = _parse_iso_datetime(row["registration_started_at"])
-                if started_at is not None and now - started_at < timedelta(
-                    seconds=stale_after_seconds
-                ):
-                    await db.commit()
-                    return BulkRegistrationState.REGISTERING.value
-
-            await db.execute(
-                """
-                UPDATE bulk_batches
-                SET registration_state = ?,
-                    registration_started_at = ?,
-                    updated_at = ?
-                WHERE batch_id = ?
-                """,
-                (
-                    BulkRegistrationState.REGISTERING.value,
-                    now.isoformat(),
-                    now.isoformat(),
-                    batch_id,
-                ),
-            )
-            await db.commit()
-        return "ACQUIRED"
-
-    async def complete_bulk_batch_registration(
-        self,
-        batch_id: str,
-        *,
-        registered_count: int,
-        data_end_row: int,
-        dashboard_projection: dict[str, Any] | None = None,
-    ) -> None:
-        """Зафиксировать фактическую границу и успешный результат регистрации пачки."""
-        async with self._connection() as db:
-            await db.execute(
-                """
-                UPDATE bulk_batches
-                SET registration_state = ?,
-                    registration_started_at = NULL,
-                    registered_count = ?,
-                    data_end_row = ?,
-                    updated_at = ?
-                WHERE batch_id = ?
-                  AND registration_state = ?
-                """,
-                (
-                    BulkRegistrationState.REGISTERED.value,
-                    registered_count,
-                    data_end_row,
-                    utc_now_iso(),
-                    batch_id,
-                    BulkRegistrationState.REGISTERING.value,
-                ),
-            )
-            if dashboard_projection is not None:
-                await self._upsert_dashboard_projection_in_connection(
-                    db,
-                    entity_type="BULK_BATCH",
-                    entity_id=batch_id,
-                    snapshot=dashboard_projection,
-                    now=utc_now_iso(),
-                )
-            await db.commit()
 
     async def upsert_dashboard_projection(
         self,
@@ -2167,41 +1640,7 @@ class DraftRepository:
             await cursor.close()
         return [self._dashboard_outbox_from_row(row) for row in rows]
 
-    async def list_completed_bulk_batches(self) -> list[BulkBatch]:
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                """
-                SELECT *
-                FROM bulk_batches
-                WHERE COALESCE(last_known_batch_status, '') = ?
-                ORDER BY created_at ASC
-                """,
-                (BulkBatchStatus.DONE.value,),
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-        return [self._bulk_batch_from_row(row) for row in rows]
 
-    async def release_bulk_batch_registration(self, batch_id: str) -> None:
-        async with self._connection() as db:
-            await db.execute(
-                """
-                UPDATE bulk_batches
-                SET registration_state = ?,
-                    registration_started_at = NULL,
-                    updated_at = ?
-                WHERE batch_id = ?
-                  AND registration_state = ?
-                """,
-                (
-                    BulkRegistrationState.DRAFT.value,
-                    utc_now_iso(),
-                    batch_id,
-                    BulkRegistrationState.REGISTERING.value,
-                ),
-            )
-            await db.commit()
 
     async def enqueue_notification_event(
         self,
@@ -2212,7 +1651,6 @@ class DraftRepository:
         snapshot_json: str,
         chunks: list[str],
         application_updates: list[dict[str, Any]] | None = None,
-        batch_updates: list[dict[str, Any]] | None = None,
         dashboard_projections: list[dict[str, Any]] | None = None,
         application_events: list[dict[str, Any]] | None = None,
     ) -> bool:
@@ -2240,20 +1678,6 @@ class DraftRepository:
                     db,
                     **event,
                     created_at=now,
-                )
-            for update in batch_updates or []:
-                await db.execute(
-                    """
-                    UPDATE bulk_batches
-                    SET batch_status = ?, last_known_batch_status = ?, updated_at = ?
-                    WHERE batch_id = ?
-                    """,
-                    (
-                        update["status"],
-                        update["status"],
-                        now,
-                        update["batch_id"],
-                    ),
                 )
             for projection in dashboard_projections or []:
                 await self._upsert_dashboard_projection_in_connection(
@@ -2491,138 +1915,10 @@ class DraftRepository:
             await cursor.close()
         return [self._notification_outbox_from_row(row) for row in rows]
 
-    async def create_bulk_creation_request(
-        self,
-        *,
-        idempotency_key: str,
-        telegram_user_id: int,
-        batch_id: str,
-    ) -> BulkCreationRequest:
-        now = utc_now_iso()
-        async with self._connection() as db:
-            await db.execute(
-                """
-                INSERT OR IGNORE INTO bulk_creation_requests (
-                    idempotency_key, telegram_user_id, state, batch_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    idempotency_key,
-                    telegram_user_id,
-                    BulkCreationState.AWAITING_DIRECTION.value,
-                    batch_id,
-                    now,
-                    now,
-                ),
-            )
-            await db.commit()
-        request = await self.get_bulk_creation_request(idempotency_key)
-        if request is None:
-            raise LookupError(f"Bulk creation request not found: {idempotency_key}")
-        return request
 
-    async def get_bulk_creation_request(
-        self,
-        idempotency_key: str,
-    ) -> BulkCreationRequest | None:
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM bulk_creation_requests WHERE idempotency_key = ?",
-                (idempotency_key,),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-        return self._bulk_creation_from_row(row) if row is not None else None
 
-    async def claim_bulk_creation(
-        self,
-        idempotency_key: str,
-        *,
-        direction: str,
-        stale_after_seconds: int,
-    ) -> BulkCreationRequest | None:
-        now = datetime.now(timezone.utc)
-        async with self._connection() as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("BEGIN IMMEDIATE")
-            cursor = await db.execute(
-                "SELECT * FROM bulk_creation_requests WHERE idempotency_key = ?",
-                (idempotency_key,),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            if row is None:
-                await db.rollback()
-                return None
-            state = row["state"]
-            started_at = _parse_iso_datetime(row["started_at"])
-            if state == BulkCreationState.BULK_CREATING.value and (
-                started_at is None
-                or now - started_at < timedelta(seconds=stale_after_seconds)
-            ):
-                await db.commit()
-                return self._bulk_creation_from_row(row)
-            if state == BulkCreationState.CREATED.value:
-                await db.commit()
-                return self._bulk_creation_from_row(row)
-            await db.execute(
-                """
-                UPDATE bulk_creation_requests
-                SET direction = ?, state = ?, started_at = ?, last_error = NULL, updated_at = ?
-                WHERE idempotency_key = ?
-                """,
-                (
-                    direction,
-                    BulkCreationState.BULK_CREATING.value,
-                    now.isoformat(),
-                    now.isoformat(),
-                    idempotency_key,
-                ),
-            )
-            await db.commit()
-        return await self.get_bulk_creation_request(idempotency_key)
 
-    async def complete_bulk_creation(
-        self,
-        idempotency_key: str,
-        *,
-        insert_url: str,
-    ) -> None:
-        async with self._connection() as db:
-            await db.execute(
-                """
-                UPDATE bulk_creation_requests
-                SET state = ?, insert_url = ?, started_at = NULL,
-                    last_error = NULL, updated_at = ?
-                WHERE idempotency_key = ?
-                """,
-                (
-                    BulkCreationState.CREATED.value,
-                    insert_url,
-                    utc_now_iso(),
-                    idempotency_key,
-                ),
-            )
-            await db.commit()
 
-    async def fail_bulk_creation(self, idempotency_key: str, *, error: str) -> None:
-        async with self._connection() as db:
-            await db.execute(
-                """
-                UPDATE bulk_creation_requests
-                SET state = ?, started_at = NULL, last_error = ?, updated_at = ?
-                WHERE idempotency_key = ?
-                """,
-                (
-                    BulkCreationState.FAILED.value,
-                    error[:1000],
-                    utc_now_iso(),
-                    idempotency_key,
-                ),
-            )
-            await db.commit()
 
     async def create_bulk_reservation(
         self,
@@ -3619,36 +2915,6 @@ class DraftRepository:
             created_at=row["created_at"],
         )
 
-    @staticmethod
-    def _bulk_batch_from_row(row: aiosqlite.Row) -> BulkBatch:
-        return BulkBatch(
-            batch_id=row["batch_id"],
-            telegram_user_id=row["telegram_user_id"],
-            spreadsheet_id=row["spreadsheet_id"] or "",
-            direction=row["direction"] or "",
-            sheet_name=row["sheet_name"],
-            sheet_id=row["sheet_id"],
-            start_row=row["start_row"],
-            data_start_row=row["data_start_row"],
-            reserved_rows=row["reserved_rows"],
-            data_end_row=row["data_end_row"],
-            registration_state=(
-                row["registration_state"] or BulkRegistrationState.DRAFT.value
-            ),
-            registration_started_at=row["registration_started_at"],
-            registered_count=row["registered_count"] or 0,
-            status_schema_version=row["status_schema_version"] or 1,
-            batch_status=row["batch_status"] or "Новая пачка",
-            last_known_batch_status=row["last_known_batch_status"] or "Новая пачка",
-            last_seen_final_answers_digest_at=row["last_seen_final_answers_digest_at"],
-            location_state=row["location_state"] or BulkBatchLocationState.KNOWN.value,
-            location_miss_count=row["location_miss_count"] or 0,
-            last_location_search_at=row["last_location_search_at"],
-            next_location_search_at=row["next_location_search_at"],
-            last_location_error=row["last_location_error"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
 
     @staticmethod
     def _notification_outbox_from_row(row: aiosqlite.Row) -> NotificationOutboxItem:
@@ -3686,20 +2952,6 @@ class DraftRepository:
             updated_at=row["updated_at"],
         )
 
-    @staticmethod
-    def _bulk_creation_from_row(row: aiosqlite.Row) -> BulkCreationRequest:
-        return BulkCreationRequest(
-            idempotency_key=row["idempotency_key"],
-            telegram_user_id=row["telegram_user_id"],
-            state=row["state"],
-            batch_id=row["batch_id"],
-            direction=row["direction"],
-            insert_url=row["insert_url"],
-            last_error=row["last_error"],
-            started_at=row["started_at"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
 
     @staticmethod
     def _bulk_reservation_from_row(row: aiosqlite.Row) -> BulkReservation:
@@ -3876,20 +3128,6 @@ class DraftRepository:
         if name not in existing_columns:
             await db.execute(f"ALTER TABLE submitted_applications ADD COLUMN {name} {definition}")
 
-    @staticmethod
-    async def _ensure_bulk_batches_column(
-        db: aiosqlite.Connection,
-        name: str,
-        definition: str,
-    ) -> bool:
-        cursor = await db.execute("PRAGMA table_info(bulk_batches)")
-        rows = await cursor.fetchall()
-        await cursor.close()
-        existing_columns = {row[1] for row in rows}
-        if name not in existing_columns:
-            await db.execute(f"ALTER TABLE bulk_batches ADD COLUMN {name} {definition}")
-            return True
-        return False
 
 
 def _parse_iso_datetime(value: str | None) -> datetime | None:

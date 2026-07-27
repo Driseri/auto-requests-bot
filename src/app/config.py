@@ -30,7 +30,6 @@ class Settings:
     google_sheet_name: str
     google_high_priority_sheet_name: str
     google_low_priority_sheet_name: str
-    google_bulk_sheet_name: str
     google_credentials_path: str
     gigachat_credentials: str
     gigachat_base_url: str
@@ -51,12 +50,9 @@ class Settings:
     status_not_found_threshold: int
     status_not_found_recheck_seconds: int
     dashboard_sync_interval_seconds: float
-    completed_bulk_dashboard_scan_interval_seconds: float
-    bulk_relocation_search_interval_seconds: int
     dashboard_outbox_retry_base_seconds: int
     dashboard_outbox_retry_max_seconds: int
     dashboard_outbox_sending_stale_seconds: int
-    bulk_reserved_rows: int
     bulk_max_rows: int
     bulk_registration_stale_seconds: int
     bulk_creation_stale_seconds: int
@@ -97,16 +93,6 @@ def load_settings() -> Settings:
     dashboard_sync_interval_seconds = float(
         os.getenv("DASHBOARD_SYNC_INTERVAL_SECONDS", "300").strip() or "300"
     )
-    completed_bulk_dashboard_scan_interval_seconds = float(
-        os.getenv(
-            "COMPLETED_BULK_DASHBOARD_SCAN_INTERVAL_SECONDS",
-            "3600",
-        ).strip()
-        or "3600"
-    )
-    bulk_relocation_search_interval_seconds = int(
-        os.getenv("BULK_RELOCATION_SEARCH_INTERVAL_SECONDS", "3600").strip() or "3600"
-    )
     dashboard_outbox_retry_base_seconds = int(
         os.getenv("DASHBOARD_OUTBOX_RETRY_BASE_SECONDS", "60").strip() or "60"
     )
@@ -126,13 +112,6 @@ def load_settings() -> Settings:
         raise ValueError("STATUS_NOT_FOUND_RECHECK_SECONDS must be greater than 0")
     if dashboard_sync_interval_seconds <= 0:
         raise ValueError("DASHBOARD_SYNC_INTERVAL_SECONDS must be greater than 0")
-    if completed_bulk_dashboard_scan_interval_seconds <= 0:
-        raise ValueError(
-            "COMPLETED_BULK_DASHBOARD_SCAN_INTERVAL_SECONDS must be greater than 0"
-        )
-    if bulk_relocation_search_interval_seconds <= 0:
-        raise ValueError("BULK_RELOCATION_SEARCH_INTERVAL_SECONDS must be greater than 0")
-    bulk_reserved_rows = int(os.getenv("BULK_RESERVED_ROWS", "100").strip() or "100")
     bulk_max_rows = int(os.getenv("BULK_MAX_ROWS", "50").strip() or "50")
     bulk_registration_stale_seconds = int(
         os.getenv("BULK_REGISTRATION_STALE_SECONDS", "600").strip() or "600"
@@ -181,8 +160,6 @@ def load_settings() -> Settings:
             "EDITOR_URGENT_CHAT_ID must be set when "
             "URGENT_EDITOR_NOTIFICATIONS_ENABLED=true"
         )
-    if bulk_reserved_rows <= 0:
-        raise ValueError("BULK_RESERVED_ROWS must be greater than 0")
     if bulk_max_rows <= 0:
         raise ValueError("BULK_MAX_ROWS must be greater than 0")
     positive_values = {
@@ -231,11 +208,6 @@ def load_settings() -> Settings:
             "Низкий",
         ).strip()
         or "Низкий",
-        google_bulk_sheet_name=os.getenv(
-            "GOOGLE_BULK_SHEET_NAME",
-            "Массовые",
-        ).strip()
-        or "Массовые",
         google_credentials_path=os.getenv(
             "GOOGLE_CREDENTIALS_PATH",
             default_credentials_path,
@@ -279,14 +251,9 @@ def load_settings() -> Settings:
         status_not_found_threshold=status_not_found_threshold,
         status_not_found_recheck_seconds=status_not_found_recheck_seconds,
         dashboard_sync_interval_seconds=dashboard_sync_interval_seconds,
-        completed_bulk_dashboard_scan_interval_seconds=(
-            completed_bulk_dashboard_scan_interval_seconds
-        ),
-        bulk_relocation_search_interval_seconds=bulk_relocation_search_interval_seconds,
         dashboard_outbox_retry_base_seconds=dashboard_outbox_retry_base_seconds,
         dashboard_outbox_retry_max_seconds=dashboard_outbox_retry_max_seconds,
         dashboard_outbox_sending_stale_seconds=dashboard_outbox_sending_stale_seconds,
-        bulk_reserved_rows=bulk_reserved_rows,
         bulk_max_rows=bulk_max_rows,
         bulk_registration_stale_seconds=bulk_registration_stale_seconds,
         bulk_creation_stale_seconds=bulk_creation_stale_seconds,
