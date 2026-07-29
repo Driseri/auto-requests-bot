@@ -46,6 +46,7 @@ async def main() -> None:
         "gigachat_verify_ssl=%s gigachat_ca_bundle_configured=%s "
         "gigachat_timeout=%s gigachat_max_retries=%s "
         "gigachat_retry_backoff_factor=%s gigachat_show_response_json=%s "
+        "gigachat_log_full_request=%s "
         "status_polling_enabled=%s status_polling_interval_seconds=%s "
         "dashboard_sync_interval_seconds=%s "
         "bulk_max_rows=%s bulk_registration_stale_seconds=%s "
@@ -72,6 +73,7 @@ async def main() -> None:
         settings.gigachat_max_retries,
         settings.gigachat_retry_backoff_factor,
         settings.gigachat_show_response_json,
+        settings.gigachat_log_full_request,
         settings.status_polling_enabled,
         settings.status_polling_interval_seconds,
         settings.dashboard_sync_interval_seconds,
@@ -148,6 +150,7 @@ async def main() -> None:
             retry_backoff_factor=settings.gigachat_retry_backoff_factor,
             system_prompt_path=settings.gigachat_system_prompt_path,
             user_prompt_path=settings.gigachat_user_prompt_path,
+            log_full_request=settings.gigachat_log_full_request,
         ),
         show_llm_response_json=settings.gigachat_show_response_json,
         submission_service=submission_service,

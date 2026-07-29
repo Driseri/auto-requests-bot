@@ -51,6 +51,22 @@ docker compose -f docker-compose.local.yml up --build
 docker compose -f docker-compose.local.yml down
 ```
 
+### Полный лог запроса GigaChat
+
+Для локальной проверки можно временно включить в `.env.local`:
+
+```env
+GIGACHAT_LOG_FULL_REQUEST=true
+```
+
+После перезапуска контейнера перед вызовом GigaChat в логах появятся полностью
+отрендеренные `SYSTEM` и `USER` prompts. Лог содержит данные заявки, поэтому
+режим нельзя включать в production и нужно выключить после диагностики:
+
+```env
+GIGACHAT_LOG_FULL_REQUEST=false
+```
+
 ## Production-запуск
 
 Production compose-файл использует заранее собранный образ:

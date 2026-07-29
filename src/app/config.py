@@ -44,6 +44,7 @@ class Settings:
     gigachat_system_prompt_path: str
     gigachat_user_prompt_path: str
     gigachat_show_response_json: bool
+    gigachat_log_full_request: bool
     status_polling_enabled: bool
     status_polling_interval_seconds: float
     status_polling_memory_log_interval: int
@@ -245,6 +246,7 @@ def load_settings() -> Settings:
         ).strip()
         or "prompts/gigachat_user_v3.md",
         gigachat_show_response_json=_env_bool("GIGACHAT_SHOW_RESPONSE_JSON", default=False),
+        gigachat_log_full_request=_env_bool("GIGACHAT_LOG_FULL_REQUEST", default=False),
         status_polling_enabled=_env_bool("STATUS_POLLING_ENABLED", default=True),
         status_polling_interval_seconds=status_polling_interval_seconds,
         status_polling_memory_log_interval=status_polling_memory_log_interval,

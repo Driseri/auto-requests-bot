@@ -294,6 +294,63 @@ async def test_gigachat_client_maps_structured_response(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_full_request_log_is_disabled_by_default(tmp_path, caplog):
+    system_prompt, user_prompt = write_prompts(tmp_path)
+    llm_client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(
+            raw_response=(
+                '{"is_complete": true, "blocking_problem": null, '
+                '"clarification_instruction": null}'
+            )
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="app.llm"):
+        await llm_client.check_change_description(make_context())
+
+    assert "FULL GigaChat request" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_full_request_log_contains_rendered_system_and_user_prompts(
+    tmp_path,
+    caplog,
+):
+    system_prompt, user_prompt = write_prompts(tmp_path)
+    llm_client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        log_full_request=True,
+        gigachat_client=FakeGigaChatClient(
+            raw_response=(
+                '{"is_complete": true, "blocking_problem": null, '
+                '"clarification_instruction": null}'
+            )
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="app.llm"):
+        await llm_client.check_change_description(
+            make_context(
+                intent="Тестовый интент",
+                reason="Тестовый кейс",
+                raw_change_description="Тестовая суть",
+            )
+        )
+
+    assert "FULL GigaChat request" in caplog.text
+    assert "----- SYSTEM PROMPT -----\nSystem prompt" in caplog.text
+    assert "intent=Тестовый интент" in caplog.text
+    assert "reason=Тестовый кейс" in caplog.text
+    assert "raw=Тестовая суть" in caplog.text
+    assert "----- END GIGACHAT REQUEST -----" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_gigachat_client_returns_fallback_on_exception(tmp_path):
     system_prompt, user_prompt = write_prompts(tmp_path)
     llm_client = LlmClient(

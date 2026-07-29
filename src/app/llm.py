@@ -232,6 +232,7 @@ class LlmClient:
         retry_backoff_factor: float = 1.0,
         system_prompt_path: str = DEFAULT_SYSTEM_PROMPT_PATH,
         user_prompt_path: str = DEFAULT_USER_PROMPT_PATH,
+        log_full_request: bool = False,
         gigachat_client: Any | None = None,
     ) -> None:
         self.credentials = credentials
@@ -244,6 +245,7 @@ class LlmClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_backoff_factor = retry_backoff_factor
+        self.log_full_request = log_full_request
         self.prompt_renderer = PromptRenderer(system_prompt_path, user_prompt_path)
         self.response_schema: type[LlmResultSchema] = (
             LlmV2ResultSchema
@@ -295,6 +297,7 @@ class LlmClient:
             len(system_prompt),
             len(user_prompt),
         )
+        self._log_full_request(system_prompt, user_prompt)
         last_error: BaseException | None = None
         for attempt in range(1, GIGACHAT_JSON_RETRY_ATTEMPTS + 1):
             try:
@@ -503,6 +506,7 @@ class LlmClient:
                 len(system_prompt),
                 len(user_prompt),
             )
+            self._log_full_request(system_prompt, user_prompt)
             client = self._get_client()
             completion = await client.achat(
                 _build_structured_chat(
@@ -552,6 +556,22 @@ class LlmClient:
                 _exception_chain(exc),
             )
             return _fallback_result(context, f"{LLM_ERROR_PREFIX} {_exception_chain(exc) or exc}")
+
+    def _log_full_request(self, system_prompt: str, user_prompt: str) -> None:
+        if not self.log_full_request:
+            return
+        logger.info(
+            "FULL GigaChat request (local diagnostics; contains user data): "
+            "model=%s system_path=%s user_path=%s\n"
+            "----- SYSTEM PROMPT -----\n%s\n"
+            "----- USER PROMPT -----\n%s\n"
+            "----- END GIGACHAT REQUEST -----",
+            self.model,
+            self.prompt_renderer.system_prompt_path,
+            self.prompt_renderer.user_prompt_path,
+            system_prompt,
+            user_prompt,
+        )
 
     def _get_client(self) -> Any:
         if self._client is None:

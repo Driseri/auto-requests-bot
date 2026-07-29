@@ -39,11 +39,21 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
 def test_load_settings_uses_v3_gigachat_prompt_by_default(monkeypatch):
     monkeypatch.delenv("GIGACHAT_SYSTEM_PROMPT_PATH", raising=False)
     monkeypatch.delenv("GIGACHAT_USER_PROMPT_PATH", raising=False)
+    monkeypatch.delenv("GIGACHAT_LOG_FULL_REQUEST", raising=False)
 
     settings = load_settings()
 
     assert settings.gigachat_system_prompt_path == "prompts/gigachat_system_v3.md"
     assert settings.gigachat_user_prompt_path == "prompts/gigachat_user_v3.md"
+    assert settings.gigachat_log_full_request is False
+
+
+def test_load_settings_can_enable_full_gigachat_request_log(monkeypatch):
+    monkeypatch.setenv("GIGACHAT_LOG_FULL_REQUEST", "true")
+
+    settings = load_settings()
+
+    assert settings.gigachat_log_full_request is True
 
 
 def test_load_settings_uses_custom_dashboard_sync_interval(monkeypatch):
