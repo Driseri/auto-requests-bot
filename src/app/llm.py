@@ -23,8 +23,9 @@ from app.models import (
 )
 
 
-DEFAULT_SYSTEM_PROMPT_PATH = "prompts/gigachat_system_v5_recommendation.md"
-DEFAULT_USER_PROMPT_PATH = "prompts/gigachat_user_v5_recommendation.md"
+DEFAULT_SYSTEM_PROMPT_PATH = "prompts/gigachat_system_v6.2_recommendation.md"
+DEFAULT_USER_PROMPT_PATH = "prompts/gigachat_user_v6.1_recommendation.md"
+APPLICATION_DATA_JSON_PLACEHOLDER = "{{APPLICATION_DATA_JSON}}"
 GIGACHAT_JSON_RETRY_ATTEMPTS = 2
 GIGACHAT_JSON_RETRY_DELAY_SECONDS = 1.0
 GIGACHAT_RESPONSE_PREVIEW_CHARS = 300
@@ -93,11 +94,19 @@ class LlmResultSchema(BaseModel):
         return self
 
 
+V5GapCode = Literal[
+    "missing_new_entity_content",
+    "missing_change_content",
+    "missing_application_context",
+    "missing_change_rationale",
+]
+
+
 class LlmRecommendationResultSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     check_result: Literal["ok", "recommendation"]
-    gap_code: LlmGapCode | None = None
+    gap_code: V5GapCode | None = None
     recommendation: str | None = None
 
     @model_validator(mode="after")
@@ -110,6 +119,26 @@ class LlmRecommendationResultSchema(BaseModel):
             raise ValueError("recommendation result must contain gap_code")
         if not (self.recommendation or "").strip():
             raise ValueError("recommendation result must contain recommendation")
+        return self
+
+
+class LlmV61RecommendationResultSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    check_result: Literal["ok", "recommendation"]
+    gap_code: LlmGapCode | None = None
+    missing_detail: str | None = None
+
+    @model_validator(mode="after")
+    def validate_recommendation_fields(self) -> "LlmV61RecommendationResultSchema":
+        if self.check_result == LlmCheckResult.OK.value:
+            if self.gap_code is not None or self.missing_detail is not None:
+                raise ValueError("ok result must contain null gap_code and missing_detail")
+            return self
+        if self.gap_code is None:
+            raise ValueError("recommendation result must contain gap_code")
+        if not (self.missing_detail or "").strip():
+            raise ValueError("recommendation result must contain missing_detail")
         return self
 
 
@@ -214,6 +243,36 @@ class PromptRenderer:
         system_prompt = self._read_prompt(self.system_prompt_path)
         user_template = self._read_prompt(self.user_prompt_path)
         self._prompt_hash = _prompt_templates_hash(system_prompt, user_template)
+        if APPLICATION_DATA_JSON_PLACEHOLDER in user_template:
+            if context.iteration_number not in {1, 2}:
+                raise ValueError("V6.1 check_iteration must be 1 or 2")
+            is_repeat = context.iteration_number == 2
+            application_data = {
+                "check_iteration": context.iteration_number,
+                "client_case": (context.reason or "").strip() or None,
+                "change_description": context.raw_change_description,
+                "previous_gap_code": (
+                    (context.previous_gap_code or "").strip() or None
+                )
+                if is_repeat
+                else None,
+                "previous_missing_detail": (
+                    (context.previous_missing_detail or None)
+                    if is_repeat else None
+                ),
+            }
+            application_data_json = json.dumps(
+                application_data,
+                ensure_ascii=False,
+                indent=2,
+            )
+            return (
+                system_prompt,
+                user_template.replace(
+                    APPLICATION_DATA_JSON_PLACEHOLDER,
+                    application_data_json,
+                ),
+            )
         values = {
             "direction": context.direction or "Не указано.",
             "answer_type": context.answer_type or "Не указан.",
@@ -258,7 +317,7 @@ class LlmClient:
         base_url: str = "https://gigachat.devices.sberbank.ru/api/v1",
         auth_url: str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
         scope: str = "GIGACHAT_API_PERS",
-        model: str = "GigaChat",
+        model: str = "GigaChat-2-Pro",
         verify_ssl_certs: bool = True,
         ca_bundle_file: str | None = None,
         timeout: float = 60.0,
@@ -284,6 +343,8 @@ class LlmClient:
         system_prompt_name = Path(system_prompt_path).name
         if system_prompt_name == "gigachat_system_v2.md":
             self.response_schema: type[BaseModel] = LlmV2ResultSchema
+        elif re.search(r"v6\.(?:1|2)_recommendation", system_prompt_name):
+            self.response_schema = LlmV61RecommendationResultSchema
         elif "v5_recommendation" in system_prompt_name:
             self.response_schema = LlmRecommendationResultSchema
         else:
@@ -349,7 +410,7 @@ class LlmClient:
                     "gap_code=%s has_recommendation=%s attempt=%s/%s",
                     result.check_result,
                     result.gap_code,
-                    bool(result.recommendation),
+                    bool(result.recommendation or result.missing_detail),
                     attempt,
                     GIGACHAT_JSON_RETRY_ATTEMPTS,
                 )
@@ -703,11 +764,12 @@ def _parse_llm_result(
             metadata=metadata,
             cause=exc,
         ) from exc
-    required_keys = (
-        {"check_result", "gap_code", "recommendation"}
-        if response_schema is LlmRecommendationResultSchema
-        else {"is_complete", "blocking_problem", "clarification_instruction"}
-    )
+    if response_schema is LlmRecommendationResultSchema:
+        required_keys = {"check_result", "gap_code", "recommendation"}
+    elif response_schema is LlmV61RecommendationResultSchema:
+        required_keys = {"check_result", "gap_code", "missing_detail"}
+    else:
+        required_keys = {"is_complete", "blocking_problem", "clarification_instruction"}
     if not isinstance(payload, dict) or not required_keys.issubset(payload):
         raise LlmResponseError(
             "schema_validation",
@@ -796,7 +858,11 @@ def _header_value(headers: Any, name: str) -> Any:
 
 
 def _prompt_version(system_prompt_path: Path) -> str:
-    match = re.search(r"_v(?P<version>\d+)(?:_|$)", system_prompt_path.stem, re.IGNORECASE)
+    match = re.search(
+        r"_v(?P<version>\d+(?:\.\d+)?)(?:_|$)",
+        system_prompt_path.stem,
+        re.IGNORECASE,
+    )
     if match:
         return f"v{match.group('version')}"
     return system_prompt_path.stem or "unknown"
@@ -883,9 +949,22 @@ def _schema_to_result(
     *,
     raw_response: str | None = None,
 ) -> LlmResult:
-    if isinstance(schema, LlmRecommendationResultSchema):
+    if isinstance(schema, LlmV61RecommendationResultSchema):
         is_complete = schema.check_result == LlmCheckResult.OK.value
         gap_code = schema.gap_code.value if schema.gap_code is not None else None
+        missing_detail = schema.missing_detail
+        return LlmResult(
+            is_complete=is_complete,
+            blocking_problem=gap_code,
+            clarification_instruction=missing_detail,
+            check_result=schema.check_result,
+            gap_code=gap_code,
+            missing_detail=missing_detail,
+            raw_response=raw_response,
+        )
+    if isinstance(schema, LlmRecommendationResultSchema):
+        is_complete = schema.check_result == LlmCheckResult.OK.value
+        gap_code = schema.gap_code
         recommendation = (schema.recommendation or "").strip() or None
         return LlmResult(
             is_complete=is_complete,

@@ -227,7 +227,10 @@ def load_settings() -> Settings:
         or "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
         gigachat_scope=os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
         or "GIGACHAT_API_PERS",
-        gigachat_model=os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat",
+        gigachat_model=(
+            os.getenv("GIGACHAT_MODEL", "GigaChat-2-Pro").strip()
+            or "GigaChat-2-Pro"
+        ),
         gigachat_verify_ssl_certs=_env_bool("GIGACHAT_VERIFY_SSL_CERTS", default=True),
         gigachat_ca_bundle_file=os.getenv("GIGACHAT_CA_BUNDLE_FILE", "").strip() or None,
         gigachat_timeout=float(os.getenv("GIGACHAT_TIMEOUT", "60").strip() or "60"),
@@ -237,14 +240,14 @@ def load_settings() -> Settings:
         ),
         gigachat_system_prompt_path=os.getenv(
             "GIGACHAT_SYSTEM_PROMPT_PATH",
-            "prompts/gigachat_system_v5_recommendation.md",
+            "prompts/gigachat_system_v6.2_recommendation.md",
         ).strip()
-        or "prompts/gigachat_system_v5_recommendation.md",
+        or "prompts/gigachat_system_v6.2_recommendation.md",
         gigachat_user_prompt_path=os.getenv(
             "GIGACHAT_USER_PROMPT_PATH",
-            "prompts/gigachat_user_v5_recommendation.md",
+            "prompts/gigachat_user_v6.1_recommendation.md",
         ).strip()
-        or "prompts/gigachat_user_v5_recommendation.md",
+        or "prompts/gigachat_user_v6.1_recommendation.md",
         gigachat_show_response_json=_env_bool("GIGACHAT_SHOW_RESPONSE_JSON", default=False),
         gigachat_log_full_request=_env_bool("GIGACHAT_LOG_FULL_REQUEST", default=False),
         status_polling_enabled=_env_bool("STATUS_POLLING_ENABLED", default=True),

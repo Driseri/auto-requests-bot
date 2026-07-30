@@ -99,8 +99,9 @@ STEP_PROMPTS = {
     Step.CHANGE_DESCRIPTION_CLARIFICATION: "Введите дополнение к сути изменений.",
     Step.CHANGE_DESCRIPTION_RECOMMENDATION: "Выберите, что сделать с рекомендацией.",
     Step.CHANGE_DESCRIPTION_REVISION: (
-        "Пришлите полную новую версию поля «Суть изменений». "
-        "Она заменит сохранённый текст целиком."
+        "Пришлите только текст, который нужно дописать к сохранённой "
+        "«Сути изменений». Бот добавит его с новой строки; уже сохранённый "
+        "текст повторять не нужно."
     ),
     Step.CHANGE_DESCRIPTION_SKIP_REASON: "Почему вы решили пропустить рекомендацию?",
     Step.SOURCE_TEXT: "Пришлите предлагаемый текст.",
@@ -1903,7 +1904,7 @@ class ApplicationFlow:
     async def _process_change_revision(
         self,
         telegram_user_id: int,
-        revised_text: str,
+        additional_text: str,
     ) -> BotResponse:
         draft = await self.repository.get_by_user_id(telegram_user_id)
         if draft is None:
@@ -1918,14 +1919,18 @@ class ApplicationFlow:
         process = await self._load_llm_process(draft)
         if process is None:
             await self.repository.set_step(telegram_user_id, Step.CHANGE_DESCRIPTION)
-            return await self._process_change_description(telegram_user_id, revised_text)
+            return await self._process_change_description(telegram_user_id, additional_text)
         iterations = process.setdefault("iterations", [])
         if len(iterations) >= 2 or process.get("state") != "awaiting_revision":
             return await self._advance_after_llm(
                 telegram_user_id,
                 draft,
                 prefix="Лимит проверок уже исчерпан. Суть изменений сохранена.",
-                revised_text=revised_text,
+                revised_text=str(
+                    process.get("current_text")
+                    or draft.raw_change_description
+                    or ""
+                ),
             )
 
         trigger = "create"
@@ -1933,6 +1938,7 @@ class ApplicationFlow:
         previous_response = previous.get("response") or {}
         initial_text = str(process.get("initial_text") or draft.raw_change_description or "")
         prior_text = str(process.get("current_text") or draft.raw_change_description or "")
+        revised_text = _append_change_description(prior_text, additional_text)
         now = _utc_now()
         actions = process.setdefault("actions", [])
         if actions and actions[-1].get("action") == "add":
@@ -1952,6 +1958,7 @@ class ApplicationFlow:
                 initial_text=initial_text,
                 previous_gap_code=previous_response.get("gap_code"),
                 previous_recommendation=previous_response.get("recommendation"),
+                previous_missing_detail=previous_response.get("missing_detail"),
             )
         )
         draft = await self.repository.save_llm_recommendation_state(
@@ -1988,6 +1995,9 @@ class ApplicationFlow:
                 previous_recommendation=str(
                     previous_response.get("recommendation") or ""
                 ),
+                previous_missing_detail=str(
+                    previous_response.get("missing_detail") or ""
+                ),
                 iteration_number=2,
             )
         )
@@ -2022,7 +2032,7 @@ class ApplicationFlow:
             ),
         )
         if status == LlmCheckStatus.NEEDS_ATTENTION.value:
-            prefix = _result_recommendation(llm_result) or (
+            prefix = _result_user_recommendation(llm_result) or (
                 "Может быть, в описании всё ещё не хватает важной информации."
             )
         else:
@@ -2069,12 +2079,7 @@ class ApplicationFlow:
         iterations = process.get("iterations")
         latest = iterations[-1] if isinstance(iterations, list) and iterations else {}
         response = latest.get("response") if isinstance(latest, dict) else {}
-        recommendation = (
-            response.get("recommendation")
-            if isinstance(response, dict)
-            else None
-        )
-        text = str(recommendation or "Может быть, тут не хватает важной информации.")
+        text = _response_user_recommendation(response)
         return BotResponse(
             text=f"{escape(text)}\n\nХотите дополнить описание или пропустить рекомендацию?",
             keyboard=KeyboardKind.LLM_RECOMMENDATION,
@@ -2269,11 +2274,8 @@ class ApplicationFlow:
                 iterations = process.get("iterations")
                 latest = iterations[-1] if isinstance(iterations, list) and iterations else {}
                 result = latest.get("response") if isinstance(latest, dict) else {}
-                recommendation = (
-                    result.get("recommendation") if isinstance(result, dict) else None
-                )
                 prefix = (
-                    f"Рекомендация:\n{escape(str(recommendation or ''))}\n\n"
+                    f"Рекомендация:\n{escape(_response_user_recommendation(result))}\n\n"
                     f"Сейчас сохранено:\n{escape(draft.raw_change_description or '')}"
                 )
         response = self._prompt_response(draft, prefix=prefix)
@@ -2750,11 +2752,22 @@ def _llm_blocking_rule(blocking_problem: str | None) -> str | None:
 
 
 def _llm_result_to_json(llm_result) -> str:
+    telemetry = getattr(llm_result, "telemetry", None)
+    uses_missing_detail = getattr(telemetry, "prompt_version", None) in {
+        "v6.1",
+        "v6.2",
+    }
+    detail = _result_missing_detail(llm_result)
+    result_field = (
+        {"missing_detail": detail}
+        if uses_missing_detail or detail is not None
+        else {"recommendation": _result_recommendation(llm_result)}
+    )
     return json.dumps(
         {
             "check_result": _result_check_result(llm_result),
             "gap_code": _result_gap_code(llm_result),
-            "recommendation": _result_recommendation(llm_result),
+            **result_field,
         },
         ensure_ascii=False,
         indent=2,
@@ -2765,6 +2778,16 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _append_change_description(current_text: str, additional_text: str) -> str:
+    saved = current_text.strip()
+    addition = additional_text.strip()
+    if not saved:
+        return addition
+    if not addition or addition == saved:
+        return saved
+    return f"{saved}\n{addition}"
+
+
 def _llm_iteration_started(
     *,
     number: int,
@@ -2772,6 +2795,7 @@ def _llm_iteration_started(
     initial_text: str,
     previous_gap_code: object = None,
     previous_recommendation: object = None,
+    previous_missing_detail: object = None,
 ) -> dict[str, object]:
     return {
         "check_id": str(uuid4()),
@@ -2783,6 +2807,7 @@ def _llm_iteration_started(
             "current_text": current_text,
             "previous_gap_code": previous_gap_code,
             "previous_recommendation": previous_recommendation,
+            "previous_missing_detail": previous_missing_detail,
         },
         "response": None,
         "raw_response": None,
@@ -2802,6 +2827,7 @@ def _complete_llm_iteration(iteration: dict[str, object], llm_result) -> None:
                 "check_result": _result_check_result(llm_result),
                 "gap_code": _result_gap_code(llm_result),
                 "recommendation": _result_recommendation(llm_result),
+                "missing_detail": _result_missing_detail(llm_result),
             },
             "raw_response": getattr(llm_result, "raw_response", None),
             "parse_status": "error" if is_error else "valid",
@@ -2841,5 +2867,34 @@ def _result_recommendation(llm_result) -> str | None:
     value = getattr(llm_result, "recommendation", None)
     if value:
         return str(value)
+    if getattr(llm_result, "missing_detail", None):
+        return None
     legacy = getattr(llm_result, "clarification_instruction", None)
     return str(legacy) if legacy else None
+
+
+def _result_missing_detail(llm_result) -> str | None:
+    value = getattr(llm_result, "missing_detail", None)
+    return str(value) if value else None
+
+
+def _result_user_recommendation(llm_result) -> str | None:
+    missing_detail = _result_missing_detail(llm_result)
+    if missing_detail:
+        return _format_missing_detail(missing_detail)
+    return _result_recommendation(llm_result)
+
+
+def _response_user_recommendation(response: object) -> str:
+    if isinstance(response, dict):
+        missing_detail = response.get("missing_detail")
+        if missing_detail:
+            return _format_missing_detail(str(missing_detail))
+        recommendation = response.get("recommendation")
+        if recommendation:
+            return str(recommendation)
+    return "Может быть, тут не хватает важной информации."
+
+
+def _format_missing_detail(missing_detail: str) -> str:
+    return f"Может быть, тут не хватает информации о том, {missing_detail.strip()}"

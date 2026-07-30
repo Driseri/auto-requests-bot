@@ -1152,9 +1152,11 @@ async def test_recommendation_can_be_applied_with_one_revision(tmp_path):
 
     revision_prompt = await flow.accept_llm_recommendation(18)
     assert revision_prompt.keyboard == KeyboardKind.STEP
+    assert "только текст, который нужно дописать" in revision_prompt.text
+    assert "Поменять срок" in revision_prompt.text
     second_response = await flow.handle_text(
         18,
-        "Поменять срок: нужно указать 5 рабочих дней",
+        "Нужно указать 5 рабочих дней",
     )
     draft = await repository.get_by_user_id(18)
 
@@ -1162,7 +1164,7 @@ async def test_recommendation_can_be_applied_with_one_revision(tmp_path):
     assert draft is not None
     assert draft.current_step == Step.SOURCE_TEXT
     assert draft.clarification_count == 1
-    assert draft.raw_change_description == "Поменять срок: нужно указать 5 рабочих дней"
+    assert draft.raw_change_description == "Поменять срок\nНужно указать 5 рабочих дней"
     assert draft.formatted_change_description == draft.raw_change_description
     assert draft.llm_check_status == LlmCheckStatus.COMPLETE.value
     assert len(llm_client.calls) == 2
@@ -1171,7 +1173,7 @@ async def test_recommendation_can_be_applied_with_one_revision(tmp_path):
     assert llm_client.calls[0].change_type == ChangeType.ADD.value
     assert (
         llm_client.calls[1].raw_change_description
-        == "Поменять срок: нужно указать 5 рабочих дней"
+        == "Поменять срок\nНужно указать 5 рабочих дней"
     )
     assert llm_client.calls[1].initial_change_description == "Поменять срок"
     assert llm_client.calls[1].iteration_number == 2
@@ -1199,18 +1201,19 @@ async def test_second_recommendation_continues_with_attention_status(tmp_path):
         [
             LlmResult(
                 is_complete=False,
-                blocking_problem="Не указано конкретное изменение",
-                clarification_instruction=(
-                    "Перепишите поле целиком: укажите, что изменить, что сделать "
-                    "и какой результат должен получиться."
-                ),
+                blocking_problem="missing_change_content",
+                clarification_instruction="что именно необходимо изменить",
+                check_result="recommendation",
+                gap_code="missing_change_content",
+                missing_detail="что именно необходимо изменить",
             ),
             LlmResult(
                 is_complete=False,
-                blocking_problem="После ответа задача все еще неоднозначна",
-                clarification_instruction=(
-                    "Укажите конкретный итоговый результат изменения."
-                ),
+                blocking_problem="missing_change_content",
+                clarification_instruction="какой итоговый результат требуется",
+                check_result="recommendation",
+                gap_code="missing_change_content",
+                missing_detail="какой итоговый результат требуется",
             ),
         ]
     )
@@ -1228,12 +1231,15 @@ async def test_second_recommendation_continues_with_attention_status(tmp_path):
     response = await flow.handle_text(19, "Сделать лучше")
     draft = await repository.get_by_user_id(19)
 
-    assert "Укажите конкретный итоговый результат изменения" in response.text
+    assert (
+        "Может быть, тут не хватает информации о том, "
+        "какой итоговый результат требуется"
+    ) in response.text
     assert draft is not None
     assert draft.current_step == Step.SOURCE_TEXT
     assert draft.llm_check_status == LlmCheckStatus.NEEDS_ATTENTION.value
-    assert draft.formatted_change_description == "Сделать лучше"
-    assert draft.raw_change_description == "Сделать лучше"
+    assert draft.formatted_change_description == "Поменять текст\nСделать лучше"
+    assert draft.raw_change_description == "Поменять текст\nСделать лучше"
 
 
 @pytest.mark.asyncio
@@ -1288,18 +1294,22 @@ async def test_recommendation_process_uses_one_row_for_two_checks(tmp_path):
             LlmResult(
                 is_complete=False,
                 blocking_problem="missing_change_content",
-                clarification_instruction="Может быть, тут не хватает содержания изменения.",
+                clarification_instruction="какой срок необходимо указать",
                 check_result="recommendation",
                 gap_code="missing_change_content",
-                recommendation="Может быть, тут не хватает содержания изменения.",
-                raw_response='{"check_result":"recommendation"}',
+                missing_detail="какой срок необходимо указать",
+                raw_response=(
+                    '{"check_result":"recommendation",'
+                    '"gap_code":"missing_change_content",'
+                    '"missing_detail":"какой срок необходимо указать"}'
+                ),
             ),
             LlmResult(
                 is_complete=True,
                 blocking_problem=None,
                 clarification_instruction=None,
                 check_result="ok",
-                raw_response='{"check_result":"ok","gap_code":null,"recommendation":null}',
+                raw_response='{"check_result":"ok","gap_code":null,"missing_detail":null}',
             ),
         ]
     )
@@ -1311,7 +1321,7 @@ async def test_recommendation_process_uses_one_row_for_two_checks(tmp_path):
     await flow.handle_text(192, "intent.change_limit")
     await flow.handle_text(192, "Иван Иванов")
     await flow.handle_text(192, "Изменились условия продукта")
-    await flow.handle_text(192, "Обновить ответ")
+    first_response = await flow.handle_text(192, "Обновить ответ")
     await flow.accept_llm_recommendation(192)
     await flow.handle_text(192, "Добавить в ответ срок пять дней")
     draft = await repository.get_by_user_id(192)
@@ -1326,7 +1336,26 @@ async def test_recommendation_process_uses_one_row_for_two_checks(tmp_path):
     assert len(process["iterations"]) == 2
     assert process["iterations"][0]["raw_response"]
     assert process["iterations"][1]["raw_response"]
+    assert process["iterations"][0]["response"] == {
+        "check_result": "recommendation",
+        "gap_code": "missing_change_content",
+        "recommendation": None,
+        "missing_detail": "какой срок необходимо указать",
+    }
+    assert (
+        first_response.text
+        == "Может быть, тут не хватает информации о том, какой срок необходимо "
+        "указать\n\nХотите дополнить описание или пропустить рекомендацию?"
+    )
+    assert llm_client.calls[1].previous_gap_code == "missing_change_content"
+    assert llm_client.calls[1].previous_missing_detail == "какой срок необходимо указать"
     assert process["actions"][0]["text_changed"] is True
+    assert process["current_text"] == "Обновить ответ\nДобавить в ответ срок пять дней"
+    assert process["iterations"][1]["input"]["current_text"] == process["current_text"]
+    assert draft.raw_change_description == process["current_text"]
+    assert process["actions"][0]["text_delta_chars"] == len(
+        "\nДобавить в ответ срок пять дней"
+    )
     async with repository._connection() as db:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM llm_recommendation_processes WHERE application_id = ?",
@@ -1601,6 +1630,47 @@ async def test_incomplete_check_keeps_score_empty(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_v61_change_action_event_uses_gap_code_without_legacy_rule(tmp_path):
+    llm_client = FakeLlmClient(
+        [
+            LlmResult(
+                is_complete=False,
+                blocking_problem="missing_change_action",
+                clarification_instruction="что необходимо сделать с информацией о комиссии",
+                check_result="recommendation",
+                gap_code="missing_change_action",
+                missing_detail="что необходимо сделать с информацией о комиссии",
+                telemetry=LlmTelemetry(
+                    prompt_version="v6.1",
+                    prompt_hash="def456abc123",
+                    model="GigaChat",
+                ),
+            )
+        ]
+    )
+    flow, repository, _, _ = await make_flow(tmp_path, llm_client)
+    await flow.start_single(251)
+    await flow.select_direction(251, Direction.FL)
+    await flow.select_answer_type(251, AnswerType.ROLLOUT)
+    await flow.select_change_type(251, ChangeType.ADD)
+    await flow.handle_text(251, "intent.change_limit")
+    await flow.handle_text(251, "Иван Иванов")
+    await flow.handle_text(251, "Клиент спрашивает о комиссии")
+    await flow.handle_text(251, "Информация о комиссии")
+    draft = await repository.get_by_user_id(251)
+
+    assert draft is not None
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    )
+    metadata = json.loads(events[0].metadata_json or "{}")
+    assert metadata["prompt_version"] == "v6.1"
+    assert metadata["gap_code"] == "missing_change_action"
+    assert metadata["blocking_rule"] is None
+
+
+@pytest.mark.asyncio
 async def test_edit_change_description_does_not_run_llm_again(tmp_path):
     llm_client = FakeLlmClient(
         [
@@ -1638,8 +1708,23 @@ async def test_edit_change_description_does_not_run_llm_again(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_can_show_gigachat_json_response_in_bot_message(tmp_path):
-    flow, _, _, _ = await make_flow_with_json(tmp_path)
+@pytest.mark.parametrize("prompt_version", ["v6.1", "v6.2"])
+async def test_can_show_gigachat_json_response_in_bot_message(
+    tmp_path,
+    prompt_version,
+):
+    llm_client = FakeLlmClient(
+        [
+            LlmResult(
+                is_complete=True,
+                blocking_problem=None,
+                clarification_instruction=None,
+                check_result="ok",
+                telemetry=LlmTelemetry(prompt_version=prompt_version),
+            )
+        ]
+    )
+    flow, _, _, _ = await make_flow_with_json(tmp_path, llm_client)
     await flow.start_new(21)
     await flow.select_direction(21, Direction.FL)
     await flow.select_answer_type(21, AnswerType.ROLLOUT)
@@ -1654,4 +1739,5 @@ async def test_can_show_gigachat_json_response_in_bot_message(tmp_path):
     assert "Ответ GigaChat:" in response.text
     assert '"check_result": "ok"' in response.text
     assert '"gap_code": null' in response.text
-    assert '"recommendation": null' in response.text
+    assert '"missing_detail": null' in response.text
+    assert '"recommendation"' not in response.text

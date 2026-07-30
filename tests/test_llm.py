@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -162,21 +163,22 @@ def test_legacy_system_prompt_is_preserved_for_rollback():
     assert "`clarification_instruction`: string или null" in prompt
 
 
-def test_default_system_prompt_uses_v5_recommendation_rules():
+def test_default_system_prompt_uses_v62_recommendation_rules():
     legacy_path = Path("prompts") / "gigachat_system.md"
     prompt_path = Path(DEFAULT_SYSTEM_PROMPT_PATH)
 
-    assert prompt_path == Path("prompts/gigachat_system_v5_recommendation.md")
+    assert prompt_path == Path("prompts/gigachat_system_v6.2_recommendation.md")
     assert legacy_path.exists()
     assert prompt_path.exists()
 
     prompt = prompt_path.read_text(encoding="utf-8")
-    assert "Проверка рекомендательная" in prompt
+    assert "рекомендательную проверку" in prompt
+    assert "missing_change_action" in prompt
     assert "missing_new_entity_content" in prompt
     assert "missing_change_content" in prompt
     assert "missing_application_context" in prompt
     assert "missing_change_rationale" in prompt
-    assert '"check_result":"ok"' in prompt
+    assert '"missing_detail": null' in prompt
 
 
 def test_v3_prompt_contains_acceptance_examples():
@@ -225,31 +227,67 @@ def test_default_user_prompt_v3_contains_supported_fields():
     assert "{scriptwriter}" not in prompt
 
 
-def test_default_user_prompt_renders_v5_context():
+def test_default_user_prompt_renders_exact_v61_application_json():
     renderer = PromptRenderer(DEFAULT_SYSTEM_PROMPT_PATH, DEFAULT_USER_PROMPT_PATH)
     _, user_prompt = renderer.render(
         make_context(
-            intent="intent.v3",
-            reason="case.v3",
-            raw_change_description="description.v3",
-            clarification_text="clarification.v3",
+            intent="intent.not-sent",
+            reason='Клиент спрашивает: "Когда?"\nНужен срок',
+            raw_change_description="Добавить срок обработки",
+            initial_change_description="Старый текст не передаётся",
+            previous_gap_code="missing_change_content",
+            previous_missing_detail="какой срок необходимо указать",
+            previous_recommendation="legacy recommendation not sent",
+            iteration_number=2,
         )
     )
 
-    for value in ("intent.v3", "case.v3", "description.v3"):
-        assert value in user_prompt
-    assert all(
-        placeholder not in user_prompt
-        for placeholder in (
-            "{intent}",
-            "{reason}",
-            "{raw_change_description}",
-            "{initial_change_description}",
-            "{previous_gap_code}",
-            "{previous_recommendation}",
-            "{iteration_number}",
+    payload_text = user_prompt.split("application_data:\n\n", maxsplit=1)[1]
+    payload = json.loads(payload_text)
+    assert payload == {
+        "check_iteration": 2,
+        "client_case": 'Клиент спрашивает: "Когда?"\nНужен срок',
+        "change_description": "Добавить срок обработки",
+        "previous_gap_code": "missing_change_content",
+        "previous_missing_detail": "какой срок необходимо указать",
+    }
+    assert list(payload) == [
+        "check_iteration",
+        "client_case",
+        "change_description",
+        "previous_gap_code",
+        "previous_missing_detail",
+    ]
+    assert "{{APPLICATION_DATA_JSON}}" not in user_prompt
+    assert "intent.not-sent" not in user_prompt
+    assert "Старый текст не передаётся" not in user_prompt
+    assert "legacy recommendation not sent" not in user_prompt
+
+
+def test_v61_first_iteration_uses_native_json_nulls():
+    renderer = PromptRenderer(DEFAULT_SYSTEM_PROMPT_PATH, DEFAULT_USER_PROMPT_PATH)
+    _, user_prompt = renderer.render(
+        make_context(
+            reason=" ",
+            raw_change_description="Добавить информацию о сроке обработки",
+            previous_gap_code="must-be-ignored",
+            previous_missing_detail="must-be-ignored",
+            iteration_number=1,
         )
     )
+
+    payload = json.loads(user_prompt.split("application_data:\n\n", maxsplit=1)[1])
+    assert payload["check_iteration"] == 1
+    assert payload["client_case"] is None
+    assert payload["previous_gap_code"] is None
+    assert payload["previous_missing_detail"] is None
+
+
+def test_v61_renderer_rejects_iteration_outside_business_limit():
+    renderer = PromptRenderer(DEFAULT_SYSTEM_PROMPT_PATH, DEFAULT_USER_PROMPT_PATH)
+
+    with pytest.raises(ValueError, match="must be 1 or 2"):
+        renderer.render(make_context(iteration_number=3))
 
 
 @pytest.mark.asyncio
@@ -327,6 +365,181 @@ async def test_v5_client_rejects_unknown_gap_code(tmp_path, monkeypatch):
         '{"check_result":"recommendation","gap_code":"unknown_gap",'
         '"recommendation":"Может быть, тут не хватает сведений."}'
     )
+    client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(raw_response=raw),
+    )
+
+    result = await client.check_change_description(make_context())
+
+    assert result.check_result == "error"
+    assert result.raw_response == raw
+    assert result.telemetry is not None
+    assert result.telemetry.error_kind == "schema_validation"
+
+
+@pytest.mark.asyncio
+async def test_v5_client_rejects_v61_only_gap_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(llm_module, "GIGACHAT_JSON_RETRY_DELAY_SECONDS", 0)
+    system_prompt = tmp_path / "gigachat_system_v5_recommendation.md"
+    user_prompt = tmp_path / "gigachat_user_v5_recommendation.md"
+    system_prompt.write_text("System prompt", encoding="utf-8")
+    user_prompt.write_text("raw={raw_change_description}", encoding="utf-8")
+    raw = (
+        '{"check_result":"recommendation","gap_code":"missing_change_action",'
+        '"recommendation":"Может быть, тут не хватает требуемого действия."}'
+    )
+    client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(raw_response=raw),
+    )
+
+    result = await client.check_change_description(make_context())
+
+    assert result.check_result == "error"
+    assert result.telemetry is not None
+    assert result.telemetry.error_kind == "schema_validation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gap_code",
+    [
+        "missing_change_action",
+        "missing_change_content",
+        "missing_new_entity_content",
+        "missing_application_context",
+        "missing_change_rationale",
+    ],
+)
+async def test_v61_client_accepts_all_gap_codes_and_keeps_missing_detail(
+    tmp_path,
+    gap_code,
+):
+    system_prompt = tmp_path / "gigachat_system_v6.1_recommendation.md"
+    user_prompt = tmp_path / "gigachat_user_v6.1_recommendation.md"
+    system_prompt.write_text("System prompt", encoding="utf-8")
+    user_prompt.write_text("{{APPLICATION_DATA_JSON}}", encoding="utf-8")
+    raw = json.dumps(
+        {
+            "check_result": "recommendation",
+            "gap_code": gap_code,
+            "missing_detail": "  какое сведение необходимо добавить \n",
+        },
+        ensure_ascii=False,
+    )
+    client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(raw_response=raw),
+    )
+
+    result = await client.check_change_description(make_context())
+
+    assert result.is_complete is False
+    assert result.check_result == "recommendation"
+    assert result.gap_code == gap_code
+    assert result.missing_detail == "  какое сведение необходимо добавить \n"
+    assert result.recommendation is None
+    assert result.raw_response == raw
+    assert result.telemetry is not None
+    assert result.telemetry.prompt_version == "v6.1"
+
+
+@pytest.mark.asyncio
+async def test_v61_client_accepts_ok_with_null_fields(tmp_path):
+    system_prompt = tmp_path / "gigachat_system_v6.1_recommendation.md"
+    user_prompt = tmp_path / "gigachat_user_v6.1_recommendation.md"
+    system_prompt.write_text("System prompt", encoding="utf-8")
+    user_prompt.write_text("{{APPLICATION_DATA_JSON}}", encoding="utf-8")
+    raw = '{"check_result":"ok","gap_code":null,"missing_detail":null}'
+    client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(raw_response=raw),
+    )
+
+    result = await client.check_change_description(make_context())
+
+    assert result.is_complete is True
+    assert result.check_result == "ok"
+    assert result.gap_code is None
+    assert result.missing_detail is None
+    assert result.recommendation is None
+    assert result.raw_response == raw
+
+
+@pytest.mark.asyncio
+async def test_v62_system_prompt_uses_v61_strict_contract(tmp_path):
+    system_prompt = tmp_path / "gigachat_system_v6.2_recommendation.md"
+    user_prompt = tmp_path / "gigachat_user_v6.1_recommendation.md"
+    system_prompt.write_text("System prompt", encoding="utf-8")
+    user_prompt.write_text("{{APPLICATION_DATA_JSON}}", encoding="utf-8")
+    raw = json.dumps(
+        {
+            "check_result": "recommendation",
+            "gap_code": "missing_change_action",
+            "missing_detail": "что необходимо сделать с указанной информацией",
+        },
+        ensure_ascii=False,
+    )
+    client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(raw_response=raw),
+    )
+
+    result = await client.check_change_description(make_context())
+
+    assert result.check_result == "recommendation"
+    assert result.gap_code == "missing_change_action"
+    assert result.missing_detail == "что необходимо сделать с указанной информацией"
+    assert result.recommendation is None
+    assert result.telemetry is not None
+    assert result.telemetry.prompt_version == "v6.2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "check_result": "recommendation",
+            "gap_code": "unknown_gap",
+            "missing_detail": "деталь",
+        },
+        {
+            "check_result": "recommendation",
+            "gap_code": "missing_change_content",
+            "missing_detail": " ",
+        },
+        {
+            "check_result": "ok",
+            "gap_code": "missing_change_content",
+            "missing_detail": None,
+        },
+        {
+            "check_result": "ok",
+            "gap_code": None,
+            "missing_detail": None,
+            "extra": "forbidden",
+        },
+    ],
+)
+async def test_v61_client_rejects_invalid_contract(tmp_path, monkeypatch, payload):
+    monkeypatch.setattr(llm_module, "GIGACHAT_JSON_RETRY_DELAY_SECONDS", 0)
+    system_prompt = tmp_path / "gigachat_system_v6.1_recommendation.md"
+    user_prompt = tmp_path / "gigachat_user_v6.1_recommendation.md"
+    system_prompt.write_text("System prompt", encoding="utf-8")
+    user_prompt.write_text("{{APPLICATION_DATA_JSON}}", encoding="utf-8")
+    raw = json.dumps(payload, ensure_ascii=False)
     client = LlmClient(
         credentials="credentials",
         system_prompt_path=str(system_prompt),

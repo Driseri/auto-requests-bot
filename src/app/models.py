@@ -179,6 +179,7 @@ class LlmCheckResult(StrEnum):
 
 
 class LlmGapCode(StrEnum):
+    MISSING_CHANGE_ACTION = "missing_change_action"
     MISSING_NEW_ENTITY_CONTENT = "missing_new_entity_content"
     MISSING_CHANGE_CONTENT = "missing_change_content"
     MISSING_APPLICATION_CONTEXT = "missing_application_context"
@@ -358,6 +359,7 @@ class LlmContext:
     initial_change_description: str = ""
     previous_gap_code: str = ""
     previous_recommendation: str = ""
+    previous_missing_detail: str = ""
     iteration_number: int = 1
 
 
@@ -381,6 +383,7 @@ class LlmResult:
     check_result: str = LlmCheckResult.OK.value
     gap_code: str | None = None
     recommendation: str | None = None
+    missing_detail: str | None = None
     raw_response: str | None = None
 
 

@@ -37,10 +37,11 @@ Telegram-бот для регистрации и сопровождения за
 2. Заполните переменные окружения для Telegram, Google Sheets и GigaChat.
 3. Положите файл `credentials.json` с Google credentials в корень проекта.
 
-Новая установка по умолчанию использует рекомендательные промпты V5. При обновлении
-существующего окружения явно переключите `GIGACHAT_SYSTEM_PROMPT_PATH` и
-`GIGACHAT_USER_PROMPT_PATH` на файлы `*_v5_recommendation.md`; локальные и production
-`.env` автоматически не перезаписываются.
+Новая установка по умолчанию использует системный промпт V6.2 и пользовательский
+промпт V6.1. При обновлении существующего окружения явно переключите
+`GIGACHAT_SYSTEM_PROMPT_PATH` на `gigachat_system_v6.2_recommendation.md`, а
+`GIGACHAT_USER_PROMPT_PATH` — на `gigachat_user_v6.1_recommendation.md`; локальные
+и production `.env` автоматически не перезаписываются.
 
 Секреты, локальные базы, архивы и deployment-артефакты не должны добавляться в Git. Файлы `.env`, `credentials.json` и локальные данные уже исключены через `.gitignore`.
 

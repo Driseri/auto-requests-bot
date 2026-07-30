@@ -9,8 +9,8 @@ services:
     environment:
       SQLITE_PATH: /data/app.db
       GOOGLE_CREDENTIALS_PATH: /run/secrets/google_credentials.json
-      GIGACHAT_SYSTEM_PROMPT_PATH: ${GIGACHAT_SYSTEM_PROMPT_PATH:-prompts/gigachat_system_v5_recommendation.md}
-      GIGACHAT_USER_PROMPT_PATH: ${GIGACHAT_USER_PROMPT_PATH:-prompts/gigachat_user_v5_recommendation.md}
+      GIGACHAT_SYSTEM_PROMPT_PATH: ${GIGACHAT_SYSTEM_PROMPT_PATH:-prompts/gigachat_system_v6.2_recommendation.md}
+      GIGACHAT_USER_PROMPT_PATH: ${GIGACHAT_USER_PROMPT_PATH:-prompts/gigachat_user_v6.1_recommendation.md}
       MALLOC_ARENA_MAX: "2"
       TZ: ${BOT_TIMEZONE:-Europe/Moscow}
     volumes:
