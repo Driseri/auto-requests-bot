@@ -706,8 +706,8 @@ PY
 Интерпретация create-flow:
 
 - `initial / passed` — принято LLM с первого раза;
-- `initial / needs_clarification` — запрошено уточнение;
-- `clarification / passed` — принято после уточнения;
+- `initial / needs_clarification` — показана необязательная рекомендация;
+- `clarification / passed` — полная новая версия принята после рекомендации;
 - `clarification / needs_clarification` — после второй проверки осталось
   `needs_attention`;
 - `technical_fallback` — техническая ошибка, которую нельзя считать отказом LLM.

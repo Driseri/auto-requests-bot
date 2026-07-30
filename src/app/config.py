@@ -237,14 +237,14 @@ def load_settings() -> Settings:
         ),
         gigachat_system_prompt_path=os.getenv(
             "GIGACHAT_SYSTEM_PROMPT_PATH",
-            "prompts/gigachat_system_v3.md",
+            "prompts/gigachat_system_v5_recommendation.md",
         ).strip()
-        or "prompts/gigachat_system_v3.md",
+        or "prompts/gigachat_system_v5_recommendation.md",
         gigachat_user_prompt_path=os.getenv(
             "GIGACHAT_USER_PROMPT_PATH",
-            "prompts/gigachat_user_v3.md",
+            "prompts/gigachat_user_v5_recommendation.md",
         ).strip()
-        or "prompts/gigachat_user_v3.md",
+        or "prompts/gigachat_user_v5_recommendation.md",
         gigachat_show_response_json=_env_bool("GIGACHAT_SHOW_RESPONSE_JSON", default=False),
         gigachat_log_full_request=_env_bool("GIGACHAT_LOG_FULL_REQUEST", default=False),
         status_polling_enabled=_env_bool("STATUS_POLLING_ENABLED", default=True),

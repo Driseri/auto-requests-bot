@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import app.config as config_module
 from app.config import load_settings
 from app.scheduling import cutoff_to_string
 
@@ -36,15 +37,19 @@ def test_load_settings_uses_default_rollout_schedule(monkeypatch):
     assert settings.editor_urgent_chat_id is None
 
 
-def test_load_settings_uses_v3_gigachat_prompt_by_default(monkeypatch):
+def test_load_settings_uses_v5_gigachat_prompt_by_default(monkeypatch):
+    monkeypatch.setattr(config_module, "load_dotenv", lambda: None)
     monkeypatch.delenv("GIGACHAT_SYSTEM_PROMPT_PATH", raising=False)
     monkeypatch.delenv("GIGACHAT_USER_PROMPT_PATH", raising=False)
     monkeypatch.delenv("GIGACHAT_LOG_FULL_REQUEST", raising=False)
 
     settings = load_settings()
 
-    assert settings.gigachat_system_prompt_path == "prompts/gigachat_system_v3.md"
-    assert settings.gigachat_user_prompt_path == "prompts/gigachat_user_v3.md"
+    assert (
+        settings.gigachat_system_prompt_path
+        == "prompts/gigachat_system_v5_recommendation.md"
+    )
+    assert settings.gigachat_user_prompt_path == "prompts/gigachat_user_v5_recommendation.md"
     assert settings.gigachat_log_full_request is False
 
 

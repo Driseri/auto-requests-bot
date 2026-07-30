@@ -75,7 +75,7 @@ async def test_repository_records_versioned_schema_migrations(tmp_path):
     await repository.init()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         rows = connection.execute(
             "SELECT version, name FROM schema_migrations ORDER BY version"
         ).fetchall()
@@ -83,7 +83,46 @@ async def test_repository_records_versioned_schema_migrations(tmp_path):
     assert rows == [
         (1, "llm_completeness_check"),
         (2, "versioned_migration_framework"),
+        (3, "llm_recommendation_process"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_repository_migrates_schema_v2_to_v3(tmp_path):
+    database = tmp_path / "migration-v2-v3.db"
+    repository = DraftRepository(str(database))
+    await repository.init()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE llm_recommendation_processes")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+        connection.execute("PRAGMA user_version = 2")
+
+    await repository.init()
+
+    with sqlite3.connect(database) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        migration = connection.execute(
+            "SELECT name FROM schema_migrations WHERE version = 3"
+        ).fetchone()
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(llm_recommendation_processes)"
+            ).fetchall()
+        }
+
+    assert version == 3
+    assert migration == ("llm_recommendation_process",)
+    assert columns == {
+        "application_id",
+        "telegram_user_id",
+        "field_code",
+        "state",
+        "process_json",
+        "created_at",
+        "updated_at",
+    }
 
 
 @pytest.mark.asyncio
@@ -93,7 +132,7 @@ async def test_repository_rejects_newer_schema_before_bootstrap(tmp_path):
         connection.execute("PRAGMA user_version = 999")
 
     repository = DraftRepository(str(database))
-    with pytest.raises(RuntimeError, match="database=999 application=2"):
+    with pytest.raises(RuntimeError, match="database=999 application=3"):
         await repository.init()
 
     with sqlite3.connect(database) as connection:

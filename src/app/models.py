@@ -15,6 +15,9 @@ class Step(StrEnum):
     REASON = "reason"
     CHANGE_DESCRIPTION = "change_description"
     CHANGE_DESCRIPTION_CLARIFICATION = "change_description_clarification"
+    CHANGE_DESCRIPTION_RECOMMENDATION = "change_description_recommendation"
+    CHANGE_DESCRIPTION_REVISION = "change_description_revision"
+    CHANGE_DESCRIPTION_SKIP_REASON = "change_description_skip_reason"
     SOURCE_TEXT = "source_text"
     CHIP_TEXT_BEFORE = "chip_text_before"
     CHIP_TEXT = "chip_text"
@@ -169,6 +172,19 @@ class LlmCheckStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class LlmCheckResult(StrEnum):
+    OK = "ok"
+    RECOMMENDATION = "recommendation"
+    ERROR = "error"
+
+
+class LlmGapCode(StrEnum):
+    MISSING_NEW_ENTITY_CONTENT = "missing_new_entity_content"
+    MISSING_CHANGE_CONTENT = "missing_change_content"
+    MISSING_APPLICATION_CONTEXT = "missing_application_context"
+    MISSING_CHANGE_RATIONALE = "missing_change_rationale"
+
+
 class KeyboardKind(StrEnum):
     START = "start"
     CREATE_MODE = "create_mode"
@@ -183,6 +199,8 @@ class KeyboardKind(StrEnum):
     SCRIPTWRITER_STEP_WITH_DEFAULT = "scriptwriter_step_with_default"
     URGENCY = "urgency"
     PRIORITY = "priority"
+    LLM_RECOMMENDATION = "llm_recommendation"
+    LLM_SKIP_REASON = "llm_skip_reason"
     REVIEW = "review"
     EDIT_MENU = "edit_menu"
     EDIT_MENU_ROLLOUT = "edit_menu_rollout"
@@ -337,6 +355,10 @@ class LlmContext:
     answer_type: str = ""
     change_type: str = ""
     clarification_text: str = ""
+    initial_change_description: str = ""
+    previous_gap_code: str = ""
+    previous_recommendation: str = ""
+    iteration_number: int = 1
 
 
 @dataclass(slots=True)
@@ -356,6 +378,10 @@ class LlmResult:
     blocking_problem: str | None
     clarification_instruction: str | None
     telemetry: LlmTelemetry | None = None
+    check_result: str = LlmCheckResult.OK.value
+    gap_code: str | None = None
+    recommendation: str | None = None
+    raw_response: str | None = None
 
 
 @dataclass(slots=True)
@@ -425,6 +451,17 @@ class ApplicationEvent:
     new_value: str | None
     metadata_json: str | None
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class LlmRecommendationProcess:
+    application_id: str
+    telegram_user_id: int
+    field_code: str
+    state: str
+    process_json: str
+    created_at: str
+    updated_at: str
 
 
 

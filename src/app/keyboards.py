@@ -39,6 +39,11 @@ class CallbackData:
     SUBMIT = "app:submit"
     EDIT = "app:edit"
     REVIEW = "app:review"
+    LLM_ADD = "app:llm:add"
+    LLM_SKIP = "app:llm:skip"
+    LLM_SKIP_OPTIONAL = "app:llm:skip_reason:optional"
+    LLM_SKIP_INCORRECT = "app:llm:skip_reason:incorrect"
+    LLM_SKIP_UNCLEAR = "app:llm:skip_reason:unclear"
 
     # Legacy callbacks kept so old inline messages do not crash the bot.
     PRIORITY_HIGH = "app:priority:high"
@@ -247,6 +252,45 @@ def build_keyboard(kind: KeyboardKind, payload: str | None = None) -> InlineKeyb
                     ],
                     [InlineKeyboardButton(text="Назад", callback_data=CallbackData.BACK)],
                     [InlineKeyboardButton(text="Отменить", callback_data=CallbackData.CANCEL)],
+                ]
+            )
+        case KeyboardKind.LLM_RECOMMENDATION:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Дополнить",
+                            callback_data=CallbackData.LLM_ADD,
+                        ),
+                        InlineKeyboardButton(
+                            text="Пропустить",
+                            callback_data=CallbackData.LLM_SKIP,
+                        ),
+                    ]
+                ]
+            )
+        case KeyboardKind.LLM_SKIP_REASON:
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Замечание можно пропустить",
+                            callback_data=CallbackData.LLM_SKIP_OPTIONAL,
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Проверка ошиблась",
+                            callback_data=CallbackData.LLM_SKIP_INCORRECT,
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Рекомендация непонятна",
+                            callback_data=CallbackData.LLM_SKIP_UNCLEAR,
+                        )
+                    ],
+                    [InlineKeyboardButton(text="Назад", callback_data=CallbackData.BACK)],
                 ]
             )
         case KeyboardKind.REVIEW:

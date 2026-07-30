@@ -15,6 +15,7 @@ from app.models import (
     DashboardOutboxItem,
     DashboardOutboxState,
     Draft,
+    LlmRecommendationProcess,
     NotificationOutboxItem,
     NotificationOutboxState,
     StatusPollingState,
@@ -27,7 +28,7 @@ from app.models import (
     utc_now_iso,
 )
 
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 
 class DraftRepository:
@@ -352,6 +353,19 @@ class DraftRepository:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS llm_recommendation_processes (
+                    application_id TEXT PRIMARY KEY,
+                    telegram_user_id INTEGER NOT NULL,
+                    field_code TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    process_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     version INTEGER PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -551,6 +565,111 @@ class DraftRepository:
             raise LookupError(f"Draft not found for user {telegram_user_id}")
         return draft
 
+    async def get_llm_recommendation_process(
+        self,
+        application_id: str,
+    ) -> LlmRecommendationProcess | None:
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM llm_recommendation_processes
+                WHERE application_id = ?
+                """,
+                (application_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return None
+        return LlmRecommendationProcess(
+            application_id=row["application_id"],
+            telegram_user_id=row["telegram_user_id"],
+            field_code=row["field_code"],
+            state=row["state"],
+            process_json=row["process_json"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def save_llm_recommendation_state(
+        self,
+        telegram_user_id: int,
+        *,
+        process: dict[str, Any],
+        draft_values: dict[str, Any] | None = None,
+        application_event: dict[str, Any] | None = None,
+    ) -> Draft:
+        """Атомарно обновить черновик, единичную LLM-запись и краткое событие."""
+        now = utc_now_iso()
+        values = dict(draft_values or {})
+        values["updated_at"] = now
+        process_json = json.dumps(process, ensure_ascii=False, sort_keys=True)
+
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM drafts WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await db.rollback()
+                raise LookupError(f"Draft not found for user {telegram_user_id}")
+            application_id = row["application_id"]
+            if not application_id:
+                await db.rollback()
+                raise ValueError("Draft must have application_id before LLM process is saved")
+
+            assignments = ", ".join(f"{field} = ?" for field in values)
+            await db.execute(
+                f"UPDATE drafts SET {assignments} WHERE telegram_user_id = ?",
+                [*values.values(), telegram_user_id],
+            )
+            await db.execute(
+                """
+                INSERT INTO llm_recommendation_processes (
+                    application_id, telegram_user_id, field_code, state,
+                    process_json, created_at, updated_at
+                ) VALUES (?, ?, 'change_description', ?, ?, ?, ?)
+                ON CONFLICT(application_id) DO UPDATE SET
+                    telegram_user_id = excluded.telegram_user_id,
+                    field_code = excluded.field_code,
+                    state = excluded.state,
+                    process_json = excluded.process_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    application_id,
+                    telegram_user_id,
+                    str(process.get("state") or "unknown"),
+                    process_json,
+                    now,
+                    now,
+                ),
+            )
+            if application_event is not None:
+                await self._record_application_event_in_connection(
+                    db,
+                    event_type=str(application_event["event_type"]),
+                    application_id=application_event.get("application_id"),
+                    telegram_user_id=application_event.get("telegram_user_id"),
+                    event_at=application_event.get("event_at"),
+                    old_value=application_event.get("old_value"),
+                    new_value=application_event.get("new_value"),
+                    metadata=application_event.get("metadata"),
+                    created_at=now,
+                )
+            await db.commit()
+
+        draft = await self.get_by_user_id(telegram_user_id)
+        if draft is None:
+            raise LookupError(f"Draft not found for user {telegram_user_id}")
+        return draft
+
     async def set_step(self, telegram_user_id: int, step: Step) -> Draft:
         await self._update_fields(telegram_user_id, {"current_step": step.value})
         draft = await self.get_by_user_id(telegram_user_id)
@@ -561,6 +680,63 @@ class DraftRepository:
     async def delete(self, telegram_user_id: int) -> None:
         async with self._connection() as db:
             await db.execute("DELETE FROM drafts WHERE telegram_user_id = ?", (telegram_user_id,))
+            await db.commit()
+
+    async def delete_with_llm_recommendation_state(
+        self,
+        telegram_user_id: int,
+        *,
+        process: dict[str, Any] | None,
+    ) -> None:
+        """Атомарно сохранить финальный LLM-процесс и удалить черновик."""
+        now = utc_now_iso()
+        process_json = (
+            json.dumps(process, ensure_ascii=False, sort_keys=True)
+            if process is not None
+            else None
+        )
+        async with self._connection() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT application_id FROM drafts WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is not None and process_json is not None:
+                application_id = row["application_id"]
+                if not application_id:
+                    await db.rollback()
+                    raise ValueError(
+                        "Draft must have application_id before LLM process is saved"
+                    )
+                await db.execute(
+                    """
+                    INSERT INTO llm_recommendation_processes (
+                        application_id, telegram_user_id, field_code, state,
+                        process_json, created_at, updated_at
+                    ) VALUES (?, ?, 'change_description', ?, ?, ?, ?)
+                    ON CONFLICT(application_id) DO UPDATE SET
+                        telegram_user_id = excluded.telegram_user_id,
+                        field_code = excluded.field_code,
+                        state = excluded.state,
+                        process_json = excluded.process_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        application_id,
+                        telegram_user_id,
+                        str(process.get("state") or "unknown"),
+                        process_json,
+                        now,
+                        now,
+                    ),
+                )
+            await db.execute(
+                "DELETE FROM drafts WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
             await db.commit()
 
     async def complete(self, telegram_user_id: int) -> Draft:
@@ -3101,6 +3277,17 @@ class DraftRepository:
                 (utc_now_iso(),),
             )
             await db.execute("PRAGMA user_version = 2")
+            version = 2
+
+        if version < 3:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (version, name, applied_at)
+                VALUES (3, 'llm_recommendation_process', ?)
+                """,
+                (utc_now_iso(),),
+            )
+            await db.execute("PRAGMA user_version = 3")
 
     @staticmethod
     async def _ensure_user_settings_column(

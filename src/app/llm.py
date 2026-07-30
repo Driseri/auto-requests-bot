@@ -12,13 +12,19 @@ from time import perf_counter
 from types import SimpleNamespace
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from app.models import LlmContext, LlmResult, LlmTelemetry
+from app.models import (
+    LlmCheckResult,
+    LlmContext,
+    LlmGapCode,
+    LlmResult,
+    LlmTelemetry,
+)
 
 
-DEFAULT_SYSTEM_PROMPT_PATH = "prompts/gigachat_system_v3.md"
-DEFAULT_USER_PROMPT_PATH = "prompts/gigachat_user_v3.md"
+DEFAULT_SYSTEM_PROMPT_PATH = "prompts/gigachat_system_v5_recommendation.md"
+DEFAULT_USER_PROMPT_PATH = "prompts/gigachat_user_v5_recommendation.md"
 GIGACHAT_JSON_RETRY_ATTEMPTS = 2
 GIGACHAT_JSON_RETRY_DELAY_SECONDS = 1.0
 GIGACHAT_RESPONSE_PREVIEW_CHARS = 300
@@ -84,6 +90,26 @@ class LlmResultSchema(BaseModel):
             raise ValueError("Incomplete result must contain blocking_problem")
         if not (self.clarification_instruction or "").strip():
             raise ValueError("Incomplete result must contain clarification_instruction")
+        return self
+
+
+class LlmRecommendationResultSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    check_result: Literal["ok", "recommendation"]
+    gap_code: LlmGapCode | None = None
+    recommendation: str | None = None
+
+    @model_validator(mode="after")
+    def validate_recommendation_fields(self) -> "LlmRecommendationResultSchema":
+        if self.check_result == LlmCheckResult.OK.value:
+            if self.gap_code is not None or self.recommendation is not None:
+                raise ValueError("ok result must contain null gap_code and recommendation")
+            return self
+        if self.gap_code is None:
+            raise ValueError("recommendation result must contain gap_code")
+        if not (self.recommendation or "").strip():
+            raise ValueError("recommendation result must contain recommendation")
         return self
 
 
@@ -197,6 +223,14 @@ class PromptRenderer:
             "reason": context.reason,
             "raw_change_description": context.raw_change_description,
             "clarification_text": context.clarification_text or "Не было.",
+            "initial_change_description": (
+                context.initial_change_description
+                or context.raw_change_description
+                or "Не указано."
+            ),
+            "previous_gap_code": context.previous_gap_code or "Не было.",
+            "previous_recommendation": context.previous_recommendation or "Не было.",
+            "iteration_number": str(context.iteration_number),
         }
         return system_prompt, _format_prompt(user_template, values)
 
@@ -247,11 +281,13 @@ class LlmClient:
         self.retry_backoff_factor = retry_backoff_factor
         self.log_full_request = log_full_request
         self.prompt_renderer = PromptRenderer(system_prompt_path, user_prompt_path)
-        self.response_schema: type[LlmResultSchema] = (
-            LlmV2ResultSchema
-            if Path(system_prompt_path).name == "gigachat_system_v2.md"
-            else LlmResultSchema
-        )
+        system_prompt_name = Path(system_prompt_path).name
+        if system_prompt_name == "gigachat_system_v2.md":
+            self.response_schema: type[BaseModel] = LlmV2ResultSchema
+        elif "v5_recommendation" in system_prompt_name:
+            self.response_schema = LlmRecommendationResultSchema
+        else:
+            self.response_schema = LlmResultSchema
         self._client = gigachat_client
 
     async def check_change_description(self, context: LlmContext) -> LlmResult:
@@ -301,19 +337,19 @@ class LlmClient:
         last_error: BaseException | None = None
         for attempt in range(1, GIGACHAT_JSON_RETRY_ATTEMPTS + 1):
             try:
-                parsed = await self._request_structured_result(
+                parsed, raw_response = await self._request_structured_result(
                     system_prompt,
                     user_prompt,
                     attempt=attempt,
                     total_attempts=GIGACHAT_JSON_RETRY_ATTEMPTS,
                 )
-                result = _schema_to_result(parsed, context)
+                result = _schema_to_result(parsed, context, raw_response=raw_response)
                 logger.info(
-                    "GigaChat completeness check completed: is_complete=%s "
-                    "has_blocker=%s has_clarification_instruction=%s attempt=%s/%s",
-                    result.is_complete,
-                    bool(result.blocking_problem),
-                    bool(result.clarification_instruction),
+                    "GigaChat recommendation check completed: check_result=%s "
+                    "gap_code=%s has_recommendation=%s attempt=%s/%s",
+                    result.check_result,
+                    result.gap_code,
+                    bool(result.recommendation),
                     attempt,
                     GIGACHAT_JSON_RETRY_ATTEMPTS,
                 )
@@ -359,6 +395,7 @@ class LlmClient:
             _fallback_result(
                 context,
                 f"{LLM_ERROR_PREFIX} {_exception_chain(last_error) or last_error}",
+                raw_response=getattr(last_error, "raw_response", None),
             ),
             started_at=started_at,
             response_attempts=attempt,
@@ -394,7 +431,7 @@ class LlmClient:
         *,
         attempt: int,
         total_attempts: int,
-    ) -> LlmResultSchema:
+    ) -> tuple[BaseModel, str]:
         client = self._get_client()
         completion = await client.achat(
             _build_structured_chat(
@@ -422,10 +459,13 @@ class LlmClient:
             len(raw_response or ""),
             _safe_response_preview(raw_response or ""),
         )
-        return _parse_llm_result(
+        return (
+            _parse_llm_result(
+                raw_response,
+                metadata=metadata,
+                response_schema=self.response_schema,
+            ),
             raw_response,
-            metadata=metadata,
-            response_schema=self.response_schema,
         )
 
     def _log_response_failure(
@@ -643,8 +683,8 @@ def _parse_llm_result(
     raw_response: str | None,
     *,
     metadata: dict[str, Any],
-    response_schema: type[LlmResultSchema] = LlmResultSchema,
-) -> LlmResultSchema:
+    response_schema: type[BaseModel] = LlmResultSchema,
+) -> BaseModel:
     raw = raw_response or ""
     if not raw.strip():
         raise LlmResponseError(
@@ -663,7 +703,11 @@ def _parse_llm_result(
             metadata=metadata,
             cause=exc,
         ) from exc
-    required_keys = {"is_complete", "blocking_problem", "clarification_instruction"}
+    required_keys = (
+        {"check_result", "gap_code", "recommendation"}
+        if response_schema is LlmRecommendationResultSchema
+        else {"is_complete", "blocking_problem", "clarification_instruction"}
+    )
     if not isinstance(payload, dict) or not required_keys.issubset(payload):
         raise LlmResponseError(
             "schema_validation",
@@ -752,7 +796,7 @@ def _header_value(headers: Any, name: str) -> Any:
 
 
 def _prompt_version(system_prompt_path: Path) -> str:
-    match = re.search(r"_v(?P<version>\d+)$", system_prompt_path.stem, re.IGNORECASE)
+    match = re.search(r"_v(?P<version>\d+)(?:_|$)", system_prompt_path.stem, re.IGNORECASE)
     if match:
         return f"v{match.group('version')}"
     return system_prompt_path.stem or "unknown"
@@ -833,7 +877,25 @@ def _format_prompt(template: str, values: dict[str, str]) -> str:
     return template.format(**values)
 
 
-def _schema_to_result(schema: LlmResultSchema, context: LlmContext) -> LlmResult:
+def _schema_to_result(
+    schema: BaseModel,
+    context: LlmContext,
+    *,
+    raw_response: str | None = None,
+) -> LlmResult:
+    if isinstance(schema, LlmRecommendationResultSchema):
+        is_complete = schema.check_result == LlmCheckResult.OK.value
+        gap_code = schema.gap_code.value if schema.gap_code is not None else None
+        recommendation = (schema.recommendation or "").strip() or None
+        return LlmResult(
+            is_complete=is_complete,
+            blocking_problem=gap_code,
+            clarification_instruction=recommendation,
+            check_result=schema.check_result,
+            gap_code=gap_code,
+            recommendation=recommendation,
+            raw_response=raw_response,
+        )
     if (
         isinstance(schema, LlmV2ResultSchema)
         and schema.is_complete
@@ -847,12 +909,40 @@ def _schema_to_result(schema: LlmResultSchema, context: LlmContext) -> LlmResult
             is_complete=False,
             blocking_problem=blocker,
             clarification_instruction=V2_BLOCKER_INSTRUCTIONS[blocker],
+            check_result=LlmCheckResult.RECOMMENDATION.value,
+            gap_code=LlmGapCode.MISSING_CHANGE_RATIONALE.value,
+            recommendation=V2_BLOCKER_INSTRUCTIONS[blocker],
+            raw_response=raw_response,
         )
+    assert isinstance(schema, LlmResultSchema)
+    gap_code = _legacy_gap_code(schema.blocking_problem)
+    recommendation = schema.clarification_instruction
     return LlmResult(
         is_complete=schema.is_complete,
         blocking_problem=schema.blocking_problem,
         clarification_instruction=schema.clarification_instruction,
+        check_result=(
+            LlmCheckResult.OK.value
+            if schema.is_complete
+            else LlmCheckResult.RECOMMENDATION.value
+        ),
+        gap_code=gap_code,
+        recommendation=recommendation,
+        raw_response=raw_response,
     )
+
+
+def _legacy_gap_code(blocking_problem: str | None) -> str | None:
+    text = (blocking_problem or "").lower()
+    if "1.1" in text or "нового ответа" in text:
+        return LlmGapCode.MISSING_NEW_ENTITY_CONTENT.value
+    if "1.2" in text or "конкретн" in text and "измен" in text:
+        return LlmGapCode.MISSING_CHANGE_CONTENT.value
+    if "2.1" in text or "ситуац" in text:
+        return LlmGapCode.MISSING_APPLICATION_CONTEXT.value
+    if "3.1" in text or "причин" in text or "основан" in text:
+        return LlmGapCode.MISSING_CHANGE_RATIONALE.value
+    return None
 
 
 def _v2_existing_answer_lacks_current_state(context: LlmContext) -> bool:
@@ -883,9 +973,16 @@ def _exception_chain(exc: BaseException) -> str:
     return " <- ".join(parts)
 
 
-def _fallback_result(context: LlmContext, problem: str) -> LlmResult:
+def _fallback_result(
+    context: LlmContext,
+    problem: str,
+    *,
+    raw_response: str | None = None,
+) -> LlmResult:
     return LlmResult(
         is_complete=True,
         blocking_problem=problem,
         clarification_instruction=None,
+        check_result=LlmCheckResult.ERROR.value,
+        raw_response=raw_response,
     )

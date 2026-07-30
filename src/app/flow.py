@@ -34,6 +34,7 @@ from app.models import (
     Draft,
     FieldName,
     KeyboardKind,
+    LlmCheckResult,
     LlmCheckStatus,
     LlmContext,
     LinkedSubmissionResult,
@@ -96,6 +97,12 @@ STEP_PROMPTS = {
         "«после нажатия добавить пояснение, чтобы клиент понимал следующий шаг» — суть."
     ),
     Step.CHANGE_DESCRIPTION_CLARIFICATION: "Введите дополнение к сути изменений.",
+    Step.CHANGE_DESCRIPTION_RECOMMENDATION: "Выберите, что сделать с рекомендацией.",
+    Step.CHANGE_DESCRIPTION_REVISION: (
+        "Пришлите полную новую версию поля «Суть изменений». "
+        "Она заменит сохранённый текст целиком."
+    ),
+    Step.CHANGE_DESCRIPTION_SKIP_REASON: "Почему вы решили пропустить рекомендацию?",
     Step.SOURCE_TEXT: "Пришлите предлагаемый текст.",
     Step.CHIP_TEXT_BEFORE: "Введите текст до чипса.",
     Step.CHIP_TEXT: "Введите текст чипса.",
@@ -227,7 +234,11 @@ class ApplicationFlow:
             )
 
         if existing is not None:
-            await self.repository.delete(telegram_user_id)
+            process = await self._closed_llm_process(existing, "restarted")
+            await self.repository.delete_with_llm_recommendation_state(
+                telegram_user_id,
+                process=process,
+            )
 
         draft = await self.repository.get_or_create(telegram_user_id)
         await self.repository.save_answer(
@@ -276,7 +287,13 @@ class ApplicationFlow:
         await self.repository.save_answer(telegram_user_id, "author_name", value)
 
     async def cancel(self, telegram_user_id: int) -> BotResponse:
-        await self.repository.delete(telegram_user_id)
+        draft = await self.repository.get_by_user_id(telegram_user_id)
+        if draft is not None:
+            process = await self._closed_llm_process(draft, "cancelled")
+            await self.repository.delete_with_llm_recommendation_state(
+                telegram_user_id,
+                process=process,
+            )
         return BotResponse(
             text="Заявка отменена. Чтобы создать новую, отправьте /new.",
             keyboard=KeyboardKind.CREATE_MODE,
@@ -819,7 +836,21 @@ class ApplicationFlow:
             case Step.CHANGE_DESCRIPTION:
                 return await self._process_change_description(telegram_user_id, value)
             case Step.CHANGE_DESCRIPTION_CLARIFICATION:
-                return await self._process_change_clarification(telegram_user_id, value)
+                return await self._process_change_revision(telegram_user_id, value)
+            case Step.CHANGE_DESCRIPTION_REVISION:
+                return await self._process_change_revision(telegram_user_id, value)
+            case Step.CHANGE_DESCRIPTION_RECOMMENDATION:
+                return await self._prompt_response_for_user(
+                    telegram_user_id,
+                    draft,
+                    prefix="Выберите действие кнопкой.",
+                )
+            case Step.CHANGE_DESCRIPTION_SKIP_REASON:
+                return await self._prompt_response_for_user(
+                    telegram_user_id,
+                    draft,
+                    prefix="Причину пропуска нужно выбрать кнопкой.",
+                )
             case Step.SOURCE_TEXT:
                 await self._save_source_text(telegram_user_id, value, formatting_spans)
                 next_step = (
@@ -863,17 +894,18 @@ class ApplicationFlow:
                 await self.repository.save_answer(telegram_user_id, FieldName.REASON.value, value)
                 return await self._return_to_review(telegram_user_id)
             case Step.EDIT_CHANGE_DESCRIPTION:
-                response = await self._process_change_description(
+                await self.repository.save_llm_result(
                     telegram_user_id,
-                    value,
-                    edit_mode=True,
+                    raw_change_description=value,
+                    formatted_change_description=value,
+                    llm_check_status=draft.llm_check_status,
+                    llm_score=None,
+                    clarification_count=draft.clarification_count,
                 )
-                if response.draft and response.draft.current_step == Step.SOURCE_TEXT:
-                    return await self._return_to_review(
-                        telegram_user_id,
-                        prefix="Суть изменений обновлена через GigaChat.",
-                    )
-                return response
+                return await self._return_to_review(
+                    telegram_user_id,
+                    prefix="Суть изменений обновлена без повторной проверки.",
+                )
             case Step.EDIT_CHIP_RESPONSE_CHANGE_DESCRIPTION:
                 await self._save_chip_response_change_description(telegram_user_id, value)
                 return await self._return_to_review(telegram_user_id)
@@ -907,8 +939,116 @@ class ApplicationFlow:
         return draft is not None and not _is_chips(draft) and draft.current_step in {
             Step.CHANGE_DESCRIPTION,
             Step.CHANGE_DESCRIPTION_CLARIFICATION,
-            Step.EDIT_CHANGE_DESCRIPTION,
+            Step.CHANGE_DESCRIPTION_REVISION,
         }
+
+    async def accept_llm_recommendation(self, telegram_user_id: int) -> BotResponse:
+        draft = await self._get_active_or_start(telegram_user_id)
+        if draft.current_step != Step.CHANGE_DESCRIPTION_RECOMMENDATION:
+            return await self._prompt_response_for_user(
+                telegram_user_id,
+                draft,
+                prefix="Эта рекомендация уже обработана.",
+            )
+        process = await self._load_llm_process(draft)
+        if process is None or len(process.get("iterations", [])) != 1:
+            return await self._advance_after_llm(
+                telegram_user_id,
+                draft,
+                prefix="Не удалось восстановить рекомендацию. Продолжаем заполнение заявки.",
+            )
+        process["state"] = "awaiting_revision"
+        process.setdefault("actions", []).append(
+            {
+                "action": "add",
+                "selected_at": _utc_now(),
+            }
+        )
+        draft = await self.repository.save_llm_recommendation_state(
+            telegram_user_id,
+            process=process,
+            draft_values={"current_step": Step.CHANGE_DESCRIPTION_REVISION.value},
+        )
+        current_text = draft.raw_change_description or ""
+        return await self._prompt_response_for_user(
+            telegram_user_id,
+            draft,
+            prefix=f"Сейчас сохранено:\n{escape(current_text)}",
+        )
+
+    async def skip_llm_recommendation(self, telegram_user_id: int) -> BotResponse:
+        draft = await self._get_active_or_start(telegram_user_id)
+        if draft.current_step != Step.CHANGE_DESCRIPTION_RECOMMENDATION:
+            return await self._prompt_response_for_user(
+                telegram_user_id,
+                draft,
+                prefix="Эта рекомендация уже обработана.",
+            )
+        process = await self._load_llm_process(draft)
+        if process is None:
+            return await self._advance_after_llm(
+                telegram_user_id,
+                draft,
+                prefix="Не удалось восстановить рекомендацию. Продолжаем заполнение заявки.",
+            )
+        process["state"] = "awaiting_skip_reason"
+        draft = await self.repository.save_llm_recommendation_state(
+            telegram_user_id,
+            process=process,
+            draft_values={"current_step": Step.CHANGE_DESCRIPTION_SKIP_REASON.value},
+        )
+        return await self._prompt_response_for_user(telegram_user_id, draft)
+
+    async def select_llm_skip_reason(
+        self,
+        telegram_user_id: int,
+        reason: str,
+    ) -> BotResponse:
+        draft = await self._get_active_or_start(telegram_user_id)
+        if draft.current_step != Step.CHANGE_DESCRIPTION_SKIP_REASON:
+            return await self._prompt_response_for_user(
+                telegram_user_id,
+                draft,
+                prefix="Причина пропуска уже сохранена.",
+            )
+        if reason not in {"optional", "incorrect", "unclear"}:
+            return await self._prompt_response_for_user(
+                telegram_user_id,
+                draft,
+                prefix="Неизвестная причина пропуска.",
+            )
+        process = await self._load_llm_process(draft)
+        if process is None:
+            return await self._advance_after_llm(
+                telegram_user_id,
+                draft,
+                prefix="Не удалось восстановить рекомендацию. Продолжаем заполнение заявки.",
+            )
+        now = _utc_now()
+        process["state"] = "skipped"
+        process["completed_at"] = now
+        process["final_outcome"] = f"skipped_{reason}"
+        process.setdefault("actions", []).append(
+            {
+                "action": "skip",
+                "reason": reason,
+                "selected_at": now,
+            }
+        )
+        next_step = Step.SOURCE_TEXT
+        draft = await self.repository.save_llm_recommendation_state(
+            telegram_user_id,
+            process=process,
+            draft_values={
+                "current_step": next_step.value,
+                "llm_check_status": LlmCheckStatus.NEEDS_ATTENTION.value,
+            },
+        )
+        return await self._prompt_response_for_user(
+            telegram_user_id,
+            draft,
+            prefix="Рекомендация пропущена.",
+        )
 
     async def select_direction(self, telegram_user_id: int, direction: Direction) -> BotResponse:
         draft = await self._get_active_or_start(telegram_user_id)
@@ -1197,6 +1337,21 @@ class ApplicationFlow:
 
     async def back(self, telegram_user_id: int) -> BotResponse:
         draft = await self._get_active_or_start(telegram_user_id)
+        if draft.current_step in {
+            Step.CHANGE_DESCRIPTION_REVISION,
+            Step.CHANGE_DESCRIPTION_SKIP_REASON,
+        }:
+            process = await self._load_llm_process(draft)
+            if process is not None:
+                process["state"] = "awaiting_action"
+                draft = await self.repository.save_llm_recommendation_state(
+                    telegram_user_id,
+                    process=process,
+                    draft_values={
+                        "current_step": Step.CHANGE_DESCRIPTION_RECOMMENDATION.value,
+                    },
+                )
+                return self._recommendation_response(draft, process)
         if _is_chips(draft):
             previous_step = (
                 Step.CHIP_RESPONSE_CHANGE_DESCRIPTION
@@ -1242,6 +1397,9 @@ class ApplicationFlow:
                 Step.REASON: Step.SCRIPTWRITER,
                 Step.CHANGE_DESCRIPTION: Step.REASON,
                 Step.CHANGE_DESCRIPTION_CLARIFICATION: Step.CHANGE_DESCRIPTION,
+                Step.CHANGE_DESCRIPTION_RECOMMENDATION: Step.CHANGE_DESCRIPTION,
+                Step.CHANGE_DESCRIPTION_REVISION: Step.CHANGE_DESCRIPTION_RECOMMENDATION,
+                Step.CHANGE_DESCRIPTION_SKIP_REASON: Step.CHANGE_DESCRIPTION_RECOMMENDATION,
                 Step.SOURCE_TEXT: Step.CHANGE_DESCRIPTION,
                 Step.URGENCY: Step.SOURCE_TEXT,
                 Step.PRIORITY: Step.SOURCE_TEXT,
@@ -1617,7 +1775,7 @@ class ApplicationFlow:
         *,
         edit_mode: bool = False,
     ) -> BotResponse:
-        """Проверить полноту описания и запросить не более одного уточнения."""
+        """Выполнить первую рекомендательную проверку поля."""
         existing = await self.repository.get_by_user_id(telegram_user_id)
         if existing is not None and _is_chips(existing):
             await self.repository.save_llm_result(
@@ -1633,10 +1791,62 @@ class ApplicationFlow:
             if next_step == Step.REVIEW:
                 return self._review_response(draft)
             return await self._prompt_response_for_user(telegram_user_id, draft)
-        draft = await self.repository.save_answer(
+
+        if edit_mode:
+            if existing is None:
+                return await self.start_new(telegram_user_id, force=True)
+            await self.repository.save_llm_result(
+                telegram_user_id,
+                raw_change_description=value,
+                formatted_change_description=value,
+                llm_check_status=existing.llm_check_status,
+                llm_score=None,
+                clarification_count=existing.clarification_count,
+            )
+            return await self._return_to_review(
+                telegram_user_id,
+                prefix="Суть изменений обновлена без повторной проверки.",
+            )
+
+        draft = existing or await self._get_active_or_start(telegram_user_id)
+        now = _utc_now()
+        process = {
+            "schema_version": 1,
+            "application_id": draft.application_id,
+            "telegram_user_id": telegram_user_id,
+            "field_code": "change_description",
+            "state": "checking",
+            "started_at": now,
+            "completed_at": None,
+            "initial_text": value,
+            "current_text": value,
+            "context": {
+                "direction": draft.direction or "",
+                "answer_type": draft.answer_type or "",
+                "change_type": draft.change_type or "",
+                "intent": draft.intent or "",
+                "reason": draft.reason or "",
+            },
+            "iterations": [
+                _llm_iteration_started(
+                    number=1,
+                    current_text=value,
+                    initial_text=value,
+                )
+            ],
+            "actions": [],
+            "final_outcome": None,
+        }
+        draft = await self.repository.save_llm_recommendation_state(
             telegram_user_id,
-            "raw_change_description",
-            value,
+            process=process,
+            draft_values={
+                "raw_change_description": value,
+                "formatted_change_description": value,
+                "llm_check_status": LlmCheckStatus.NOT_CHECKED.value,
+                "llm_score": None,
+                "clarification_count": 0,
+            },
         )
         llm_result = await self.llm_client.check_change_description(
             LlmContext(
@@ -1647,15 +1857,32 @@ class ApplicationFlow:
                 scriptwriter=draft.scriptwriter or "",
                 reason=draft.reason or "",
                 raw_change_description=value,
+                initial_change_description=value,
+                iteration_number=1,
             )
         )
+        _complete_llm_iteration(process["iterations"][-1], llm_result)
         status = self._status_from_llm_result(llm_result)
-        await self.repository.save_llm_result(
+        is_error = _is_llm_error_result(llm_result)
+        if is_error or llm_result.is_complete:
+            process["state"] = "completed"
+            process["completed_at"] = _utc_now()
+            process["final_outcome"] = "technical_fallback" if is_error else "ok"
+            next_step = Step.SOURCE_TEXT
+        else:
+            process["state"] = "awaiting_action"
+            process["final_outcome"] = None
+            next_step = Step.CHANGE_DESCRIPTION_RECOMMENDATION
+        draft = await self.repository.save_llm_recommendation_state(
             telegram_user_id,
-            formatted_change_description=value,
-            llm_check_status=status,
-            llm_score=None,
-            clarification_count=0,
+            process=process,
+            draft_values={
+                "current_step": next_step.value,
+                "formatted_change_description": value,
+                "llm_check_status": status,
+                "llm_score": None,
+                "clarification_count": 0,
+            },
             application_event=_llm_check_completed_event(
                 draft,
                 llm_result,
@@ -1665,34 +1892,18 @@ class ApplicationFlow:
             ),
         )
 
-        if llm_result.is_complete or status == LlmCheckStatus.ERROR.value:
-            next_step = Step.REVIEW if edit_mode else Step.SOURCE_TEXT
-            draft = await self.repository.set_step(telegram_user_id, next_step)
+        if next_step == Step.SOURCE_TEXT:
             prefix = self._with_llm_json(
                 self._llm_success_prefix(status),
                 llm_result,
             )
-            if edit_mode:
-                return self._review_response(draft, prefix=prefix)
             return await self._prompt_response_for_user(telegram_user_id, draft, prefix=prefix)
+        return self._recommendation_response(draft, process)
 
-        draft = await self.repository.set_step(
-            telegram_user_id,
-            Step.CHANGE_DESCRIPTION_CLARIFICATION,
-        )
-        return await self._prompt_response_for_user(
-            telegram_user_id,
-            draft,
-            prefix=self._with_llm_json(
-                self._clarification_prefix(llm_result),
-                llm_result,
-            ),
-        )
-
-    async def _process_change_clarification(
+    async def _process_change_revision(
         self,
         telegram_user_id: int,
-        clarification: str,
+        revised_text: str,
     ) -> BotResponse:
         draft = await self.repository.get_by_user_id(telegram_user_id)
         if draft is None:
@@ -1704,23 +1915,64 @@ class ApplicationFlow:
                 return self._review_response(draft)
             return await self._prompt_response_for_user(telegram_user_id, draft)
 
-        trigger = "edit" if draft.source_text else "create"
-        clarification_number = draft.clarification_count + 1
+        process = await self._load_llm_process(draft)
+        if process is None:
+            await self.repository.set_step(telegram_user_id, Step.CHANGE_DESCRIPTION)
+            return await self._process_change_description(telegram_user_id, revised_text)
+        iterations = process.setdefault("iterations", [])
+        if len(iterations) >= 2 or process.get("state") != "awaiting_revision":
+            return await self._advance_after_llm(
+                telegram_user_id,
+                draft,
+                prefix="Лимит проверок уже исчерпан. Суть изменений сохранена.",
+                revised_text=revised_text,
+            )
+
+        trigger = "create"
+        previous = iterations[-1]
+        previous_response = previous.get("response") or {}
+        initial_text = str(process.get("initial_text") or draft.raw_change_description or "")
+        prior_text = str(process.get("current_text") or draft.raw_change_description or "")
+        now = _utc_now()
+        actions = process.setdefault("actions", [])
+        if actions and actions[-1].get("action") == "add":
+            actions[-1].update(
+                {
+                    "submitted_at": now,
+                    "text_changed": revised_text != prior_text,
+                    "text_delta_chars": len(revised_text) - len(prior_text),
+                }
+            )
+        process["state"] = "checking"
+        process["current_text"] = revised_text
+        iterations.append(
+            _llm_iteration_started(
+                number=2,
+                current_text=revised_text,
+                initial_text=initial_text,
+                previous_gap_code=previous_response.get("gap_code"),
+                previous_recommendation=previous_response.get("recommendation"),
+            )
+        )
+        draft = await self.repository.save_llm_recommendation_state(
+            telegram_user_id,
+            process=process,
+            draft_values={
+                "raw_change_description": revised_text,
+                "formatted_change_description": revised_text,
+                "clarification_count": 1,
+            },
+        )
         await self.repository.record_application_event(
             event_type=LLM_CLARIFICATION_SUBMITTED_EVENT_TYPE,
             application_id=draft.application_id,
             telegram_user_id=telegram_user_id,
             metadata={
                 "schema_version": 1,
-                "clarification_number": clarification_number,
+                "clarification_number": 1,
                 "trigger": trigger,
             },
         )
-        original_description = draft.raw_change_description or ""
-        combined_description = (
-            f"{original_description}\n\n"
-            f"Уточнение сценариста: {clarification}"
-        ).strip()
         llm_result = await self.llm_client.check_change_description(
             LlmContext(
                 direction=draft.direction or "",
@@ -1729,17 +1981,38 @@ class ApplicationFlow:
                 intent=draft.intent or "",
                 scriptwriter=draft.scriptwriter or "",
                 reason=draft.reason or "",
-                raw_change_description=original_description,
-                clarification_text=clarification,
+                raw_change_description=revised_text,
+                initial_change_description=initial_text,
+                clarification_text=revised_text,
+                previous_gap_code=str(previous_response.get("gap_code") or ""),
+                previous_recommendation=str(
+                    previous_response.get("recommendation") or ""
+                ),
+                iteration_number=2,
             )
         )
+        _complete_llm_iteration(iterations[-1], llm_result)
         status = self._status_from_llm_result(llm_result, after_clarification=True)
-        await self.repository.save_llm_result(
+        is_error = _is_llm_error_result(llm_result)
+        process["state"] = "completed"
+        process["completed_at"] = _utc_now()
+        process["final_outcome"] = (
+            "technical_fallback"
+            if is_error
+            else ("ok" if llm_result.is_complete else "recommendation_after_limit")
+        )
+        next_step = Step.SOURCE_TEXT
+        draft = await self.repository.save_llm_recommendation_state(
             telegram_user_id,
-            formatted_change_description=combined_description,
-            llm_check_status=status,
-            llm_score=None,
-            clarification_count=clarification_number,
+            process=process,
+            draft_values={
+                "current_step": next_step.value,
+                "raw_change_description": revised_text,
+                "formatted_change_description": revised_text,
+                "llm_check_status": status,
+                "llm_score": None,
+                "clarification_count": 1,
+            },
             application_event=_llm_check_completed_event(
                 draft,
                 llm_result,
@@ -1748,19 +2021,89 @@ class ApplicationFlow:
                 status=status,
             ),
         )
-        next_step = Step.REVIEW if draft.source_text and draft.is_urgent is not None else Step.SOURCE_TEXT
-        draft = await self.repository.set_step(telegram_user_id, next_step)
-        prefix = self._llm_success_prefix(status)
         if status == LlmCheckStatus.NEEDS_ATTENTION.value:
-            prefix = (
-                "Описание все еще выглядит неполным. "
-                "Заявка продолжит заполняться и уйдет редактору с пометкой, "
-                "что нужно дополнительное внимание."
+            prefix = _result_recommendation(llm_result) or (
+                "Может быть, в описании всё ещё не хватает важной информации."
             )
+        else:
+            prefix = self._llm_success_prefix(status)
         prefix = self._with_llm_json(prefix, llm_result)
-        if next_step == Step.REVIEW:
-            return self._review_response(draft, prefix=prefix)
         return await self._prompt_response_for_user(telegram_user_id, draft, prefix=prefix)
+
+    async def _load_llm_process(self, draft: Draft) -> dict[str, object] | None:
+        if not draft.application_id:
+            return None
+        stored = await self.repository.get_llm_recommendation_process(draft.application_id)
+        if stored is None:
+            return None
+        try:
+            process = json.loads(stored.process_json)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return process if isinstance(process, dict) else None
+
+    async def _closed_llm_process(
+        self,
+        draft: Draft,
+        outcome: str,
+    ) -> dict[str, object] | None:
+        process = await self._load_llm_process(draft)
+        if process is None or process.get("state") in {"completed", "skipped", "cancelled"}:
+            return None
+        process["state"] = "cancelled"
+        process["completed_at"] = _utc_now()
+        process["final_outcome"] = outcome
+        process.setdefault("actions", []).append(
+            {
+                "action": outcome,
+                "selected_at": _utc_now(),
+            }
+        )
+        return process
+
+    def _recommendation_response(
+        self,
+        draft: Draft,
+        process: dict[str, object],
+    ) -> BotResponse:
+        iterations = process.get("iterations")
+        latest = iterations[-1] if isinstance(iterations, list) and iterations else {}
+        response = latest.get("response") if isinstance(latest, dict) else {}
+        recommendation = (
+            response.get("recommendation")
+            if isinstance(response, dict)
+            else None
+        )
+        text = str(recommendation or "Может быть, тут не хватает важной информации.")
+        return BotResponse(
+            text=f"{escape(text)}\n\nХотите дополнить описание или пропустить рекомендацию?",
+            keyboard=KeyboardKind.LLM_RECOMMENDATION,
+            draft=draft,
+        )
+
+    async def _advance_after_llm(
+        self,
+        telegram_user_id: int,
+        draft: Draft,
+        *,
+        prefix: str,
+        revised_text: str | None = None,
+    ) -> BotResponse:
+        if revised_text is not None:
+            await self.repository.save_llm_result(
+                telegram_user_id,
+                raw_change_description=revised_text,
+                formatted_change_description=revised_text,
+                llm_check_status=draft.llm_check_status,
+                llm_score=None,
+                clarification_count=draft.clarification_count,
+            )
+        draft = await self.repository.set_step(telegram_user_id, Step.SOURCE_TEXT)
+        return await self._prompt_response_for_user(
+            telegram_user_id,
+            draft,
+            prefix=prefix,
+        )
 
     def _with_llm_json(self, prefix: str, llm_result) -> str:
         if not self.show_llm_response_json:
@@ -1916,6 +2259,23 @@ class ApplicationFlow:
         *,
         prefix: str | None = None,
     ) -> BotResponse:
+        if draft.current_step == Step.CHANGE_DESCRIPTION_RECOMMENDATION:
+            process = await self._load_llm_process(draft)
+            if process is not None:
+                return self._recommendation_response(draft, process)
+        if draft.current_step == Step.CHANGE_DESCRIPTION_REVISION and prefix is None:
+            process = await self._load_llm_process(draft)
+            if process is not None:
+                iterations = process.get("iterations")
+                latest = iterations[-1] if isinstance(iterations, list) and iterations else {}
+                result = latest.get("response") if isinstance(latest, dict) else {}
+                recommendation = (
+                    result.get("recommendation") if isinstance(result, dict) else None
+                )
+                prefix = (
+                    f"Рекомендация:\n{escape(str(recommendation or ''))}\n\n"
+                    f"Сейчас сохранено:\n{escape(draft.raw_change_description or '')}"
+                )
         response = self._prompt_response(draft, prefix=prefix)
         if draft.current_step == Step.DIRECTION:
             settings = await self.repository.get_user_settings(telegram_user_id)
@@ -1942,6 +2302,9 @@ class ApplicationFlow:
         incompatible_steps = {
             Step.CHANGE_DESCRIPTION,
             Step.CHANGE_DESCRIPTION_CLARIFICATION,
+            Step.CHANGE_DESCRIPTION_RECOMMENDATION,
+            Step.CHANGE_DESCRIPTION_REVISION,
+            Step.CHANGE_DESCRIPTION_SKIP_REASON,
             Step.SOURCE_TEXT,
             Step.EDIT_CHANGE_DESCRIPTION,
             Step.EDIT_SOURCE_TEXT,
@@ -2001,6 +2364,10 @@ class ApplicationFlow:
             return KeyboardKind.URGENCY
         if step in {Step.PRIORITY, Step.EDIT_PRIORITY}:
             return KeyboardKind.PRIORITY
+        if step == Step.CHANGE_DESCRIPTION_RECOMMENDATION:
+            return KeyboardKind.LLM_RECOMMENDATION
+        if step == Step.CHANGE_DESCRIPTION_SKIP_REASON:
+            return KeyboardKind.LLM_SKIP_REASON
         if step == Step.REVIEW:
             return KeyboardKind.REVIEW
         if step == Step.COMPLETED:
@@ -2319,6 +2686,8 @@ def _bulk_reservation_is_recent(
 
 
 def _is_llm_error_result(llm_result) -> bool:
+    if getattr(llm_result, "check_result", None) == LlmCheckResult.ERROR.value:
+        return True
     problem = llm_result.blocking_problem or ""
     return (
         problem.startswith(LLM_ERROR_PREFIX)
@@ -2356,6 +2725,7 @@ def _llm_check_completed_event(
             "prompt_hash": getattr(telemetry, "prompt_hash", None),
             "model": getattr(telemetry, "model", None),
             "blocking_rule": _llm_blocking_rule(llm_result.blocking_problem),
+            "gap_code": _result_gap_code(llm_result),
             "duration_ms": getattr(telemetry, "duration_ms", None),
             "response_attempts": getattr(telemetry, "response_attempts", None),
             "validation_retries": getattr(telemetry, "validation_retries", None),
@@ -2365,6 +2735,14 @@ def _llm_check_completed_event(
 
 
 def _llm_blocking_rule(blocking_problem: str | None) -> str | None:
+    gap_rules = {
+        "missing_new_entity_content": "1.1",
+        "missing_change_content": "1.2",
+        "missing_application_context": "2.1",
+        "missing_change_rationale": "3.1",
+    }
+    if blocking_problem in gap_rules:
+        return gap_rules[blocking_problem]
     match = re.search(r"правило\s+(1\.[12]|[23]\.1)", blocking_problem or "", re.IGNORECASE)
     if match and match.group(1) in {"1.1", "1.2", "2.1", "3.1"}:
         return match.group(1)
@@ -2374,10 +2752,94 @@ def _llm_blocking_rule(blocking_problem: str | None) -> str | None:
 def _llm_result_to_json(llm_result) -> str:
     return json.dumps(
         {
-            "is_complete": llm_result.is_complete,
-            "blocking_problem": llm_result.blocking_problem,
-            "clarification_instruction": llm_result.clarification_instruction,
+            "check_result": _result_check_result(llm_result),
+            "gap_code": _result_gap_code(llm_result),
+            "recommendation": _result_recommendation(llm_result),
         },
         ensure_ascii=False,
         indent=2,
     )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _llm_iteration_started(
+    *,
+    number: int,
+    current_text: str,
+    initial_text: str,
+    previous_gap_code: object = None,
+    previous_recommendation: object = None,
+) -> dict[str, object]:
+    return {
+        "check_id": str(uuid4()),
+        "number": number,
+        "started_at": _utc_now(),
+        "completed_at": None,
+        "input": {
+            "initial_text": initial_text,
+            "current_text": current_text,
+            "previous_gap_code": previous_gap_code,
+            "previous_recommendation": previous_recommendation,
+        },
+        "response": None,
+        "raw_response": None,
+        "parse_status": "pending",
+        "technical": None,
+        "llm": None,
+    }
+
+
+def _complete_llm_iteration(iteration: dict[str, object], llm_result) -> None:
+    telemetry = getattr(llm_result, "telemetry", None)
+    is_error = _is_llm_error_result(llm_result)
+    iteration.update(
+        {
+            "completed_at": _utc_now(),
+            "response": {
+                "check_result": _result_check_result(llm_result),
+                "gap_code": _result_gap_code(llm_result),
+                "recommendation": _result_recommendation(llm_result),
+            },
+            "raw_response": getattr(llm_result, "raw_response", None),
+            "parse_status": "error" if is_error else "valid",
+            "technical": {
+                "error_kind": getattr(telemetry, "error_kind", None),
+                "response_attempts": getattr(telemetry, "response_attempts", None),
+                "validation_retries": getattr(telemetry, "validation_retries", None),
+                "duration_ms": getattr(telemetry, "duration_ms", None),
+            },
+            "llm": {
+                "model": getattr(telemetry, "model", None),
+                "prompt_version": getattr(telemetry, "prompt_version", "unknown"),
+                "prompt_hash": getattr(telemetry, "prompt_hash", None),
+                "generation_parameters": {
+                    "temperature": 0.01,
+                    "response_format": "json_schema",
+                },
+            },
+        }
+    )
+
+
+def _result_check_result(llm_result) -> str:
+    if _is_llm_error_result(llm_result):
+        return LlmCheckResult.ERROR.value
+    if llm_result.is_complete:
+        return LlmCheckResult.OK.value
+    return LlmCheckResult.RECOMMENDATION.value
+
+
+def _result_gap_code(llm_result) -> str | None:
+    value = getattr(llm_result, "gap_code", None)
+    return str(value) if value else None
+
+
+def _result_recommendation(llm_result) -> str | None:
+    value = getattr(llm_result, "recommendation", None)
+    if value:
+        return str(value)
+    legacy = getattr(llm_result, "clarification_instruction", None)
+    return str(legacy) if legacy else None

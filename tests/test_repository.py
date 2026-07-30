@@ -850,6 +850,44 @@ async def test_save_llm_result_rolls_back_when_event_cannot_be_serialized(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_save_llm_recommendation_state_is_atomic(tmp_path):
+    repository = DraftRepository(str(tmp_path / "llm-process-rollback.db"))
+    await repository.init()
+    draft = await repository.get_or_create(64)
+
+    with pytest.raises(TypeError):
+        await repository.save_llm_recommendation_state(
+            64,
+            process={"state": "completed", "iterations": []},
+            draft_values={
+                "formatted_change_description": "Не должно сохраниться",
+                "llm_check_status": "complete",
+            },
+            application_event={
+                "event_type": "llm_check_completed",
+                "application_id": draft.application_id,
+                "telegram_user_id": 64,
+                "new_value": "passed",
+                "metadata": {"not_json": object()},
+            },
+        )
+
+    unchanged = await repository.get_by_user_id(64)
+    process = await repository.get_llm_recommendation_process(
+        draft.application_id or ""
+    )
+    events = await repository.list_application_events(
+        application_id=draft.application_id,
+        event_type="llm_check_completed",
+    )
+    assert unchanged is not None
+    assert unchanged.llm_check_status == "not_checked"
+    assert unchanged.formatted_change_description is None
+    assert process is None
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_new_draft_gets_application_id(tmp_path):
     repository = DraftRepository(str(tmp_path / "drafts.db"))
     await repository.init()

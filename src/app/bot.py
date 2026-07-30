@@ -566,6 +566,41 @@ def create_router(flow: ApplicationFlow) -> Router:
     async def callback_back(callback: CallbackQuery) -> None:
         await ui.answer_callback(callback, await flow.back(_callback_user_id(callback)))
 
+    @router.callback_query(F.data == CallbackData.LLM_ADD)
+    async def callback_llm_add(callback: CallbackQuery) -> None:
+        await ui.answer_callback(
+            callback,
+            await flow.accept_llm_recommendation(_callback_user_id(callback)),
+        )
+
+    @router.callback_query(F.data == CallbackData.LLM_SKIP)
+    async def callback_llm_skip(callback: CallbackQuery) -> None:
+        await ui.answer_callback(
+            callback,
+            await flow.skip_llm_recommendation(_callback_user_id(callback)),
+        )
+
+    @router.callback_query(F.data == CallbackData.LLM_SKIP_OPTIONAL)
+    async def callback_llm_skip_optional(callback: CallbackQuery) -> None:
+        await ui.answer_callback(
+            callback,
+            await flow.select_llm_skip_reason(_callback_user_id(callback), "optional"),
+        )
+
+    @router.callback_query(F.data == CallbackData.LLM_SKIP_INCORRECT)
+    async def callback_llm_skip_incorrect(callback: CallbackQuery) -> None:
+        await ui.answer_callback(
+            callback,
+            await flow.select_llm_skip_reason(_callback_user_id(callback), "incorrect"),
+        )
+
+    @router.callback_query(F.data == CallbackData.LLM_SKIP_UNCLEAR)
+    async def callback_llm_skip_unclear(callback: CallbackQuery) -> None:
+        await ui.answer_callback(
+            callback,
+            await flow.select_llm_skip_reason(_callback_user_id(callback), "unclear"),
+        )
+
     @router.callback_query(F.data.startswith("app:direction:"))
     async def callback_direction(callback: CallbackQuery) -> None:
         direction_value = (callback.data or "").split(":", maxsplit=2)[2]

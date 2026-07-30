@@ -684,33 +684,33 @@ CREATE TABLE application_events (
 | `editor_comment_added` | Стабильно появился комментарий редактора | факт обратной связи редактора |
 | `scriptwriter_response_added` | Стабильно появился или изменился `Ответ сценариста` | факт ответа сценариста и время реакции |
 | `final_answer_added` | Появился или изменился итоговый ответ редактора | время до финального ответа |
-| `llm_check_completed` | Завершилась одна логическая проверка ADD/EDIT через GigaChat | first-pass rate, возвраты на уточнение, причины блокировки, длительность и технические ошибки |
-| `llm_clarification_submitted` | Пользователь прислал ответ на запрос уточнения перед повторной проверкой | время ответа пользователя и число уточнений |
+| `llm_check_completed` | Завершилась одна логическая проверка одиночной ADD/EDIT через GigaChat | first-pass rate, рекомендации, коды пробелов, длительность и технические ошибки |
+| `llm_clarification_submitted` | Пользователь прислал полную новую версию поля после рекомендации | время реакции пользователя и число повторных проверок |
 | `application_not_found` | Polling не нашёл заявку в ожидаемых листах | диагностика потерянных заявок; повторные записи не считать новыми заявками |
 | `application_deletion_error` | Не удалось подтвердить или удалить строку по статусу `Удаление` | ошибки безопасного удаления |
 | `application_deleted` | Строка удалена из Sheets и tracking очищен | контроль удалений и cleanup |
 
 ### Атомарность и повторяемость
 
-События polling записываются в одной SQLite-транзакции с обновлением tracking и постановкой связанных notification/dashboard outbox-событий. `llm_check_completed` записывается в одной транзакции с обновлением результата проверки в черновике. Если транзакция не завершилась, соответствующее состояние и событие не считаются зафиксированными.
+События polling записываются в одной SQLite-транзакции с обновлением tracking и постановкой связанных notification/dashboard outbox-событий. `llm_check_completed`, состояние черновика и строка `llm_recommendation_processes` записываются в одной транзакции. Если транзакция не завершилась, соответствующее состояние и событие не считаются зафиксированными.
 
 Неизменившееся значение при повторном polling не создаёт новый `status_changed`, `editor_changed` или `final_answer_added`. Для стабильных текстовых полей используется проверка одинакового значения в трёх polling-циклах; событие создаётся после третьего наблюдения. `application_not_found` может повторяться по одной заявке через интервал повторной проверки и не доказывает физическое удаление строки.
 
 ### События проверки GigaChat
 
-Одна строка `llm_check_completed` соответствует одной логической проверке, а не каждой HTTP-попытке SDK. Событие создаётся только для первоначальной и повторной проверки одиночных ADD/EDIT. CHIPS, массовые заявки и автоматически создаваемая ADD/EDIT-строка после CHIPS не вызывают GigaChat и не создают эти события.
+Одна строка `llm_check_completed` соответствует одной бизнес-проверке, а не каждой HTTP-попытке SDK. В V5 событие создаётся только для первоначальной и, после выбора «Дополнить», второй проверки одиночных ADD/EDIT при создании заявки. Редактирование поля из review новую проверку не запускает. CHIPS, массовые заявки и автоматически создаваемая ADD/EDIT-строка после CHIPS не вызывают GigaChat и не создают эти события.
 
 `new_value` принимает одно из значений:
 
 - `passed` — описание прошло проверку;
-- `needs_clarification` — требуется уточнение пользователя;
+- `needs_clarification` — модель сформировала необязательную рекомендацию;
 - `technical_fallback` — проверка не завершилась технически, пользовательский flow продолжился.
 
-`metadata_json` имеет `schema_version=1` и содержит только технические признаки: `stage` (`initial` или `clarification`), `trigger` (`create` или `edit`), `prompt_version`, `prompt_hash`, `model`, `blocking_rule`, `duration_ms`, `response_attempts`, `validation_retries`, `error_kind`. `blocking_rule` допускает только `1.1`, `1.2`, `2.1`, `3.1` или `null`. `error_kind` нормализуется в `not_configured`, `timeout`, `network`, `auth`, `rate_limit`, `provider_error`, `empty_response`, `invalid_json`, `schema_validation`, `truncated_response`, `unknown`.
+`metadata_json` имеет `schema_version=1` и содержит только технические признаки: `stage` (`initial` или `clarification`), `trigger` (`create` для V5), `prompt_version`, `prompt_hash`, `model`, `blocking_rule`, `gap_code`, `duration_ms`, `response_attempts`, `validation_retries`, `error_kind`. `gap_code` принимает один из четырёх кодов V5 или `null`; `blocking_rule` остаётся совместимым отображением в `1.1`, `1.2`, `2.1`, `3.1`. `error_kind` нормализуется в `not_configured`, `timeout`, `network`, `auth`, `rate_limit`, `provider_error`, `empty_response`, `invalid_json`, `schema_validation`, `truncated_response`, `unknown`.
 
-`prompt_hash` — первые 12 символов SHA-256 от исходных system/user шаблонов. Пользовательские значения в хеш не входят. Полные тексты заявки, промптов, ответа GigaChat, уточнения и инструкции пользователю в события не записываются.
+`prompt_hash` — первые 12 символов SHA-256 от исходных system/user шаблонов. Пользовательские значения в хеш не входят. Полные тексты заявки, промптов, ответа GigaChat, новой версии поля и рекомендации в обезличенные события не записываются. Подробный аудит хранится отдельно: одна защищённая строка `llm_recommendation_processes` на `application_id`, включая `process_json`.
 
-`llm_clarification_submitted` содержит только `schema_version=1`, порядковый `clarification_number` и `trigger`. Время ответа пользователя рассчитывается между предыдущим `llm_check_completed` со значением `needs_clarification` и следующим `llm_clarification_submitted` той же заявки.
+`llm_clarification_submitted` сохранено как совместимое краткое событие и содержит только `schema_version=1`, `clarification_number=1` и `trigger=create`. Время реакции пользователя рассчитывается между предыдущим `llm_check_completed` со значением `needs_clarification` и следующим `llm_clarification_submitted` той же заявки.
 
 ### Как dashboard читает события
 
@@ -731,9 +731,9 @@ Remote collector выбирает события за последние 30 дн
 - Наличие строки в `submitted_applications` не гарантирует полный набор событий.
 - `editor_comment_added` — текущий код комментария редактора; `user_comment_added` в production-коде не создаётся.
 - `scriptwriter_response_added` относится к заполнению `Ответ сценариста` в Sheets, а не к произвольному сообщению в Telegram.
-- События не являются аудитом полного содержимого заявки: полный текст хранится в Sheets.
+- События не являются аудитом полного содержимого заявки. Подробный цикл LLM-проверки хранится в `llm_recommendation_processes`, а итоговый текст заявки — в Sheets.
 - LLM-события начинают собираться только после выкладки; исторические проверки не восстанавливаются.
-- Для first-pass rate используется самое раннее `llm_check_completed` с `stage=initial` и `trigger=create` по каждой заявке. Проверки после редактирования (`trigger=edit`) в этот показатель не включаются.
+- Для first-pass rate используется самое раннее `llm_check_completed` с `stage=initial` и `trigger=create` по каждой заявке. Исторические события с `trigger=edit` в этот показатель не включаются; V5 их не создаёт.
 - Если путь сохранения координат не записал `application_indexed`, воронка «Появилась в Sheets» будет занижена и должна быть помечена как неполная.
 
 ### Контрольные SQL-запросы

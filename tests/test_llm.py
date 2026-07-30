@@ -162,39 +162,25 @@ def test_legacy_system_prompt_is_preserved_for_rollback():
     assert "`clarification_instruction`: string или null" in prompt
 
 
-def test_default_system_prompt_uses_v3_rules():
+def test_default_system_prompt_uses_v5_recommendation_rules():
     legacy_path = Path("prompts") / "gigachat_system.md"
     prompt_path = Path(DEFAULT_SYSTEM_PROMPT_PATH)
 
-    assert prompt_path == Path("prompts/gigachat_system_v3.md")
+    assert prompt_path == Path("prompts/gigachat_system_v5_recommendation.md")
     assert legacy_path.exists()
     assert prompt_path.exists()
 
     prompt = prompt_path.read_text(encoding="utf-8")
-    legacy_prompt = legacy_path.read_text(encoding="utf-8")
-
-    assert len(prompt) > len(legacy_prompt) * 0.65
-    assert "Не проверяй заполненность отдельных полей" in prompt
-    assert "## Критерий 1. Содержание изменения" in prompt
-    assert "## Критерий 2. Ситуация применения" in prompt
-    assert "## Критерий 3. Основание или логика изменения" in prompt
-    assert "### Правило 1.1. Новая сущность" in prompt
-    assert "### Правило 1.2. Существующий ответ" in prompt
-    assert "### Правило 2.1" in prompt
-    assert "### Правило 3.1" in prompt
-    assert prompt.count("Положительный пример:") >= 4
-    assert prompt.count("Отрицательный пример:") >= 4
-    assert "подтверждает правило, но не отменяет" in prompt
-    assert "новая инициатива" in prompt
-    assert "Верни только один валидный JSON-объект" in prompt
-    assert (
-        '{"is_complete":true,"blocking_problem":null,'
-        '"clarification_instruction":null}'
-    ) in prompt
+    assert "Проверка рекомендательная" in prompt
+    assert "missing_new_entity_content" in prompt
+    assert "missing_change_content" in prompt
+    assert "missing_application_context" in prompt
+    assert "missing_change_rationale" in prompt
+    assert '"check_result":"ok"' in prompt
 
 
 def test_v3_prompt_contains_acceptance_examples():
-    prompt = Path(DEFAULT_SYSTEM_PROMPT_PATH).read_text(encoding="utf-8")
+    prompt = Path("prompts/gigachat_system_v3.md").read_text(encoding="utf-8")
 
     assert "Положительный пример:" in prompt
     assert "Отрицательный пример:" in prompt
@@ -205,7 +191,7 @@ def test_v3_prompt_contains_acceptance_examples():
 
 
 def test_v3_prompt_contains_expanded_action_and_problem_groups():
-    prompt = Path(DEFAULT_SYSTEM_PROMPT_PATH).read_text(encoding="utf-8")
+    prompt = Path("prompts/gigachat_system_v3.md").read_text(encoding="utf-8")
 
     assert "Существующий ответ" in prompt
     assert "Новая сущность" in prompt
@@ -225,7 +211,7 @@ def test_legacy_user_prompt_is_preserved_for_rollback():
 
 
 def test_default_user_prompt_v3_contains_supported_fields():
-    prompt_path = Path(DEFAULT_USER_PROMPT_PATH)
+    prompt_path = Path("prompts/gigachat_user_v3.md")
     prompt = prompt_path.read_text(encoding="utf-8")
 
     assert prompt_path == Path("prompts/gigachat_user_v3.md")
@@ -239,7 +225,7 @@ def test_default_user_prompt_v3_contains_supported_fields():
     assert "{scriptwriter}" not in prompt
 
 
-def test_default_user_prompt_renders_all_supported_fields():
+def test_default_user_prompt_renders_v5_context():
     renderer = PromptRenderer(DEFAULT_SYSTEM_PROMPT_PATH, DEFAULT_USER_PROMPT_PATH)
     _, user_prompt = renderer.render(
         make_context(
@@ -250,7 +236,7 @@ def test_default_user_prompt_renders_all_supported_fields():
         )
     )
 
-    for value in ("intent.v3", "case.v3", "description.v3", "clarification.v3"):
+    for value in ("intent.v3", "case.v3", "description.v3"):
         assert value in user_prompt
     assert all(
         placeholder not in user_prompt
@@ -258,7 +244,10 @@ def test_default_user_prompt_renders_all_supported_fields():
             "{intent}",
             "{reason}",
             "{raw_change_description}",
-            "{clarification_text}",
+            "{initial_change_description}",
+            "{previous_gap_code}",
+            "{previous_recommendation}",
+            "{iteration_number}",
         )
     )
 
@@ -291,6 +280,66 @@ async def test_gigachat_client_maps_structured_response(tmp_path):
     )
     assert fake_client.calls[0]["chat"].messages
     assert fake_client.calls[0]["chat"].temperature == 0.01
+
+
+@pytest.mark.asyncio
+async def test_v5_client_maps_strict_recommendation_and_keeps_raw_response(tmp_path):
+    system_prompt = tmp_path / "gigachat_system_v5_recommendation.md"
+    user_prompt = tmp_path / "gigachat_user_v5_recommendation.md"
+    system_prompt.write_text("System prompt", encoding="utf-8")
+    user_prompt.write_text(
+        "iteration={iteration_number}\n"
+        "raw={raw_change_description}\n"
+        "initial={initial_change_description}\n"
+        "previous_gap={previous_gap_code}\n"
+        "previous_recommendation={previous_recommendation}",
+        encoding="utf-8",
+    )
+    raw = (
+        '{"check_result":"recommendation",'
+        '"gap_code":"missing_change_content",'
+        '"recommendation":"Может быть, тут не хватает содержания изменения."}'
+    )
+    client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(raw_response=raw),
+    )
+
+    result = await client.check_change_description(make_context())
+
+    assert result.is_complete is False
+    assert result.check_result == "recommendation"
+    assert result.gap_code == "missing_change_content"
+    assert result.recommendation == "Может быть, тут не хватает содержания изменения."
+    assert result.raw_response == raw
+
+
+@pytest.mark.asyncio
+async def test_v5_client_rejects_unknown_gap_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(llm_module, "GIGACHAT_JSON_RETRY_DELAY_SECONDS", 0)
+    system_prompt = tmp_path / "gigachat_system_v5_recommendation.md"
+    user_prompt = tmp_path / "gigachat_user_v5_recommendation.md"
+    system_prompt.write_text("System prompt", encoding="utf-8")
+    user_prompt.write_text("raw={raw_change_description}", encoding="utf-8")
+    raw = (
+        '{"check_result":"recommendation","gap_code":"unknown_gap",'
+        '"recommendation":"Может быть, тут не хватает сведений."}'
+    )
+    client = LlmClient(
+        credentials="credentials",
+        system_prompt_path=str(system_prompt),
+        user_prompt_path=str(user_prompt),
+        gigachat_client=FakeGigaChatClient(raw_response=raw),
+    )
+
+    result = await client.check_change_description(make_context())
+
+    assert result.check_result == "error"
+    assert result.raw_response == raw
+    assert result.telemetry is not None
+    assert result.telemetry.error_kind == "schema_validation"
 
 
 @pytest.mark.asyncio

@@ -7,5 +7,5 @@ services:
       SQLITE_PATH: /data/local-app.db
       GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS:-}
       GIGACHAT_VERIFY_SSL_CERTS: ${GIGACHAT_VERIFY_SSL_CERTS:-false}
-      GIGACHAT_SYSTEM_PROMPT_PATH: ${GIGACHAT_SYSTEM_PROMPT_PATH:-prompts/gigachat_system_v3.md}
-      GIGACHAT_USER_PROMPT_PATH: ${GIGACHAT_USER_PROMPT_PATH:-prompts/gigachat_user_v3.md}
+      GIGACHAT_SYSTEM_PROMPT_PATH: ${GIGACHAT_SYSTEM_PROMPT_PATH:-prompts/gigachat_system_v5_recommendation.md}
+      GIGACHAT_USER_PROMPT_PATH: ${GIGACHAT_USER_PROMPT_PATH:-prompts/gigachat_user_v5_recommendation.md}
