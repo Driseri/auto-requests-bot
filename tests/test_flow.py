@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
+from html import unescape
 
 import pytest
-from app.flow import ApplicationFlow
+from app.flow import ApplicationFlow, _bulk_registration_confirmation
 from app.keyboards import build_keyboard
 from app.models import (
     AnswerType,
@@ -24,7 +26,83 @@ from app.models import (
 )
 from app.repository import DraftRepository
 from app.submission import InMemorySubmissionService
-from app.bulk import BulkReservationCreationResult
+from app.bulk import BulkRegistrationResult, BulkReservationCreationResult
+
+
+def _application_links(count: int) -> tuple[str, ...]:
+    return tuple(
+        f"https://docs.google.com/spreadsheets/d/test/edit#gid=1&range=A{index}:X{index}"
+        for index in range(1, count + 1)
+    )
+
+
+def test_bulk_registration_confirmation_lists_up_to_five_ids_without_collapsing():
+    response = _bulk_registration_confirmation(
+        BulkRegistrationResult(
+            success=True,
+            message="Готово.",
+            registered_count=5,
+            empty_count=2,
+            application_ids=("APP00001", "APP00002", "APP00003", "APP00004", "APP00005"),
+            application_links=_application_links(5),
+            retry_allowed=False,
+        )
+    )
+
+    assert "Массовая заявка зарегистрирована" in response
+    assert "<b>Статус:</b> Новая" in response
+    assert "<b>Зарегистрировано заявок:</b> 5" in response
+    assert "<b>Пустых строк оставлено:</b> 2" in response
+    assert response.count('<a href="https://docs.google.com/') == 5
+    assert ">APP00001</a>" in response
+    assert "<blockquote expandable>" not in response
+
+
+def test_bulk_registration_confirmation_collapses_more_than_five_ids():
+    response = _bulk_registration_confirmation(
+        BulkRegistrationResult(
+            success=True,
+            message="Готово.",
+            registered_count=6,
+            application_ids=tuple(f"APP0000{index}" for index in range(1, 7)),
+            application_links=_application_links(6),
+            retry_allowed=False,
+        )
+    )
+
+    assert response.count('<a href="https://docs.google.com/') == 6
+    assert response.count("<blockquote expandable>") == 1
+    assert response.count("</blockquote>") == 1
+
+
+def test_bulk_registration_confirmation_fits_telegram_limit_for_fifty_ids():
+    response = _bulk_registration_confirmation(
+        BulkRegistrationResult(
+            success=True,
+            message="Готово.",
+            registered_count=50,
+            application_ids=tuple(f"{index:08X}" for index in range(50)),
+            application_links=_application_links(50),
+            retry_allowed=False,
+        )
+    )
+
+    assert response.count('<a href="https://docs.google.com/') == 50
+    rendered_text = unescape(re.sub(r"<[^>]+>", "", response))
+    assert len(rendered_text) < 4096
+    assert "<blockquote expandable>" in response
+
+
+def test_bulk_registration_confirmation_rejects_missing_application_links():
+    with pytest.raises(ValueError, match="incomplete application links"):
+        _bulk_registration_confirmation(
+            BulkRegistrationResult(
+                success=True,
+                message="Готово.",
+                registered_count=1,
+                application_ids=("APP00001",),
+            )
+        )
 
 
 class FakeLlmClient:

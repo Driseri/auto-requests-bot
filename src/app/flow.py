@@ -16,6 +16,7 @@ from app.formatting import (
     serialize_formatting_spans,
 )
 from app.bulk import (
+    BulkRegistrationResult,
     BulkReservationRegistrar,
     BulkReservationServiceProtocol,
 )
@@ -501,8 +502,9 @@ class ApplicationFlow:
                 parse_mode="HTML",
             )
         return BotResponse(
-            text=result.message,
+            text=_bulk_registration_confirmation(result),
             keyboard=KeyboardKind.BULK_RESERVATION_COMPLETED,
+            parse_mode="HTML",
         )
 
     async def cancel_bulk_reservation(
@@ -2504,6 +2506,36 @@ def _chip_after_text_action_review(draft: Draft) -> str:
         ChipAfterTextAction.EDIT: "Будут созданы CHIPS + EDIT",
         ChipAfterTextAction.UNCHANGED: "Будет создана только CHIPS-заявка",
     }.get(action, "Не выбрано")
+
+
+def _bulk_registration_confirmation(result: BulkRegistrationResult) -> str:
+    if not result.application_ids:
+        return escape(result.message)
+    if len(result.application_links) != len(result.application_ids):
+        raise ValueError("Bulk registration result has incomplete application links")
+    id_lines = [
+        f'• <a href="{escape(link, quote=True)}">{escape(application_id)}</a>'
+        for application_id, link in zip(
+            result.application_ids,
+            result.application_links,
+            strict=True,
+        )
+    ]
+    rendered_ids = "\n".join(id_lines)
+    if len(result.application_ids) > 5:
+        rendered_ids = f"<blockquote expandable>{rendered_ids}</blockquote>"
+    return "\n".join(
+        [
+            "✅ <b>Массовая заявка зарегистрирована</b>",
+            "",
+            f"<b>Статус:</b> {escape(ApplicationStatus.NEW.value)}",
+            f"<b>Зарегистрировано заявок:</b> {result.registered_count}",
+            f"<b>Пустых строк оставлено:</b> {result.empty_count}",
+            "",
+            "<b>ID заявок:</b>",
+            rendered_ids,
+        ]
+    )
 
 
 def _linked_response_application_id(chips_application_id: str) -> str:

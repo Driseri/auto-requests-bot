@@ -12,6 +12,7 @@ from app.bot import (
     CallbackQueryAckMiddleware,
     PrivateChatOnlyMiddleware,
     UserActionLockMiddleware,
+    _answer_bulk_reservation_registration,
     _show_callback_processing,
 )
 from app.models import BotResponse, KeyboardKind
@@ -79,6 +80,62 @@ class FakeBot:
 
     async def edit_message_reply_markup(self, **kwargs):
         self.markup_edits.append(kwargs)
+
+
+@pytest.mark.asyncio
+async def test_bulk_registration_confirmation_remains_separate_from_navigation() -> None:
+    class ProgressMessage:
+        def __init__(self) -> None:
+            self.edits = []
+
+        async def edit_text(self, text, reply_markup=None, parse_mode=None):
+            self.edits.append((text, reply_markup, parse_mode))
+
+    class CallbackMessage:
+        def __init__(self) -> None:
+            self.progress = ProgressMessage()
+            self.answers = []
+            self.markup_edits = []
+
+        async def edit_reply_markup(self, reply_markup=None):
+            self.markup_edits.append(reply_markup)
+
+        async def answer(self, text, reply_markup=None, parse_mode=None):
+            self.answers.append((text, reply_markup, parse_mode))
+            if len(self.answers) == 1:
+                return self.progress
+            return SimpleNamespace(chat=SimpleNamespace(id=100), message_id=77)
+
+    class Flow:
+        async def confirm_bulk_reservation_filled(self, telegram_user_id, reservation_id):
+            assert telegram_user_id == 100
+            assert reservation_id == "RES-1"
+            return BotResponse(
+                text="Регистрация завершена: APP00001",
+                keyboard=KeyboardKind.BULK_RESERVATION_COMPLETED,
+                parse_mode="HTML",
+            )
+
+    class Ui:
+        def __init__(self) -> None:
+            self.tracked = []
+
+        async def track_response_message(self, telegram_user_id, message, markup):
+            self.tracked.append((telegram_user_id, message, markup))
+
+    message = CallbackMessage()
+    callback = FakeCallback(message=message, data="app:bulk_reservation_ready:RES-1")
+    ui = Ui()
+
+    await _answer_bulk_reservation_registration(callback, Flow(), ui, "RES-1")
+
+    assert message.progress.edits == [("Регистрация завершена: APP00001", None, "HTML")]
+    assert len(message.answers) == 2
+    assert message.answers[1][0] == "Можно перейти в главное меню или продолжить работу позже."
+    assert message.answers[1][1] is not None
+    assert len(ui.tracked) == 1
+    assert ui.tracked[0][0] == 100
+    assert ui.tracked[0][1].message_id == 77
 
 
 class UiMessage:

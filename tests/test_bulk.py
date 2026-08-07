@@ -790,7 +790,7 @@ async def test_bulk_reservation_holds_section_lock_until_sqlite_shift_completes(
 
 
 @pytest.mark.asyncio
-async def test_bulk_reservation_registration_adds_borders_after_success(tmp_path):
+async def test_bulk_reservation_registration_adds_borders_after_success(tmp_path, monkeypatch):
     repository = DraftRepository(str(tmp_path / "reservation_registration_borders.db"))
     await repository.init()
     api = FakeSheetsApi(sheets={FL_SPREADSHEET: {"29.06 (1)": 100}})
@@ -819,10 +819,18 @@ async def test_bulk_reservation_registration_adds_borders_after_success(tmp_path
         sheets_api=api,
         application_editors=("editor 1", "editor 2"),
     )
+    generated_ids = iter(("APP00001", "APP00002"))
+    monkeypatch.setattr("app.bulk.generate_application_id", lambda: next(generated_ids))
 
     result = await registrar.register_reservation("RES-READY", 123)
 
     assert result.success is True
+    assert result.application_ids == ("APP00001", "APP00002")
+    assert result.application_links == (
+        f"https://docs.google.com/spreadsheets/d/{FL_SPREADSHEET}/edit#gid=100&range=A10:X10",
+        f"https://docs.google.com/spreadsheets/d/{FL_SPREADSHEET}/edit#gid=100&range=A12:X12",
+    )
+    assert result.empty_count == 3
     assert len(api.batch_updates) == 1
     requests = [
         request
@@ -830,14 +838,24 @@ async def test_bulk_reservation_registration_adds_borders_after_success(tmp_path
         for request in update["body"]["requests"]
     ]
     update_cells = [request["updateCells"] for request in requests if "updateCells" in request]
-    assert len(update_cells) == 2
+    assert len(update_cells) == 4
     assert all(
         update_cell["fields"] == "userEnteredValue,userEnteredFormat"
         for update_cell in update_cells
     )
+    updated_column_ranges = {
+        (
+            update_cell["range"]["startColumnIndex"],
+            update_cell["range"]["endColumnIndex"],
+        )
+        for update_cell in update_cells
+    }
+    assert updated_column_ranges == {(1, 2), (11, len(WORKSHEET_HEADERS))}
     assert all(
-        update_cell["rows"][0]["values"][0]["userEnteredFormat"]["backgroundColor"]
-        == BULK_RESERVATION_SCRIPTWRITER_BACKGROUND_COLOR
+        not (
+            update_cell["range"]["startColumnIndex"] < 11
+            and update_cell["range"]["endColumnIndex"] > 2
+        )
         for update_cell in update_cells
     )
     editor_validation_requests = [
@@ -1099,6 +1117,19 @@ async def test_bulk_reservation_chips_dashboard_projection_uses_dashboard_layout
     result = await registrar.register_reservation("RES-CHIPS-DASH", 123)
 
     assert result.success is True
+    requests = [
+        request
+        for update in api.batch_updates
+        for request in update["body"]["requests"]
+    ]
+    update_cells = [request["updateCells"] for request in requests if "updateCells" in request]
+    assert {
+        (
+            update_cell["range"]["startColumnIndex"],
+            update_cell["range"]["endColumnIndex"],
+        )
+        for update_cell in update_cells
+    } == {(1, 2), (11, len(CHIPS_WORKSHEET_HEADERS))}
     outbox = await repository.list_dashboard_outbox()
     assert len(outbox) == 1
     dashboard_row = json.loads(outbox[0].snapshot_json)["row"]

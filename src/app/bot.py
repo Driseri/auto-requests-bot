@@ -793,18 +793,27 @@ async def _answer_bulk_reservation_registration(
             keyboard_payload=reservation_id,
         )
     markup = build_keyboard(response.keyboard, response.keyboard_payload)
+    registration_completed = response.keyboard == KeyboardKind.BULK_RESERVATION_COMPLETED
+    response_markup = None if registration_completed else markup
     if progress_message is not None:
         try:
             await progress_message.edit_text(
                 response.text,
-                reply_markup=markup,
+                reply_markup=response_markup,
                 parse_mode=response.parse_mode,
             )
-            await ui.track_response_message(
-                _callback_user_id(callback),
-                progress_message,
-                markup,
-            )
+            if registration_completed:
+                await _send_bulk_registration_navigation(
+                    callback.message,
+                    ui,
+                    _callback_user_id(callback),
+                )
+            else:
+                await ui.track_response_message(
+                    _callback_user_id(callback),
+                    progress_message,
+                    markup,
+                )
             return
         except Exception:
             LOGGER.exception(
@@ -813,14 +822,35 @@ async def _answer_bulk_reservation_registration(
             )
     sent = await callback.message.answer(
         response.text,
-        reply_markup=markup,
+        reply_markup=response_markup,
         parse_mode=response.parse_mode,
     )
-    await ui.track_response_message(
-        _callback_user_id(callback),
-        sent,
-        markup,
+    if registration_completed:
+        await _send_bulk_registration_navigation(
+            callback.message,
+            ui,
+            _callback_user_id(callback),
+        )
+    else:
+        await ui.track_response_message(
+            _callback_user_id(callback),
+            sent,
+            markup,
+        )
+
+
+async def _send_bulk_registration_navigation(
+    message: Message,
+    ui: ActiveMessageManager,
+    telegram_user_id: int,
+) -> None:
+    """Keep registration details intact and track navigation separately."""
+    markup = build_keyboard(KeyboardKind.BULK_RESERVATION_COMPLETED)
+    sent = await message.answer(
+        "Можно перейти в главное меню или продолжить работу позже.",
+        reply_markup=markup,
     )
+    await ui.track_response_message(telegram_user_id, sent, markup)
 
 
 def _user_id(message: Message) -> int:

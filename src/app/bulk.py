@@ -60,6 +60,9 @@ class BulkRegistrationResult:
     success: bool
     message: str
     registered_count: int = 0
+    empty_count: int = 0
+    application_ids: tuple[str, ...] = ()
+    application_links: tuple[str, ...] = ()
     retry_allowed: bool = True
     insert_url: str | None = None
 
@@ -927,6 +930,7 @@ class BulkReservationRegistrar:
         submitted_at = self.clock()
         tracking: list[dict[str, Any]] = []
         projections: list[dict[str, Any]] = []
+        application_links: list[str] = []
         update_requests: list[dict[str, Any]] = []
         registered_row_numbers = [row_number for row_number, _ in filled]
         registered_row_set = set(registered_row_numbers)
@@ -940,8 +944,8 @@ class BulkReservationRegistrar:
                 reservation=reservation,
                 submitted_at=submitted_at,
             )
-            update_requests.append(
-                self._registered_row_update_request(
+            update_requests.extend(
+                self._registered_row_update_requests(
                     reservation,
                     row_number=row_number,
                     row=full_row,
@@ -981,6 +985,14 @@ class BulkReservationRegistrar:
                     "last_seen_row_number": row_number,
                     "submitted_at": utc_iso(submitted_at),
                 }
+            )
+            application_links.append(
+                spreadsheet_row_link(
+                    spreadsheet_id=reservation.spreadsheet_id,
+                    sheet_id=reservation.sheet_id,
+                    row_number=row_number,
+                    end_column=_worksheet_schema_layout(schema)["end_column"],
+                )
             )
             projections.append(
                 {
@@ -1027,6 +1039,9 @@ class BulkReservationRegistrar:
                 True,
                 f"Готово.\n\nЗарегистрировано заявок: {len(filled)}\nПустых строк оставлено: {empty_count}",
                 registered_count=len(filled),
+                empty_count=empty_count,
+                application_ids=tuple(item["application_id"] for item in tracking),
+                application_links=tuple(application_links),
                 retry_allowed=False,
                 insert_url=reservation.insert_url,
             ),
@@ -1051,37 +1066,56 @@ class BulkReservationRegistrar:
         ).execute()
         return result.get("values", [])
 
-    def _registered_row_update_request(
+    def _registered_row_update_requests(
         self,
         reservation: BulkReservation,
         *,
         row_number: int,
         row: list[Any],
         schema: str,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         layout = _worksheet_schema_layout(schema)
-        cells = [_cell_data(value) for value in row]
-        cells[0].setdefault("userEnteredFormat", {})["backgroundColor"] = (
-            BULK_RESERVATION_SCRIPTWRITER_BACKGROUND_COLOR
+        technical_start = (
+            CHIPS_WORKSHEET_HEADERS.index("ID заявки")
+            if schema == "chips"
+            else WORKSHEET_HEADERS.index("ID заявки")
         )
-        cells[layout["status"]] = _status_cell_data(ApplicationStatus.NEW.value)
-        cells[layout["date"]] = google_sheets_date_cell(
+        technical_cells = [_cell_data(value) for value in row[technical_start:]]
+        date_offset = layout["date"] - technical_start
+        technical_cells[date_offset] = google_sheets_date_cell(
             row[layout["date"]],
             timezone_name=self.timezone_name,
         )
-        return {
-            "updateCells": {
-                "range": {
-                    "sheetId": reservation.sheet_id,
-                    "startRowIndex": row_number - 1,
-                    "endRowIndex": row_number,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": len(cells),
+        return [
+            {
+                "updateCells": {
+                    "range": {
+                        "sheetId": reservation.sheet_id,
+                        "startRowIndex": row_number - 1,
+                        "endRowIndex": row_number,
+                        "startColumnIndex": layout["status"],
+                        "endColumnIndex": layout["status"] + 1,
+                    },
+                    "rows": [
+                        {"values": [_status_cell_data(ApplicationStatus.NEW.value)]}
+                    ],
+                    "fields": "userEnteredValue,userEnteredFormat",
+                }
+            },
+            {
+                "updateCells": {
+                    "range": {
+                        "sheetId": reservation.sheet_id,
+                        "startRowIndex": row_number - 1,
+                        "endRowIndex": row_number,
+                        "startColumnIndex": technical_start,
+                        "endColumnIndex": len(row),
+                    },
+                    "rows": [{"values": technical_cells}],
+                    "fields": "userEnteredValue,userEnteredFormat",
                 },
-                "rows": [{"values": cells}],
-                "fields": "userEnteredValue,userEnteredFormat",
-            }
-        }
+            },
+        ]
 
     def _registered_row_editor_validation_request(
         self,
