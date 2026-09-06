@@ -1004,6 +1004,7 @@ async def test_submitted_applications_are_saved_listed_and_updated(tmp_path):
     assert first.last_seen_editor == "редактор 1"
     assert first.last_seen_editor_comment == "Можно использовать"
     assert first.last_seen_scriptwriter_response is None
+    assert first.scriptwriter_response_tracking_initialized is True
     assert first.pending_editor_comment is None
     assert first.pending_editor_comment_seen_count == 0
     assert first.pending_scriptwriter_response is None
@@ -1121,6 +1122,7 @@ async def test_repository_migration_adds_submitted_applications_table(tmp_path):
         "chip_text_after_formatting_json",
     } <= draft_columns
     assert "change_type" in tracking_columns
+    assert "scriptwriter_response_tracking_initialized" in tracking_columns
 
 
 
@@ -1173,6 +1175,7 @@ async def test_repository_migrates_submitted_at_column(tmp_path):
 
     assert tracked is not None
     assert tracked.submitted_at is None
+    assert tracked.scriptwriter_response_tracking_initialized is False
 
 
 

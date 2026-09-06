@@ -231,7 +231,9 @@ polling-циклах. Изменённый текст создаёт новое 
 ### 4.8 `scriptwriter_response_added`
 
 Создаётся после стабильного чтения поля `Ответ сценариста` в трёх polling-циклах.
-Статус заявки не является условием события. Изменение ответа создаёт новое событие.
+Статус, срочность и маршрут заявки не являются условиями события. Изменение ответа
+создаёт новое событие. При миграции на отслеживание всех типов уже заполненное
+значение один раз принимается как baseline без события.
 
 | Поле | Значение |
 |---|---|
@@ -470,9 +472,9 @@ application_indexed (не гарантирован для текущего submi
 - `status_final_answer_ready`.
 
 `application-status`, `urgent-editor-application-created`,
-`urgent-editor-scriptwriter-response`, `urgent-editor-bulk-reservation-created` и
-`bulk-batch-status` относятся к `notification_outbox`, а не к
-`application_events`.
+`editor-scriptwriter-response`, legacy `urgent-editor-scriptwriter-response`,
+`urgent-editor-bulk-reservation-created` и `bulk-batch-status` относятся к
+`notification_outbox`, а не к `application_events`.
 
 ## 9. Контрольные SQL-запросы
 

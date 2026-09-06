@@ -427,6 +427,7 @@ class SubmittedApplication:
     last_seen_editor_comment: str | None = None
     last_seen_final_answer: str | None = None
     last_seen_scriptwriter_response: str | None = None
+    scriptwriter_response_tracking_initialized: bool = True
     pending_editor_comment: str | None = None
     pending_editor_comment_seen_count: int = 0
     pending_scriptwriter_response: str | None = None

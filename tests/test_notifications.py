@@ -5,6 +5,7 @@ import json
 import logging
 import re
 
+import aiosqlite
 import pytest
 from googleapiclient.errors import HttpError
 
@@ -1289,7 +1290,7 @@ async def test_empty_editor_comment_clears_pending_without_notification(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_urgent_scriptwriter_response_notifies_editor_chat(tmp_path):
+async def test_scriptwriter_response_notifies_editor_chat(tmp_path):
     repository = DraftRepository(str(tmp_path / "urgent_scriptwriter_response.db"))
     await repository.init()
     await repository.save_submitted_application(
@@ -1342,7 +1343,8 @@ async def test_urgent_scriptwriter_response_notifies_editor_chat(tmp_path):
     message = notifier.messages[0]
     assert message["chat_id"] == -100123456
     assert message["reply_markup"] is None
-    assert "Сценарист ответил по срочной заявке" in message["text"]
+    assert "Сценарист ответил по заявке" in message["text"]
+    assert "Тип ответа:</b> Срочные" in message["text"]
     assert "Петров Петр" in message["text"]
     assert "urgent.intent" in message["text"]
     assert "Сценарист уточнил детали &lt;важно&gt;" in message["text"]
@@ -1350,6 +1352,9 @@ async def test_urgent_scriptwriter_response_notifies_editor_chat(tmp_path):
     tracked = await repository.get_submitted_application("URGRESP1")
     assert tracked is not None
     assert tracked.last_seen_scriptwriter_response == "Сценарист уточнил детали <важно>"
+    outbox = await repository.list_notification_outbox()
+    assert len(outbox) == 1
+    assert outbox[0].event_type == "editor-scriptwriter-response"
 
     events = await repository.list_application_events(
         application_id="URGRESP1",
@@ -1477,7 +1482,14 @@ async def test_changed_urgent_scriptwriter_response_notifies_again(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_non_urgent_scriptwriter_response_does_not_notify_editor_chat(tmp_path):
+@pytest.mark.parametrize(
+    "answer_type",
+    [AnswerType.ROLLOUT.value, AnswerType.INTEGRATION.value],
+)
+async def test_non_urgent_scriptwriter_response_notifies_editor_chat(
+    tmp_path,
+    answer_type,
+):
     repository = DraftRepository(str(tmp_path / "non_urgent_scriptwriter_response.db"))
     await repository.init()
     await repository.save_submitted_application(
@@ -1487,7 +1499,8 @@ async def test_non_urgent_scriptwriter_response_does_not_notify_editor_chat(tmp_
         sheet_id=100,
         sheet_name=WEEK_SHEET,
         last_known_status=ApplicationStatus.NEEDS_CLARIFICATION.value,
-        answer_type=AnswerType.ROLLOUT.value,
+        answer_type=answer_type,
+        change_type=ChangeType.ADD.value,
         application_type=ApplicationType.SINGLE.value,
         is_urgent=False,
     )
@@ -1506,7 +1519,8 @@ async def test_non_urgent_scriptwriter_response_does_not_notify_editor_chat(tmp_
                     editor_comment="",
                     final_answer="",
                     scriptwriter_response="Ответ по несрочной заявке",
-                    answer_type=AnswerType.ROLLOUT.value,
+                    answer_type=answer_type,
+                    change_type=ChangeType.ADD.value,
                     is_urgent=False,
                 )
             }
@@ -1520,10 +1534,137 @@ async def test_non_urgent_scriptwriter_response_does_not_notify_editor_chat(tmp_
     await service.run_once()
     await service.run_once()
 
-    assert notifier.messages == []
+    assert len(notifier.messages) == 1
+    assert notifier.messages[0]["chat_id"] == -100123456
+    assert f"Тип ответа:</b> {answer_type}" in notifier.messages[0]["text"]
+    assert "Тип изменения:</b> ADD" in notifier.messages[0]["text"]
     tracked = await repository.get_submitted_application("REGRESP1")
     assert tracked is not None
-    assert tracked.last_seen_scriptwriter_response is None
+    assert tracked.last_seen_scriptwriter_response == "Ответ по несрочной заявке"
+
+
+@pytest.mark.asyncio
+async def test_existing_scriptwriter_response_is_baselined_without_notification(tmp_path):
+    database_path = tmp_path / "scriptwriter_response_baseline.db"
+    repository = DraftRepository(str(database_path))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="BASELINE1",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
+        answer_type=AnswerType.ROLLOUT.value,
+        application_type=ApplicationType.SINGLE.value,
+        is_urgent=False,
+    )
+    async with aiosqlite.connect(database_path) as db:
+        await db.execute(
+            """
+            UPDATE submitted_applications
+            SET scriptwriter_response_tracking_initialized = 0
+            WHERE application_id = 'BASELINE1'
+            """
+        )
+        await db.commit()
+
+    current = SheetApplicationStatus(
+        application_id="BASELINE1",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name=WEEK_SHEET,
+        sheet_id=100,
+        row_number=12,
+        status=ApplicationStatus.IN_PROGRESS.value,
+        editor_comment="",
+        final_answer="",
+        scriptwriter_response="Ответ до релиза",
+        answer_type=AnswerType.ROLLOUT.value,
+        is_urgent=False,
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({"BASELINE1": current}),
+        notifier=notifier,
+        urgent_editor_notifications_enabled=True,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await service.run_once()
+    await service.run_once()
+    await service.run_once()
+
+    assert notifier.messages == []
+    assert await repository.list_application_events(
+        application_id="BASELINE1",
+        event_type="scriptwriter_response_added",
+    ) == []
+    tracked = await repository.get_submitted_application("BASELINE1")
+    assert tracked is not None
+    assert tracked.scriptwriter_response_tracking_initialized is True
+    assert tracked.last_seen_scriptwriter_response == "Ответ до релиза"
+
+    current.scriptwriter_response = "Новый ответ после релиза"
+    await service.run_once()
+    await service.run_once()
+    await service.run_once()
+
+    assert len(notifier.messages) == 1
+    assert "Новый ответ после релиза" in notifier.messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_scriptwriter_response_is_tracked_when_editor_delivery_is_disabled(tmp_path):
+    repository = DraftRepository(str(tmp_path / "disabled_editor_delivery.db"))
+    await repository.init()
+    await repository.save_submitted_application(
+        application_id="DISABLED1",
+        telegram_user_id=100,
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_id=100,
+        sheet_name=WEEK_SHEET,
+        last_known_status=ApplicationStatus.IN_PROGRESS.value,
+        answer_type=AnswerType.ROLLOUT.value,
+        application_type=ApplicationType.SINGLE.value,
+        is_urgent=False,
+    )
+    current = SheetApplicationStatus(
+        application_id="DISABLED1",
+        spreadsheet_id=FL_SPREADSHEET,
+        sheet_name=WEEK_SHEET,
+        sheet_id=100,
+        row_number=12,
+        status=ApplicationStatus.IN_PROGRESS.value,
+        editor_comment="",
+        final_answer="",
+        scriptwriter_response="Ответ при выключенной доставке",
+        answer_type=AnswerType.ROLLOUT.value,
+        is_urgent=False,
+    )
+    notifier = FakeNotifier()
+    service = StatusNotificationService(
+        repository=repository,
+        status_reader=FakeStatusReader({"DISABLED1": current}),
+        notifier=notifier,
+        urgent_editor_notifications_enabled=False,
+        editor_urgent_chat_id=-100123456,
+    )
+
+    await service.run_once()
+    await service.run_once()
+    await service.run_once()
+
+    assert notifier.messages == []
+    assert await repository.list_notification_outbox() == []
+    events = await repository.list_application_events(
+        application_id="DISABLED1",
+        event_type="scriptwriter_response_added",
+    )
+    assert len(events) == 1
+    tracked = await repository.get_submitted_application("DISABLED1")
+    assert tracked is not None
+    assert tracked.last_seen_scriptwriter_response == current.scriptwriter_response
 
 
 @pytest.mark.asyncio

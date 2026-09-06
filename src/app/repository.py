@@ -146,6 +146,7 @@ class DraftRepository:
                     last_seen_editor_comment TEXT,
                     last_seen_final_answer TEXT,
                     last_seen_scriptwriter_response TEXT,
+                    scriptwriter_response_tracking_initialized INTEGER NOT NULL DEFAULT 1,
                     pending_editor_comment TEXT,
                     pending_editor_comment_seen_count INTEGER NOT NULL DEFAULT 0,
                     pending_scriptwriter_response TEXT,
@@ -176,6 +177,11 @@ class DraftRepository:
                 db,
                 "last_seen_scriptwriter_response",
                 "TEXT",
+            )
+            await self._ensure_submitted_applications_column(
+                db,
+                "scriptwriter_response_tracking_initialized",
+                "INTEGER NOT NULL DEFAULT 0",
             )
             await self._ensure_submitted_applications_column(db, "pending_editor_comment", "TEXT")
             await self._ensure_submitted_applications_column(
@@ -1530,6 +1536,7 @@ class DraftRepository:
         sheet_id: int | None = None,
         last_seen_final_answer: str | None = None,
         last_seen_scriptwriter_response: str | None = None,
+        scriptwriter_response_tracking_initialized: bool | None = None,
         pending_editor_comment: str | None = None,
         pending_editor_comment_seen_count: int = 0,
         pending_scriptwriter_response: str | None = None,
@@ -1548,6 +1555,9 @@ class DraftRepository:
                     last_seen_editor_comment = ?,
                     last_seen_final_answer = ?,
                     last_seen_scriptwriter_response = ?,
+                    scriptwriter_response_tracking_initialized = COALESCE(
+                        ?, scriptwriter_response_tracking_initialized
+                    ),
                     pending_editor_comment = ?,
                     pending_editor_comment_seen_count = ?,
                     pending_scriptwriter_response = ?,
@@ -1572,6 +1582,11 @@ class DraftRepository:
                     last_seen_editor_comment,
                     last_seen_final_answer,
                     last_seen_scriptwriter_response,
+                    (
+                        None
+                        if scriptwriter_response_tracking_initialized is None
+                        else (1 if scriptwriter_response_tracking_initialized else 0)
+                    ),
                     pending_editor_comment,
                     pending_editor_comment_seen_count,
                     pending_scriptwriter_response,
@@ -2937,6 +2952,9 @@ class DraftRepository:
                 last_seen_editor_comment = ?,
                 last_seen_final_answer = ?,
                 last_seen_scriptwriter_response = ?,
+                scriptwriter_response_tracking_initialized = COALESCE(
+                    ?, scriptwriter_response_tracking_initialized
+                ),
                 pending_editor_comment = ?,
                 pending_editor_comment_seen_count = ?,
                 pending_scriptwriter_response = ?,
@@ -2962,6 +2980,13 @@ class DraftRepository:
                 update.get("last_seen_editor_comment"),
                 update.get("last_seen_final_answer"),
                 update.get("last_seen_scriptwriter_response"),
+                (
+                    None
+                    if "scriptwriter_response_tracking_initialized" not in update
+                    else (
+                        1 if update["scriptwriter_response_tracking_initialized"] else 0
+                    )
+                ),
                 update.get("pending_editor_comment"),
                 update.get("pending_editor_comment_seen_count", 0),
                 update.get("pending_scriptwriter_response"),
@@ -3059,6 +3084,9 @@ class DraftRepository:
             last_seen_editor_comment=row["last_seen_editor_comment"],
             last_seen_final_answer=row["last_seen_final_answer"],
             last_seen_scriptwriter_response=row["last_seen_scriptwriter_response"],
+            scriptwriter_response_tracking_initialized=bool(
+                row["scriptwriter_response_tracking_initialized"]
+            ),
             pending_editor_comment=row["pending_editor_comment"],
             pending_editor_comment_seen_count=row["pending_editor_comment_seen_count"] or 0,
             pending_scriptwriter_response=row["pending_scriptwriter_response"],

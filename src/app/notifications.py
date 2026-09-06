@@ -19,7 +19,6 @@ from app.google_api import GoogleApiRetryConfig, execute_with_retry_async
 from app.keyboards import build_keyboard
 from app.health import write_heartbeat
 from app.models import (
-    AnswerType,
     ApplicationStatus,
     ApplicationType,
     ChangeType,
@@ -50,7 +49,10 @@ from app.submission import (
 
 LOGGER = logging.getLogger(__name__)
 URGENT_EDITOR_NOTIFICATION_EVENT_TYPE = "urgent-editor-application-created"
-URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE = "urgent-editor-scriptwriter-response"
+EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE = "editor-scriptwriter-response"
+LEGACY_URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE = (
+    "urgent-editor-scriptwriter-response"
+)
 URGENT_EDITOR_BULK_RESERVATION_EVENT_TYPE = "urgent-editor-bulk-reservation-created"
 SCRIPTWRITER_RESPONSE_PREVIEW_LIMIT = 1800
 STABLE_NOTIFICATION_POLLS = 3
@@ -742,7 +744,7 @@ class StatusNotificationService:
                 stable_tracking_updates=stable_updates,
             )
             scriptwriter_response_event = (
-                self._urgent_scriptwriter_response_event(notification)
+                self._editor_scriptwriter_response_event(notification)
                 if scriptwriter_response_change.ready
                 else None
             )
@@ -975,16 +977,18 @@ class StatusNotificationService:
         tracked: SubmittedApplication,
         current: SheetApplicationStatus,
     ) -> StableFieldChange:
-        if not self.urgent_editor_notifications_enabled or self.editor_urgent_chat_id is None:
-            return StableFieldChange(False, {})
-        is_urgent = (
-            current.answer_type == AnswerType.URGENT.value
-            or tracked.answer_type == AnswerType.URGENT.value
-            or current.is_urgent is True
-            or tracked.is_urgent is True
-        )
-        if not is_urgent:
-            return StableFieldChange(False, {})
+        if not tracked.scriptwriter_response_tracking_initialized:
+            return StableFieldChange(
+                False,
+                {
+                    "last_seen_scriptwriter_response": (
+                        (current.scriptwriter_response or "").strip() or None
+                    ),
+                    "scriptwriter_response_tracking_initialized": True,
+                    "pending_scriptwriter_response": None,
+                    "pending_scriptwriter_response_seen_count": 0,
+                },
+            )
         return _stable_text_field_change(
             current_value=current.scriptwriter_response,
             last_sent_value=tracked.last_seen_scriptwriter_response,
@@ -995,25 +999,17 @@ class StatusNotificationService:
             last_sent_field="last_seen_scriptwriter_response",
         )
 
-    def _urgent_scriptwriter_response_event(
+    def _editor_scriptwriter_response_event(
         self,
         notification: StatusNotification,
     ) -> dict[str, Any] | None:
-        """Build editor-chat event when a writer answers an urgent clarification."""
+        """Build an editor-chat event when a writer answers any tracked request."""
         if not self.urgent_editor_notifications_enabled:
             return None
         if self.editor_urgent_chat_id is None:
             return None
         tracked = notification.tracked
         current = notification.current
-        is_urgent = (
-            current.answer_type == AnswerType.URGENT.value
-            or tracked.answer_type == AnswerType.URGENT.value
-            or current.is_urgent is True
-            or tracked.is_urgent is True
-        )
-        if not is_urgent:
-            return None
         scriptwriter_response = (current.scriptwriter_response or "").strip()
         if not scriptwriter_response:
             return None
@@ -1026,6 +1022,8 @@ class StatusNotificationService:
         snapshot = {
             "application_id": tracked.application_id,
             "direction": current.direction or tracked.direction or "",
+            "answer_type": current.answer_type or tracked.answer_type or "",
+            "change_type": current.change_type or tracked.change_type or "",
             "scriptwriter": current.scriptwriter or "",
             "intent": current.intent or "",
             "status": current.status,
@@ -1034,16 +1032,16 @@ class StatusNotificationService:
         }
         snapshot_json = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
         dedupe_key = (
-            f"{URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE}:"
+            f"{EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE}:"
             f"{tracked.application_id}:{response_hash}"
         )
         return {
             "telegram_user_id": self.editor_urgent_chat_id,
-            "event_type": URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE,
+            "event_type": EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE,
             "dedupe_key": dedupe_key,
             "snapshot_json": snapshot_json,
             "chunks": _split_html_message(
-                _render_urgent_scriptwriter_response_notification(snapshot),
+                _render_editor_scriptwriter_response_notification(snapshot),
                 self.notification_message_max_chars,
             ),
         }
@@ -1216,6 +1214,10 @@ class StatusNotificationService:
                 "last_seen_scriptwriter_response",
                 tracked.last_seen_scriptwriter_response,
             ),
+            "scriptwriter_response_tracking_initialized": stable_updates.get(
+                "scriptwriter_response_tracking_initialized",
+                tracked.scriptwriter_response_tracking_initialized,
+            ),
             "pending_editor_comment": stable_updates.get(
                 "pending_editor_comment",
                 tracked.pending_editor_comment,
@@ -1295,7 +1297,11 @@ class StatusNotificationService:
                     "new_value": current.final_answer,
                 }
             )
-        if "last_seen_scriptwriter_response" in notification.stable_tracking_updates:
+        if (
+            notification.tracked.scriptwriter_response_tracking_initialized
+            and "last_seen_scriptwriter_response"
+            in notification.stable_tracking_updates
+        ):
             events.append(
                 {
                     **base,
@@ -1393,7 +1399,8 @@ class StatusNotificationService:
     ) -> Any | None:
         if item.event_type in {
             URGENT_EDITOR_NOTIFICATION_EVENT_TYPE,
-            URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE,
+            EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE,
+            LEGACY_URGENT_EDITOR_SCRIPTWRITER_RESPONSE_EVENT_TYPE,
             URGENT_EDITOR_BULK_RESERVATION_EVENT_TYPE,
         }:
             return None
@@ -1594,15 +1601,17 @@ def _fit_html_block(block: str, max_chars: int) -> str:
     return f"{shortened}{suffix}"
 
 
-def _render_urgent_scriptwriter_response_notification(snapshot: dict[str, Any]) -> str:
+def _render_editor_scriptwriter_response_notification(snapshot: dict[str, Any]) -> str:
     response = _truncate_text(
         str(snapshot.get("scriptwriter_response") or ""),
         SCRIPTWRITER_RESPONSE_PREVIEW_LIMIT,
     )
     lines = [
-        "💬 <b>Сценарист ответил по срочной заявке</b>",
+        "💬 <b>Сценарист ответил по заявке</b>",
         "",
         f"<b>Направление:</b> {escape(str(snapshot.get('direction') or '-'))}",
+        f"<b>Тип ответа:</b> {escape(str(snapshot.get('answer_type') or '-'))}",
+        f"<b>Тип изменения:</b> {escape(str(snapshot.get('change_type') or '-'))}",
         f"<b>Сценарист:</b> {escape(str(snapshot.get('scriptwriter') or '-'))}",
         f"<b>Интент:</b> {escape(str(snapshot.get('intent') or '-'))}",
         f"<b>Статус:</b> {escape(str(snapshot.get('status') or '-'))}",
