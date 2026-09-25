@@ -317,6 +317,7 @@ async def test_gigachat_client_maps_structured_response(tmp_path):
         == "Дополните поле: укажите результат после изменения."
     )
     assert fake_client.calls[0]["chat"].messages
+    assert fake_client.calls[0]["chat"].model == "GigaChat-2-Pro"
     assert fake_client.calls[0]["chat"].temperature == 0.01
 
 

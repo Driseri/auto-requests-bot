@@ -10,6 +10,10 @@
 This release freezes the final project implementation before controlled shutdown.
 Deploying it does not stop the bot and does not remove infrastructure or data.
 
+The release explicitly includes the configured GigaChat model in every structured
+request. This removes reliance on private SDK client settings and keeps real and
+test clients on the same request contract.
+
 ## GigaChat configuration
 
 - Model: `GigaChat-2-Pro`

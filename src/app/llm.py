@@ -504,6 +504,7 @@ class LlmClient:
                     "_settings",
                     SimpleNamespace(model=None, profanity_check=None, flags=None),
                 ),
+                model=self.model,
             )
         )
         metadata = _response_metadata(completion)
@@ -619,6 +620,7 @@ class LlmClient:
                         "_settings",
                         SimpleNamespace(model=None, profanity_check=None, flags=None),
                     ),
+                    model=self.model,
                 )
             )
             raw_response = _extract_completion_content(completion)
@@ -707,7 +709,7 @@ class LlmClient:
         return self._client
 
 
-def _build_chat(system_prompt: str, user_prompt: str) -> Any:
+def _build_chat(system_prompt: str, user_prompt: str, *, model: str) -> Any:
     from gigachat.models import Chat, Messages, MessagesRole
 
     return Chat(
@@ -715,6 +717,7 @@ def _build_chat(system_prompt: str, user_prompt: str) -> Any:
             Messages(role=MessagesRole.SYSTEM, content=system_prompt),
             Messages(role=MessagesRole.USER, content=user_prompt),
         ],
+        model=model,
         temperature=0.01,
     )
 
@@ -724,10 +727,12 @@ def _build_structured_chat(
     user_prompt: str,
     response_format: type,
     settings: Any,
+    *,
+    model: str,
 ) -> Any:
     from gigachat.client import _prepare_chat_for_parse
 
-    chat = _build_chat(system_prompt, user_prompt)
+    chat = _build_chat(system_prompt, user_prompt, model=model)
     return _prepare_chat_for_parse(chat, settings, response_format, True)
 
 
