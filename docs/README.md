@@ -2,7 +2,7 @@
 
 Secondary project documentation lives here:
 
-Last consistency audit against the codebase: `2026-07-27`.
+Last consistency audit against the codebase: `2026-09-25`.
 
 Current references:
 
@@ -10,6 +10,7 @@ Current references:
 - `BOT_MONITORING_DASHBOARD_SPEC.md` - local monitoring dashboard specification.
 - `APPLICATION_EVENTS_REFERENCE.md` - technical contract and complete field catalog for `application_events`.
 - `LEGACY_CLEANUP_AUDIT.md` - inventory, production dependencies and staged legacy cleanup plan.
+- `FINAL_RELEASE_2026-09-25.md` - immutable final release manifest and shutdown boundary.
 
 Plans and historical context:
 
